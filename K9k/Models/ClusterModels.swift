@@ -12,13 +12,48 @@ struct KubeContext: Codable, Identifiable, Hashable {
 // resource aliases without importing executable plugin behaviour.
 struct K9sConfigSummary: Codable, Hashable {
     let directory: String
+    let files: [String: K9sConfigFile]
     let aliases: [K9sAlias]
+    let hotkeys: [K9sHotkey]
+    let plugins: [K9sPlugin]
+    let views: [K9sCustomView]
+}
+
+struct K9sConfigFile: Codable, Hashable {
+    let path: String
+    let present: Bool
+    let error: String?
 }
 
 struct K9sAlias: Codable, Identifiable, Hashable {
     let name: String
     let target: String
     var id: String { name }
+}
+
+struct K9sHotkey: Codable, Identifiable, Hashable {
+    let name: String
+    let shortcut: String
+    let description: String
+    let command: String
+    var id: String { name }
+}
+
+struct K9sPlugin: Codable, Identifiable, Hashable {
+    let name: String
+    let scopes: [String]
+    let shortcut: String
+    let description: String
+    let command: String
+    let dangerous: Bool
+    var id: String { name }
+}
+
+struct K9sCustomView: Codable, Identifiable, Hashable {
+    let key: String
+    let columns: [String]
+    let sortColumn: String
+    var id: String { key }
 }
 
 struct ResourceType: Codable, Identifiable, Hashable {
@@ -107,6 +142,32 @@ struct ContainerMetrics: Codable, Identifiable, Hashable {
     let name: String
     let usage: [String: String]
     var id: String { name }
+}
+
+/// The immutable selection guard returned with an editable Kubernetes object.
+/// Its UID makes a stale editor incapable of applying to a replacement object
+/// that happens to reuse the same name.
+struct ManifestIdentity: Codable, Hashable {
+    // Core Kubernetes resources omit `group` on the wire.
+    let group: String?
+    let version: String
+    let resource: String
+    let namespaced: Bool
+    let namespace: String?
+    let name: String
+    let uid: String
+    let kind: String
+}
+
+struct ManifestDocument: Codable, Hashable {
+    let identity: ManifestIdentity
+    let yaml: String
+}
+
+struct ManifestApplyResult: Codable, Hashable {
+    let validated: Bool
+    let applied: Bool
+    let manifest: ManifestDocument
 }
 
 enum JSONValue: Codable, Hashable {

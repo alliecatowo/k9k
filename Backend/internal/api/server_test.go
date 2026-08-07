@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
+	kubeexec "k8s.io/client-go/util/exec"
 )
 
 // fakeCluster deliberately records the complete API boundary.  The server
@@ -37,17 +39,23 @@ type fakeCluster struct {
 	listErr, getErr, watchErr, deleteErr, patchErr      error
 	accessErr, portForwardErr                           error
 	metricsErr                                          error
+	execErr                                             error
+	manifestErr, applyManifestErr                       error
 
-	selected    []string
-	lists       []resourceCall
-	gets        []resourceCall
-	watches     []resourceCall
-	deletes     []resourceCall
-	patches     []patchCall
-	accesses    []AccessCheck
-	forwards    []PortForwardRequest
-	metrics     []MetricsQuery
-	metricItems []ResourceMetrics
+	selected       []string
+	lists          []resourceCall
+	gets           []resourceCall
+	watches        []resourceCall
+	deletes        []resourceCall
+	patches        []patchCall
+	accesses       []AccessCheck
+	forwards       []PortForwardRequest
+	metrics        []MetricsQuery
+	metricItems    []ResourceMetrics
+	execs          []PodExecRequest
+	execFn         func(context.Context, PodExecRequest, PodExecStreams) error
+	manifests      []resourceCall
+	applyManifests []ManifestApplyRequest
 }
 
 type resourceCall struct {
@@ -135,6 +143,29 @@ func (f *fakeCluster) Patch(_ context.Context, gvr schema.GroupVersionResource, 
 	return f.object, f.patchErr
 }
 
+func (f *fakeCluster) Manifest(_ context.Context, gvr schema.GroupVersionResource, namespace, name string, namespaced bool) (ManifestDocument, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.manifests = append(f.manifests, resourceCall{gvr: gvr, namespace: namespace, name: name, namespaced: namespaced})
+	if f.manifestErr != nil {
+		return ManifestDocument{}, f.manifestErr
+	}
+	return NewManifestDocument(f.object, ManifestIdentity{Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource, Namespaced: namespaced, Namespace: namespace, Name: name})
+}
+
+func (f *fakeCluster) ApplyManifest(_ context.Context, request ManifestApplyRequest) (*unstructured.Unstructured, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.applyManifests = append(f.applyManifests, request)
+	if f.applyManifestErr != nil {
+		return nil, f.applyManifestErr
+	}
+	if f.object == nil {
+		return request.Object.DeepCopy(), nil
+	}
+	return f.object.DeepCopy(), nil
+}
+
 func (f *fakeCluster) PodLogs(context.Context, string, string, string, bool, bool, bool, int64) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
@@ -181,6 +212,18 @@ func (f *fakeCluster) PortForward(ctx context.Context, request PortForwardReques
 	})
 	<-ctx.Done()
 	return nil
+}
+
+func (f *fakeCluster) PodExec(ctx context.Context, request PodExecRequest, streams PodExecStreams) error {
+	f.mu.Lock()
+	f.execs = append(f.execs, request)
+	err := f.execErr
+	callback := f.execFn
+	f.mu.Unlock()
+	if callback != nil {
+		return callback(ctx, request, streams)
+	}
+	return err
 }
 
 type contextWatch struct {
@@ -377,6 +420,79 @@ func TestServerContextAndReadOperations(t *testing.T) {
 	}
 }
 
+func TestManifestGetAndApplyUseCanonicalYAMLDryRunAndExplicitConfirm(t *testing.T) {
+	object := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1", "kind": "Deployment",
+		"metadata": map[string]any{
+			"name": "api", "namespace": "demo", "uid": "deployment-uid",
+			"resourceVersion": "42", "generation": int64(7), "labels": map[string]any{"app": "api"},
+		},
+		"spec":   map[string]any{"replicas": int64(2)},
+		"status": map[string]any{"readyReplicas": int64(2)},
+	}}
+	client := &fakeCluster{object: object}
+	manifest := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\n  namespace: demo\n  labels:\n    app: api\nspec:\n  replicas: 3\n"
+	base := map[string]any{
+		"gvr": "apps/v1/deployments", "namespace": "demo", "name": "api",
+		"expectedUID": "deployment-uid", "kind": "Deployment", "manifest": manifest,
+	}
+	responses := runRequests(t, client,
+		request("get", "manifest.get", map[string]any{"gvr": "apps/v1/deployments", "namespace": "demo", "name": "api"}),
+		request("preview", "manifest.apply", base),
+		request("apply", "manifest.apply", map[string]any{
+			"gvr": "apps/v1/deployments", "namespace": "demo", "name": "api", "expectedUID": "deployment-uid", "kind": "Deployment", "manifest": manifest, "confirm": true,
+		}),
+		request("changed-name", "manifest.apply", map[string]any{
+			"gvr": "apps/v1/deployments", "namespace": "demo", "name": "api", "expectedUID": "deployment-uid", "kind": "Deployment", "manifest": strings.Replace(manifest, "name: api", "name: other", 1),
+		}),
+	)
+	get := decodeResult[ManifestDocument](t, envelopeByID(t, responses, "get").Result)
+	if get.Identity.UID != "deployment-uid" || get.Identity.Kind != "Deployment" || get.Identity.Resource != "deployments" {
+		t.Errorf("identity = %#v", get.Identity)
+	}
+	for _, forbidden := range []string{"status:", "resourceVersion:", "generation:", "uid:"} {
+		if strings.Contains(get.YAML, forbidden) {
+			t.Errorf("canonical YAML contains %q:\n%s", forbidden, get.YAML)
+		}
+	}
+	preview := mustObject(t, envelopeByID(t, responses, "preview").Result)
+	if preview["validated"] != true || preview["applied"] != false {
+		t.Errorf("preview = %#v", preview)
+	}
+	confirmed := mustObject(t, envelopeByID(t, responses, "apply").Result)
+	if confirmed["validated"] != true || confirmed["applied"] != true {
+		t.Errorf("confirmed = %#v", confirmed)
+	}
+	if errorResult := envelopeByID(t, responses, "changed-name").Error; errorResult == nil || errorResult.Code != "invalid_params" {
+		t.Errorf("changed identity error = %#v", errorResult)
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.manifests) != 1 || client.manifests[0].gvr != (schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}) {
+		t.Errorf("manifest reads = %#v", client.manifests)
+	}
+	if len(client.applyManifests) != 3 {
+		t.Fatalf("apply calls = %d, want preview dry run plus confirmed dry run and write", len(client.applyManifests))
+	}
+	if !client.applyManifests[0].DryRun || !client.applyManifests[1].DryRun || client.applyManifests[2].DryRun {
+		t.Errorf("dry-run sequence = %#v", client.applyManifests)
+	}
+}
+
+func TestManifestApplyClassifiesIdentityAndServerValidationFailures(t *testing.T) {
+	manifest := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: demo\ndata:\n  theme: dark\n"
+	params := map[string]any{"gvr": "v1/configmaps", "namespace": "demo", "name": "settings", "expectedUID": "old", "kind": "ConfigMap", "manifest": manifest}
+	identity := envelopeByID(t, runRequests(t, &fakeCluster{applyManifestErr: ErrManifestIdentityMismatch}, request("stale", "manifest.apply", params)), "stale")
+	if identity.Error == nil || identity.Error.Code != "identity_mismatch" {
+		t.Errorf("identity mismatch = %#v", identity.Error)
+	}
+	validation := envelopeByID(t, runRequests(t, &fakeCluster{applyManifestErr: errors.New("admission denied")}, request("invalid", "manifest.apply", params)), "invalid")
+	if validation.Error == nil || validation.Error.Code != "manifest_validation_failed" {
+		t.Errorf("validation failure = %#v", validation.Error)
+	}
+}
+
 func TestResourceTypeSerializesMissingShortNamesAsArray(t *testing.T) {
 	encoded, err := json.Marshal(ResourceType{Version: "v1", Resource: "pods", Kind: "Pod"})
 	if err != nil {
@@ -528,17 +644,21 @@ func TestServerMetricsListUsesVersionedPodAndNodeQueries(t *testing.T) {
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	want := []MetricsQuery{
-		{Version: "v1beta1", Resource: "pods", Namespace: "demo", Name: "api"},
-		{Version: "v1beta1", Resource: "nodes", Name: "worker"},
+	want := map[MetricsQuery]bool{
+		{Version: "v1beta1", Resource: "pods", Namespace: "demo", Name: "api"}: true,
+		{Version: "v1beta1", Resource: "nodes", Name: "worker"}:                true,
 	}
 	if len(client.metrics) != len(want) {
 		t.Fatalf("metrics calls = %#v", client.metrics)
 	}
-	for i := range want {
-		if client.metrics[i] != want[i] {
-			t.Errorf("metrics call %d = %#v, want %#v", i, client.metrics[i], want[i])
+	for _, got := range client.metrics {
+		if !want[got] {
+			t.Errorf("unexpected metrics call %#v", got)
 		}
+		delete(want, got)
+	}
+	if len(want) != 0 {
+		t.Errorf("missing metrics calls %#v", want)
 	}
 }
 
@@ -679,6 +799,155 @@ func TestServerPortForwardValidationAndStartupError(t *testing.T) {
 	}
 }
 
+func TestServerExecStreamsInteractiveBytesResizeAndCancellation(t *testing.T) {
+	initialSize := make(chan [2]uint16, 1)
+	resizeSize := make(chan [2]uint16, 1)
+	client := &fakeCluster{execFn: func(ctx context.Context, request PodExecRequest, streams PodExecStreams) error {
+		if request.Namespace != "demo" || request.Pod != "shell" || request.Container != "app" || !request.TTY || !request.Stdin {
+			t.Errorf("exec request = %#v", request)
+		}
+		initial := streams.TerminalSizeQueue.Next()
+		if initial == nil {
+			t.Fatal("missing initial terminal size")
+		}
+		initialSize <- [2]uint16{initial.Width, initial.Height}
+		if _, err := streams.Stdout.Write([]byte("ready\\n")); err != nil {
+			return err
+		}
+		input := make([]byte, 64)
+		n, err := streams.Stdin.Read(input)
+		if err != nil {
+			return err
+		}
+		if got, want := string(input[:n]), "echo hi\\r"; got != want {
+			t.Errorf("stdin = %q, want %q", got, want)
+		}
+		if _, err := streams.Stdout.Write([]byte{0xff, 0x00}); err != nil {
+			return err
+		}
+		resized := streams.TerminalSizeQueue.Next()
+		if resized == nil {
+			t.Fatal("missing resize")
+		}
+		resizeSize <- [2]uint16{resized.Width, resized.Height}
+		<-ctx.Done()
+		return nil
+	}}
+	inputReader, inputWriter := io.Pipe()
+	var output lockedBuffer
+	server := NewServer(client, inputReader, &output)
+	done := make(chan error, 1)
+	go func() { done <- server.Run(context.Background()) }()
+
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "open", Operation: "exec.open", StreamID: "terminal", Params: json.RawMessage(`{"namespace":"demo","pod":"shell","container":"app","command":["/bin/sh"],"initialColumns":120,"initialRows":40}`)})
+	waitFor(t, &output, func(values []protocol.Envelope) bool {
+		return hasEnvelope(values, "open", "response") && hasEnvelope(values, "", "exec.started") && hasEnvelope(values, "", "exec.stdout")
+	})
+	select {
+	case got := <-initialSize:
+		if got != [2]uint16{120, 40} {
+			t.Errorf("initial size = %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exec did not receive initial terminal size")
+	}
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "input", Operation: "exec.stdin", StreamID: "terminal", Params: json.RawMessage(`{"data":"echo hi\\r"}`)})
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "resize", Operation: "exec.resize", StreamID: "terminal", Params: json.RawMessage(`{"columns":160,"rows":50}`)})
+	waitFor(t, &output, func(values []protocol.Envelope) bool {
+		return hasEnvelope(values, "input", "response") && hasEnvelope(values, "resize", "response") && countEnvelopes(values, "exec.stdout") >= 2
+	})
+	select {
+	case got := <-resizeSize:
+		if got != [2]uint16{160, 50} {
+			t.Errorf("resize = %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exec did not receive resize")
+	}
+
+	values := decodeEnvelopes(t, output.String())
+	var sawBinary bool
+	for _, value := range values {
+		if value.Type != "exec.stdout" {
+			continue
+		}
+		payload := mustObject(t, value.Result)
+		if payload["encoding"] != "base64" {
+			t.Errorf("stdout encoding = %#v", payload)
+		}
+		if encoded, _ := payload["dataBase64"].(string); encoded == "/wA=" {
+			sawBinary = true
+		}
+	}
+	if !sawBinary {
+		t.Errorf("missing binary stdout event: %#v", values)
+	}
+
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "cancel", Operation: "stream.cancel", StreamID: "terminal"})
+	waitFor(t, &output, func(values []protocol.Envelope) bool {
+		return hasEnvelope(values, "cancel", "response") && hasEnvelope(values, "", "exec.closed")
+	})
+	if err := inputWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop")
+	}
+	for _, value := range decodeEnvelopes(t, output.String()) {
+		if value.Type == "exec.closed" && mustObject(t, value.Result)["reason"] != "cancelled" {
+			t.Errorf("close = %#v", value.Result)
+		}
+	}
+}
+
+func TestServerExecReportsRemoteExitAndRejectsBadFrames(t *testing.T) {
+	client := &fakeCluster{execErr: kubeexec.CodeExitError{Err: errors.New("command terminated with exit code 7"), Code: 7}}
+	inputReader, inputWriter := io.Pipe()
+	var output lockedBuffer
+	server := NewServer(client, inputReader, &output)
+	done := make(chan error, 1)
+	go func() { done <- server.Run(context.Background()) }()
+
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "open", Operation: "exec.open", StreamID: "failure", Params: json.RawMessage(`{"namespace":"demo","pod":"job","command":["false"],"tty":false}`)})
+	waitFor(t, &output, func(values []protocol.Envelope) bool {
+		return hasEnvelope(values, "open", "response") && hasEnvelope(values, "", "exec.error") && hasEnvelope(values, "", "exec.closed")
+	})
+	values := decodeEnvelopes(t, output.String())
+	for _, event := range values {
+		if event.Type == "exec.error" {
+			if got := mustObject(t, event.Result)["exitCode"]; got != float64(7) {
+				t.Errorf("exitCode = %#v", got)
+			}
+		}
+	}
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "missing", Operation: "exec.stdin", StreamID: "missing", Params: json.RawMessage(`{"data":"x"}`)})
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "bad", Operation: "exec.open", StreamID: "bad", Params: json.RawMessage(`{"namespace":"demo","pod":"job","command":[]}`)})
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "bad-data", Operation: "exec.stdin", StreamID: "missing", Params: json.RawMessage(`{"data":"x","dataBase64":"eA=="}`)})
+	waitFor(t, &output, func(values []protocol.Envelope) bool {
+		return hasEnvelope(values, "missing", "response") && hasEnvelope(values, "bad", "response") && hasEnvelope(values, "bad-data", "response")
+	})
+	values = decodeEnvelopes(t, output.String())
+	if got := envelopeByID(t, values, "missing").Error; got == nil || got.Code != "stream_not_found" {
+		t.Errorf("missing stdin = %#v", got)
+	}
+	for _, id := range []string{"bad", "bad-data"} {
+		if got := envelopeByID(t, values, id).Error; got == nil || got.Code != "invalid_params" {
+			t.Errorf("%s = %#v", id, got)
+		}
+	}
+	if err := inputWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestServerSerializesConcurrentResponsesAsCompleteJSONLines(t *testing.T) {
 	client := &fakeCluster{}
 	var input strings.Builder
@@ -763,6 +1032,16 @@ func hasEnvelope(values []protocol.Envelope, id, typ string) bool {
 		}
 	}
 	return false
+}
+
+func countEnvelopes(values []protocol.Envelope, typ string) int {
+	count := 0
+	for _, value := range values {
+		if value.Type == typ {
+			count++
+		}
+	}
+	return count
 }
 
 func equalJSON(left, right any) bool {

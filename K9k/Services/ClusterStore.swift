@@ -20,12 +20,19 @@ final class ClusterStore {
     var isReadOnly = false
     var activeStreamID: String?
     var k9sAliases: [K9sAlias] = []
+    var k9sConfig: K9sConfigSummary?
 
     var events: [ClusterEvent] = []
     var logLines: [String] = []
     var activeLogStreamID: String?
     var activePortForward: PortForwardBinding?
     var activePortForwardStreamID: String?
+    var terminalOutput = ""
+    var activeExecStreamID: String?
+    var execAccess: AccessReview?
+    var isCheckingExecAccess = false
+    var manifestAccess: AccessReview?
+    var isCheckingManifestAccess = false
     var resourceMetrics: ResourceMetrics?
     var metricsUnavailableMessage: String?
     var isLoadingMetrics = false
@@ -38,6 +45,9 @@ final class ClusterStore {
     private var deleteAccessGeneration = 0
     private var scaleAccessGeneration = 0
     private var restartAccessGeneration = 0
+    private var execAccessGeneration = 0
+    private var manifestAccessGeneration = 0
+    private var rawTerminalOutput = ""
 
     private let client = CoreClient()
 
@@ -62,9 +72,7 @@ final class ClusterStore {
             contexts = try decodeArray((try await contextsEnvelope).result, as: KubeContext.self)
             selectedContext = contexts.first(where: \.active) ?? contexts.first
             discoveredResources = try decodeArray((try await discoveryEnvelope).result, as: ResourceType.self)
-            if let config = try? decode((try await client.request("config.summary")).result, as: K9sConfigSummary.self) {
-                k9sAliases = config.aliases
-            }
+            await loadK9sConfig()
             ensureDefaultResourceSelection()
             await loadNamespaces()
             await loadResources()
@@ -98,6 +106,19 @@ final class ClusterStore {
         catch { errorMessage = error.localizedDescription }
     }
 
+    func loadK9sConfig() async {
+        do {
+            let config = try decode((try await client.request("config.summary")).result, as: K9sConfigSummary.self)
+            k9sConfig = config
+            k9sAliases = config.aliases
+        } catch {
+            // K9s configuration is optional compatibility metadata. It must
+            // never prevent access to the selected Kubernetes context.
+            k9sConfig = nil
+            k9sAliases = []
+        }
+    }
+
     func loadResources() async {
         guard let type = selectedResourceType else { return }
         if let activeStreamID { await client.cancel(streamID: activeStreamID) }
@@ -122,6 +143,8 @@ final class ClusterStore {
         deleteAccess = nil
         scaleAccess = nil
         restartAccess = nil
+        execAccess = nil
+        manifestAccess = nil
     }
 
     func deleteSelected() async {
@@ -155,6 +178,18 @@ final class ClusterStore {
     }
 
     var isSelectedResourceRestartable: Bool { selectedRestartableResource != nil }
+
+    var canOpenExec: Bool {
+        !isReadOnly && selectedPodResource != nil && execAccess?.allowed == true
+    }
+
+    var isSelectedResourcePod: Bool { selectedPodResource != nil }
+
+    var canEditSelectedManifest: Bool {
+        !isReadOnly && selectedResourceType != nil && selectedResources.count == 1 && manifestAccess?.allowed == true
+    }
+
+    var hasSelectedManifest: Bool { selectedResourceType != nil && selectedResources.count == 1 && selectedSelectedResource != nil }
 
     var selectedReplicaCount: Int {
         selectedScalableResource?.raw?.objectValue?["spec"]?.objectValue?["replicas"]?.intValue ?? 1
@@ -294,6 +329,117 @@ final class ClusterStore {
         }
     }
 
+    func updateExecAccess() async {
+        execAccessGeneration &+= 1
+        let generation = execAccessGeneration
+        guard let type = selectedResourceType, let resource = selectedPodResource else {
+            execAccess = nil
+            isCheckingExecAccess = false
+            return
+        }
+        isCheckingExecAccess = true
+        defer {
+            if generation == execAccessGeneration { isCheckingExecAccess = false }
+        }
+        do {
+            let parameters = operationParameters(type: type, resource: resource, additional: [
+                "verb": .string("create"),
+                "subresource": .string("exec")
+            ])
+            let review = try decode((try await client.request("rbac.check", parameters: parameters)).result, as: AccessReview.self)
+            if generation == execAccessGeneration { execAccess = review }
+        } catch {
+            if generation == execAccessGeneration {
+                execAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify Pod exec permission: \(error.localizedDescription)", evaluationError: nil)
+            }
+        }
+    }
+
+    func openExec(for resource: ResourceSummary, command: [String], container: String? = nil) async {
+        guard resource.kind == "Pod", let namespace = resource.namespace else { return }
+        await updateExecAccess()
+        guard canOpenExec else {
+            errorMessage = execAccess?.reason ?? "The active Kubernetes identity is not authorized to open an exec session for this Pod."
+            return
+        }
+        await closeExec()
+        let streamID = UUID().uuidString
+        terminalOutput = ""
+        rawTerminalOutput = ""
+        activeExecStreamID = streamID
+        var parameters: [String: JSONValue] = [
+            "streamID": .string(streamID),
+            "namespace": .string(namespace),
+            "pod": .string(resource.name),
+            "command": .array(command.map(JSONValue.string)),
+            "tty": .bool(true),
+            "stdin": .bool(true),
+            "initialColumns": .number(120),
+            "initialRows": .number(36)
+        ]
+        if let container, !container.isEmpty { parameters["container"] = .string(container) }
+        do {
+            _ = try await client.request("exec.open", parameters: .object(parameters))
+        } catch {
+            activeExecStreamID = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func sendExecInput(_ input: String) async {
+        guard let activeExecStreamID, !input.isEmpty else { return }
+        do {
+            _ = try await client.request("exec.stdin", parameters: .object([
+                "streamID": .string(activeExecStreamID),
+                "data": .string(input)
+            ]))
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func closeExec() async {
+        if let activeExecStreamID { await client.cancel(streamID: activeExecStreamID) }
+        activeExecStreamID = nil
+    }
+
+    func updateManifestAccess() async {
+        manifestAccessGeneration &+= 1
+        let generation = manifestAccessGeneration
+        guard let type = selectedResourceType, let resource = selectedSelectedResource else {
+            manifestAccess = nil
+            isCheckingManifestAccess = false
+            return
+        }
+        isCheckingManifestAccess = true
+        defer {
+            if generation == manifestAccessGeneration { isCheckingManifestAccess = false }
+        }
+        do {
+            let review = try decode(
+                (try await client.request("rbac.check", parameters: operationParameters(type: type, resource: resource, additional: ["verb": .string("patch")]))).result,
+                as: AccessReview.self
+            )
+            if generation == manifestAccessGeneration { manifestAccess = review }
+        } catch {
+            if generation == manifestAccessGeneration {
+                manifestAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify manifest edit permission: \(error.localizedDescription)", evaluationError: nil)
+            }
+        }
+    }
+
+    func fetchManifest(type: ResourceType, resource: ResourceSummary) async throws -> ManifestDocument {
+        try decode((try await client.request("manifest.get", parameters: operationParameters(type: type, resource: resource))).result, as: ManifestDocument.self)
+    }
+
+    func validateManifest(type: ResourceType, document: ManifestDocument, source: String) async throws -> ManifestApplyResult {
+        try await submitManifest(type: type, document: document, source: source, confirm: false)
+    }
+
+    func applyManifest(type: ResourceType, document: ManifestDocument, source: String) async throws -> ManifestApplyResult {
+        try await submitManifest(type: type, document: document, source: source, confirm: true)
+    }
+
     func copySelectedName() {
         guard let resource = resources.first(where: { selectedResources.contains($0.id) }) else { return }
         NSPasteboard.general.clearContents()
@@ -404,6 +550,20 @@ final class ClusterStore {
         return resource(for: id)
     }
 
+    private var selectedPodResource: ResourceSummary? {
+        guard selectedResourceType?.resource == "pods",
+              selectedResources.count == 1,
+              let id = selectedResources.first,
+              let resource = resource(for: id),
+              resource.kind == "Pod" else { return nil }
+        return resource
+    }
+
+    private var selectedSelectedResource: ResourceSummary? {
+        guard selectedResources.count == 1, let id = selectedResources.first else { return nil }
+        return resource(for: id)
+    }
+
     func resourceType(forK9sAlias name: String) -> ResourceType? {
         var visited = Set<String>()
         func resolve(_ target: String) -> ResourceType? {
@@ -434,7 +594,33 @@ final class ClusterStore {
         return .object(values)
     }
 
+    private func submitManifest(type: ResourceType, document: ManifestDocument, source: String, confirm: Bool) async throws -> ManifestApplyResult {
+        var parameters = type.requestParameters.objectValue ?? [:]
+        let identity = document.identity
+        parameters["namespace"] = .string(identity.namespace ?? "")
+        parameters["name"] = .string(identity.name)
+        parameters["expectedUID"] = .string(identity.uid)
+        parameters["kind"] = .string(identity.kind)
+        parameters["manifest"] = .string(source)
+        parameters["confirm"] = .bool(confirm)
+        return try decode((try await client.request("manifest.apply", parameters: .object(parameters))).result, as: ManifestApplyResult.self)
+    }
+
     private func apply(event: CoreEnvelope) {
+        if event.streamID == activeExecStreamID {
+            if ["exec.stdout", "exec.stderr"].contains(event.type),
+               let encoded = event.result?.objectValue?["dataBase64"]?.stringValue,
+               let data = Data(base64Encoded: encoded) {
+                rawTerminalOutput.append(String(decoding: data, as: UTF8.self))
+                if rawTerminalOutput.count > 200_000 { rawTerminalOutput.removeFirst(rawTerminalOutput.count - 200_000) }
+                terminalOutput = renderTerminalOutput(rawTerminalOutput)
+                return
+            }
+            if event.type == "exec.closed" || event.type == "exec.error" {
+                activeExecStreamID = nil
+                return
+            }
+        }
         if event.streamID == activeLogStreamID, event.type == "logs.data", let line = event.result?.objectValue?["line"]?.stringValue {
             logLines.append(line)
             if logLines.count > 10_000 { logLines.removeFirst(logLines.count - 10_000) }
@@ -458,4 +644,16 @@ final class ClusterStore {
         return try JSONDecoder.k9k.decode(T.self, from: JSONEncoder().encode(value))
     }
     private func decodeArray<T: Decodable>(_ value: JSONValue?, as type: T.Type) throws -> [T] { try decode(value, as: [T].self) }
+
+    /// K9k's first-party terminal surface intentionally presents a readable
+    /// transcript while the direct exec transport remains byte-exact. Strip
+    /// terminal-control responses such as cursor-position probes so they don't
+    /// leak into copyable output; a full VT grid is a later enhancement.
+    private func renderTerminalOutput(_ raw: String) -> String {
+        let pattern = "\u{001B}\\[[0-?]*[ -/]*[@-~]"
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return raw }
+        let range = NSRange(raw.startIndex..., in: raw)
+        return expression.stringByReplacingMatches(in: raw, range: range, withTemplate: "")
+            .replacingOccurrences(of: "\r", with: "\n")
+    }
 }

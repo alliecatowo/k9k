@@ -9,6 +9,8 @@ struct K9kRootView: View {
     @State private var portForwardPresented = false
     @State private var scalePresented = false
     @State private var restartConfirmation = false
+    @State private var terminalPresented = false
+    @State private var manifestEditorPresented = false
 
     var body: some View {
         @Bindable var store = store
@@ -35,6 +37,8 @@ struct K9kRootView: View {
                 await store.updateDeleteAccess()
                 await store.updateScaleAccess()
                 await store.updateRestartAccess()
+                await store.updateExecAccess()
+                await store.updateManifestAccess()
             }
         }
         .confirmationDialog("Delete selected resources?", isPresented: $destructiveConfirmation, titleVisibility: .visible) {
@@ -51,6 +55,14 @@ struct K9kRootView: View {
             if let resource = store.resource(for: store.selectedResources.first) { PortForwardView(resource: resource, isPresented: $portForwardPresented) }
         }
         .sheet(isPresented: $scalePresented) { ScaleWorkloadView(isPresented: $scalePresented) }
+        .sheet(isPresented: $terminalPresented) {
+            if let resource = store.resource(for: store.selectedResources.first) { TerminalSessionView(resource: resource) }
+        }
+        .sheet(isPresented: $manifestEditorPresented) {
+            if let resource = store.resource(for: store.selectedResources.first), let type = store.selectedResourceType {
+                ManifestEditorView(resource: resource, type: type)
+            }
+        }
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
         } message: { Text(store.errorMessage ?? "") }
@@ -81,9 +93,13 @@ struct K9kRootView: View {
                 .help("Show or hide inspector")
             Menu {
                 Button("Copy Name", action: store.copySelectedName).disabled(store.selectedResources.isEmpty)
+                Button("Edit Manifest…") { manifestEditorPresented = true }
+                    .disabled(!store.hasSelectedManifest)
                 if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Pod" {
                     Button("View Logs") { logsPresented = true }
                     Button("Port Forward…") { portForwardPresented = true }
+                    Button("Open Terminal…") { terminalPresented = true }
+                        .disabled(!store.canOpenExec)
                 }
                 if store.isSelectedResourceScalable {
                     Button("Scale…") { scalePresented = true }
@@ -109,8 +125,26 @@ struct SettingsView: View {
         Form {
             Toggle("Read-only Mode", isOn: $store.isReadOnly)
             LabeledContent("Kubeconfig") { Text(ProcessInfo.processInfo.environment["KUBECONFIG"] ?? "~/.kube/config") }
+            Section("K9s compatibility") {
+                if let config = store.k9sConfig {
+                    LabeledContent("Configuration directory", value: config.directory)
+                    LabeledContent("Aliases", value: "\(config.aliases.count)")
+                    LabeledContent("Hotkeys", value: "\(config.hotkeys.count)")
+                    LabeledContent("Custom views", value: "\(config.views.count)")
+                    LabeledContent("Plugin declarations", value: "\(config.plugins.count)")
+                    ForEach(config.files.keys.sorted(), id: \.self) { key in
+                        if let file = config.files[key] {
+                            LabeledContent(key.capitalized, value: file.present ? (file.error ?? "Loaded") : "Not present")
+                        }
+                    }
+                    Button("Reload K9s Configuration") { Task { await store.loadK9sConfig() } }
+                } else {
+                    Text("K9s configuration is optional and could not be read.").foregroundStyle(.secondary)
+                    Button("Reload K9s Configuration") { Task { await store.loadK9sConfig() } }
+                }
+            }
         }
         .padding()
-        .frame(width: 420)
+        .frame(width: 520)
     }
 }

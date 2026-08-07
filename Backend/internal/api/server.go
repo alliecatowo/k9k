@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,12 +15,22 @@ import (
 
 	"github.com/k9k-app/k9k/backend/internal/config"
 	"github.com/k9k-app/k9k/backend/internal/protocol"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/tools/remotecommand"
+	kubeexec "k8s.io/client-go/util/exec"
+	"sigs.k8s.io/yaml"
 )
 
 const maxRequestBytes = 16 << 20
+
+const (
+	maxExecInputChunkBytes  = 64 << 10
+	maxExecInputQueueChunks = 32
+	maxExecOutputChunkBytes = 64 << 10
+)
 
 // ClusterClient is the narrow Kubernetes surface used by the IPC server. It is
 // intentionally an interface so the protocol can be exercised without a live
@@ -34,11 +45,14 @@ type ClusterClient interface {
 	Watch(context.Context, schema.GroupVersionResource, string, bool, string) (watch.Interface, error)
 	Delete(context.Context, schema.GroupVersionResource, string, string, bool) error
 	Patch(context.Context, schema.GroupVersionResource, string, string, bool, []byte) (*unstructured.Unstructured, error)
+	Manifest(context.Context, schema.GroupVersionResource, string, string, bool) (ManifestDocument, error)
+	ApplyManifest(context.Context, ManifestApplyRequest) (*unstructured.Unstructured, error)
 	PodLogs(context.Context, string, string, string, bool, bool, bool, int64) (io.ReadCloser, error)
 	Events(context.Context, string, string) ([]ClusterEvent, error)
 	Metrics(context.Context, MetricsQuery) ([]ResourceMetrics, error)
 	CheckAccess(context.Context, AccessCheck) (AccessReview, error)
 	PortForward(context.Context, PortForwardRequest, func(PortForwardBinding)) error
+	PodExec(context.Context, PodExecRequest, PodExecStreams) error
 }
 
 // Server dispatches K9k's newline-delimited JSON protocol. Concurrent request
@@ -52,6 +66,8 @@ type Server struct {
 	writeMu  sync.Mutex
 	streamMu sync.Mutex
 	streams  map[string]context.CancelFunc
+	execMu   sync.Mutex
+	execs    map[string]*execSession
 	work     sync.WaitGroup
 }
 
@@ -61,6 +77,7 @@ func NewServer(cluster ClusterClient, input io.Reader, output io.Writer) *Server
 		in:      input,
 		out:     output,
 		streams: make(map[string]context.CancelFunc),
+		execs:   make(map[string]*execSession),
 	}
 }
 
@@ -117,6 +134,14 @@ func (s *Server) readRequests(ctx context.Context) error {
 			continue
 		}
 
+		// Input and resize frames must retain their NDJSON arrival order. Both
+		// operations are bounded/non-blocking, so handling them on the reader
+		// goroutine cannot stall cancellation or ordinary API requests.
+		if request.Operation == "exec.stdin" || request.Operation == "exec.resize" {
+			s.dispatch(ctx, request)
+			continue
+		}
+
 		s.work.Add(1)
 		go func(request protocol.Request) {
 			defer s.work.Done()
@@ -143,6 +168,10 @@ func (s *Server) dispatch(ctx context.Context, request protocol.Request) {
 		s.startPortForward(ctx, request)
 		return
 	}
+	if request.Operation == "exec.open" {
+		s.startExec(ctx, request)
+		return
+	}
 
 	result, opErr := s.handle(ctx, request)
 	if opErr != nil {
@@ -162,6 +191,148 @@ func invalidParams(err error) *operationError {
 	return &operationError{code: "invalid_params", err: err}
 }
 func kubeError(err error) *operationError { return &operationError{code: "kubernetes_error", err: err} }
+
+// execInput is a bounded, cancellable Reader for interactive terminal bytes.
+// Requests are accepted by the scanner in wire order, then remotecommand pulls
+// them as the API server is ready. The finite queue keeps a disconnected or
+// slow pod from allowing unbounded helper memory growth.
+type execInput struct {
+	chunks  chan []byte
+	done    chan struct{}
+	once    sync.Once
+	pending []byte
+}
+
+func newExecInput() *execInput {
+	return &execInput{
+		chunks: make(chan []byte, maxExecInputQueueChunks),
+		done:   make(chan struct{}),
+	}
+}
+
+func (in *execInput) Read(destination []byte) (int, error) {
+	for len(in.pending) == 0 {
+		select {
+		case chunk := <-in.chunks:
+			in.pending = chunk
+		case <-in.done:
+			return 0, io.EOF
+		}
+	}
+	n := copy(destination, in.pending)
+	in.pending = in.pending[n:]
+	return n, nil
+}
+
+func (in *execInput) Enqueue(data []byte) error {
+	if len(data) > maxExecInputChunkBytes {
+		return fmt.Errorf("exec input must not exceed %d bytes", maxExecInputChunkBytes)
+	}
+	copyOfData := append([]byte(nil), data...)
+	select {
+	case <-in.done:
+		return io.ErrClosedPipe
+	default:
+	}
+	select {
+	case <-in.done:
+		return io.ErrClosedPipe
+	case in.chunks <- copyOfData:
+		return nil
+	default:
+		return errExecInputBackpressure
+	}
+}
+
+func (in *execInput) Close() { in.once.Do(func() { close(in.done) }) }
+
+var errExecInputBackpressure = errors.New("exec input queue is full; wait for the terminal to drain")
+
+// resizeQueue follows the client-go TerminalSizeQueue contract. It begins
+// with an explicit initial size and coalesces later resizes: terminal programs
+// only need the current dimensions, not every intermediate drag position.
+type resizeQueue struct {
+	sizes chan remotecommand.TerminalSize
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newResizeQueue(columns, rows uint16) *resizeQueue {
+	queue := &resizeQueue{sizes: make(chan remotecommand.TerminalSize, 1), done: make(chan struct{})}
+	queue.sizes <- remotecommand.TerminalSize{Width: columns, Height: rows}
+	return queue
+}
+
+func (q *resizeQueue) Next() *remotecommand.TerminalSize {
+	select {
+	case size := <-q.sizes:
+		return &size
+	case <-q.done:
+		return nil
+	}
+}
+
+func (q *resizeQueue) Resize(columns, rows uint16) error {
+	if columns == 0 || rows == 0 {
+		return errors.New("columns and rows must be positive")
+	}
+	select {
+	case <-q.done:
+		return io.ErrClosedPipe
+	default:
+	}
+	size := remotecommand.TerminalSize{Width: columns, Height: rows}
+	select {
+	case q.sizes <- size:
+		return nil
+	default:
+		// There is one queued resize. Replace it with the current dimensions.
+		select {
+		case <-q.sizes:
+		default:
+		}
+		select {
+		case <-q.done:
+			return io.ErrClosedPipe
+		case q.sizes <- size:
+			return nil
+		default:
+			return nil
+		}
+	}
+}
+
+func (q *resizeQueue) Close() { q.once.Do(func() { close(q.done) }) }
+
+type execSession struct {
+	input  *execInput
+	resize *resizeQueue
+	stdin  bool
+}
+
+// execEventWriter preserves every remote byte using base64, including ANSI
+// escape sequences and non-UTF-8 output. The GUI can therefore feed the
+// decoded bytes directly to a terminal emulator without newline heuristics.
+type execEventWriter struct {
+	server   *Server
+	streamID string
+	event    string
+}
+
+func (w execEventWriter) Write(data []byte) (int, error) {
+	written := len(data)
+	for len(data) > 0 {
+		length := len(data)
+		if length > maxExecOutputChunkBytes {
+			length = maxExecOutputChunkBytes
+		}
+		w.server.write(protocol.Event(w.streamID, w.event, map[string]any{
+			"encoding": "base64", "dataBase64": base64.StdEncoding.EncodeToString(data[:length]),
+		}))
+		data = data[length:]
+	}
+	return written, nil
+}
 
 func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *operationError) {
 	switch request.Operation {
@@ -233,6 +404,44 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(getErr)
 		}
 		return result.Object, nil
+	case "manifest.get":
+		params, err := decodeResourceParams(request.Params, true)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		result, manifestErr := s.cluster.Manifest(ctx, params.gvr(), params.Namespace, params.Name, params.isNamespaced())
+		if manifestErr != nil {
+			return nil, kubeError(manifestErr)
+		}
+		return result, nil
+	case "manifest.apply":
+		params, err := decodeManifestApplyParams(request.Params)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		// Always issue the exact server-side apply as a dry run first. This
+		// validates schema, admission, defaulting, and ownership conflicts
+		// without persisting a change; confirm only enables the second write.
+		preview, applyErr := s.cluster.ApplyManifest(ctx, params.request(true))
+		if applyErr != nil {
+			return nil, manifestOperationError(applyErr, "manifest validation failed")
+		}
+		previewDocument, documentErr := NewManifestDocument(preview, params.identity())
+		if documentErr != nil {
+			return nil, kubeError(documentErr)
+		}
+		if !params.Confirm {
+			return map[string]any{"validated": true, "applied": false, "manifest": previewDocument}, nil
+		}
+		applied, applyErr := s.cluster.ApplyManifest(ctx, params.request(false))
+		if applyErr != nil {
+			return nil, manifestOperationError(applyErr, "manifest apply failed")
+		}
+		appliedDocument, documentErr := NewManifestDocument(applied, params.identity())
+		if documentErr != nil {
+			return nil, kubeError(documentErr)
+		}
+		return map[string]any{"validated": true, "applied": true, "manifest": appliedDocument}, nil
 	case "resource.events":
 		var params struct {
 			Namespace string `json:"namespace"`
@@ -325,6 +534,47 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(patchErr)
 		}
 		return result.Object, nil
+	case "exec.stdin":
+		params, err := decodeExecInputParams(request)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		session := s.execSession(params.StreamID)
+		if session == nil {
+			return nil, &operationError{code: "stream_not_found", err: fmt.Errorf("exec stream %q is not active", params.StreamID)}
+		}
+		if !session.stdin {
+			return nil, invalidParams(errors.New("exec.stdin requires an exec stream opened with stdin: true"))
+		}
+		if err := session.input.Enqueue(params.Data); err != nil {
+			if errors.Is(err, io.ErrClosedPipe) {
+				return nil, &operationError{code: "stream_closed", err: fmt.Errorf("exec stream %q is closed", params.StreamID)}
+			}
+			if errors.Is(err, errExecInputBackpressure) {
+				return nil, &operationError{code: "input_backpressure", err: err}
+			}
+			return nil, invalidParams(err)
+		}
+		return map[string]any{"streamID": params.StreamID, "accepted": true, "bytes": len(params.Data)}, nil
+	case "exec.resize":
+		params, err := decodeExecResizeParams(request)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		session := s.execSession(params.StreamID)
+		if session == nil {
+			return nil, &operationError{code: "stream_not_found", err: fmt.Errorf("exec stream %q is not active", params.StreamID)}
+		}
+		if session.resize == nil {
+			return nil, invalidParams(errors.New("exec.resize requires a TTY exec stream"))
+		}
+		if err := session.resize.Resize(params.Columns, params.Rows); err != nil {
+			if errors.Is(err, io.ErrClosedPipe) {
+				return nil, &operationError{code: "stream_closed", err: fmt.Errorf("exec stream %q is closed", params.StreamID)}
+			}
+			return nil, invalidParams(err)
+		}
+		return map[string]any{"streamID": params.StreamID, "accepted": true, "columns": params.Columns, "rows": params.Rows}, nil
 	case "stream.cancel", "resource.cancel", "resource.watch.cancel":
 		streamID := request.StreamID
 		if streamID == "" {
@@ -354,6 +604,282 @@ type logParams struct {
 	Follow     bool   `json:"follow"`
 	Timestamps bool   `json:"timestamps"`
 	TailLines  int64  `json:"tailLines"`
+}
+
+type execParams struct {
+	StreamID       string   `json:"streamID"`
+	Namespace      string   `json:"namespace"`
+	Pod            string   `json:"pod"`
+	Container      string   `json:"container"`
+	Command        []string `json:"command"`
+	TTY            *bool    `json:"tty"`
+	Stdin          *bool    `json:"stdin"`
+	InitialColumns int      `json:"initialColumns"`
+	InitialRows    int      `json:"initialRows"`
+}
+
+func (p *execParams) validate() error {
+	p.Namespace = strings.TrimSpace(p.Namespace)
+	p.Pod = strings.TrimSpace(p.Pod)
+	p.Container = strings.TrimSpace(p.Container)
+	if p.Namespace == "" || p.Pod == "" {
+		return errors.New("namespace and pod are required")
+	}
+	if len(p.Command) == 0 {
+		return errors.New("command must contain at least one argv element")
+	}
+	if len(p.Command) > 64 {
+		return errors.New("command cannot contain more than 64 argv elements")
+	}
+	commandBytes := 0
+	for index, argument := range p.Command {
+		if strings.IndexByte(argument, 0) >= 0 {
+			return fmt.Errorf("command argument %d contains a NUL byte", index)
+		}
+		commandBytes += len(argument)
+	}
+	if commandBytes > 64<<10 {
+		return errors.New("command arguments cannot exceed 65536 bytes")
+	}
+	if p.InitialColumns < 0 || p.InitialColumns > 65535 || p.InitialRows < 0 || p.InitialRows > 65535 {
+		return errors.New("initial terminal dimensions must be between 0 and 65535")
+	}
+	return nil
+}
+
+func (p execParams) tty() bool {
+	return p.TTY == nil || *p.TTY
+}
+
+func (p execParams) stdin() bool {
+	// Interactive TTY sessions naturally expect input. For a non-TTY command,
+	// stdin is opt-in so a one-shot command cannot wait forever for EOF.
+	if p.Stdin != nil {
+		return *p.Stdin
+	}
+	return p.tty()
+}
+
+func (p execParams) request() PodExecRequest {
+	return PodExecRequest{
+		Namespace: p.Namespace, Pod: p.Pod, Container: p.Container,
+		Command: append([]string(nil), p.Command...), TTY: p.tty(), Stdin: p.stdin(),
+	}
+}
+
+func (p execParams) initialDimensions() (uint16, uint16) {
+	columns, rows := p.InitialColumns, p.InitialRows
+	if columns == 0 {
+		columns = 80
+	}
+	if rows == 0 {
+		rows = 24
+	}
+	return uint16(columns), uint16(rows)
+}
+
+type execInputParams struct {
+	StreamID   string  `json:"streamID"`
+	Data       *string `json:"data"`
+	DataBase64 *string `json:"dataBase64"`
+}
+
+func decodeExecInputParams(request protocol.Request) (struct {
+	StreamID string
+	Data     []byte
+}, error) {
+	var params execInputParams
+	if err := decodeParams(request.Params, &params); err != nil {
+		return struct {
+			StreamID string
+			Data     []byte
+		}{}, err
+	}
+	streamID := request.StreamID
+	if streamID == "" {
+		streamID = params.StreamID
+	}
+	if streamID == "" {
+		return struct {
+			StreamID string
+			Data     []byte
+		}{}, errors.New("streamID is required")
+	}
+	if params.Data != nil && params.DataBase64 != nil {
+		return struct {
+			StreamID string
+			Data     []byte
+		}{}, errors.New("provide exactly one of data or dataBase64")
+	}
+	if params.Data == nil && params.DataBase64 == nil {
+		return struct {
+			StreamID string
+			Data     []byte
+		}{}, errors.New("data or dataBase64 is required")
+	}
+	data := []byte(nil)
+	if params.Data != nil {
+		data = []byte(*params.Data)
+	} else {
+		decoded, err := base64.StdEncoding.DecodeString(*params.DataBase64)
+		if err != nil {
+			return struct {
+				StreamID string
+				Data     []byte
+			}{}, fmt.Errorf("decode dataBase64: %w", err)
+		}
+		data = decoded
+	}
+	return struct {
+		StreamID string
+		Data     []byte
+	}{StreamID: streamID, Data: data}, nil
+}
+
+type execResizeParams struct {
+	StreamID string `json:"streamID"`
+	Columns  int    `json:"columns"`
+	Rows     int    `json:"rows"`
+}
+
+func decodeExecResizeParams(request protocol.Request) (struct {
+	StreamID string
+	Columns  uint16
+	Rows     uint16
+}, error) {
+	var params execResizeParams
+	if err := decodeParams(request.Params, &params); err != nil {
+		return struct {
+			StreamID string
+			Columns  uint16
+			Rows     uint16
+		}{}, err
+	}
+	streamID := request.StreamID
+	if streamID == "" {
+		streamID = params.StreamID
+	}
+	if streamID == "" {
+		return struct {
+			StreamID string
+			Columns  uint16
+			Rows     uint16
+		}{}, errors.New("streamID is required")
+	}
+	if params.Columns < 1 || params.Columns > 65535 || params.Rows < 1 || params.Rows > 65535 {
+		return struct {
+			StreamID string
+			Columns  uint16
+			Rows     uint16
+		}{}, errors.New("columns and rows must be between 1 and 65535")
+	}
+	return struct {
+		StreamID string
+		Columns  uint16
+		Rows     uint16
+	}{StreamID: streamID, Columns: uint16(params.Columns), Rows: uint16(params.Rows)}, nil
+}
+
+// startExec creates a direct Kubernetes remotecommand session. The helper
+// owns the pipes and terminal resize queue while the frontend communicates
+// exclusively through the versioned NDJSON stream protocol.
+func (s *Server) startExec(ctx context.Context, request protocol.Request) {
+	var params execParams
+	if err := decodeParams(request.Params, &params); err != nil {
+		s.writeFailure(request.ID, "invalid_params", err, nil)
+		return
+	}
+	if err := params.validate(); err != nil {
+		s.writeFailure(request.ID, "invalid_params", err, nil)
+		return
+	}
+	streamID := request.StreamID
+	if streamID == "" {
+		streamID = params.StreamID
+	}
+	if streamID == "" {
+		s.writeFailure(request.ID, "invalid_params", errors.New("streamID is required"), nil)
+		return
+	}
+
+	streamContext, cancel := context.WithCancel(ctx)
+	if !s.registerStream(streamID, cancel) {
+		cancel()
+		s.writeFailure(request.ID, "stream_exists", fmt.Errorf("stream %q already exists", streamID), nil)
+		return
+	}
+	input := newExecInput()
+	var resize *resizeQueue
+	if params.tty() {
+		columns, rows := params.initialDimensions()
+		resize = newResizeQueue(columns, rows)
+	}
+	session := &execSession{input: input, resize: resize, stdin: params.stdin()}
+	if !s.registerExecSession(streamID, session) {
+		s.unregisterStream(streamID)
+		input.Close()
+		if resize != nil {
+			resize.Close()
+		}
+		cancel()
+		s.writeFailure(request.ID, "stream_exists", fmt.Errorf("exec stream %q already exists", streamID), nil)
+		return
+	}
+
+	result := map[string]any{
+		"streamID": streamID, "status": "started", "namespace": params.Namespace,
+		"pod": params.Pod, "container": params.Container, "command": params.Command,
+		"tty": params.tty(), "stdin": params.stdin(),
+	}
+	s.write(protocol.Response(request.ID, result))
+	s.write(protocol.Event(streamID, "exec.started", result))
+	s.work.Add(1)
+	go func() {
+		defer s.work.Done()
+		defer s.unregisterExecSession(streamID)
+		defer s.unregisterStream(streamID)
+		defer cancel()
+		defer input.Close()
+		if resize != nil {
+			defer resize.Close()
+		}
+
+		streams := PodExecStreams{
+			Stdout: execEventWriter{server: s, streamID: streamID, event: "exec.stdout"},
+			Stderr: execEventWriter{server: s, streamID: streamID, event: "exec.stderr"},
+		}
+		if params.stdin() {
+			streams.Stdin = input
+		}
+		if resize != nil {
+			streams.TerminalSizeQueue = resize
+		}
+		execErr := s.cluster.PodExec(streamContext, params.request(), streams)
+		reason := "completed"
+		closeResult := map[string]any{"reason": reason, "exitCode": 0}
+		if streamContext.Err() != nil {
+			reason = "cancelled"
+			closeResult = map[string]any{"reason": reason}
+		} else if execErr != nil {
+			reason = "error"
+			exitCode, isExit := remoteExitCode(execErr)
+			closeResult = map[string]any{"reason": reason, "message": execErr.Error()}
+			if isExit {
+				closeResult["exitCode"] = exitCode
+			}
+			s.write(protocol.Event(streamID, "exec.error", closeResult))
+		}
+		closeResult["reason"] = reason
+		s.write(protocol.Event(streamID, "exec.closed", closeResult))
+	}()
+}
+
+func remoteExitCode(err error) (int, bool) {
+	var exitError kubeexec.ExitError
+	if errors.As(err, &exitError) && exitError.Exited() {
+		return exitError.ExitStatus(), true
+	}
+	return 0, false
 }
 
 type portForwardParams struct {
@@ -613,6 +1139,28 @@ func (s *Server) unregisterStream(id string) {
 	s.streamMu.Unlock()
 }
 
+func (s *Server) registerExecSession(id string, session *execSession) bool {
+	s.execMu.Lock()
+	defer s.execMu.Unlock()
+	if _, exists := s.execs[id]; exists {
+		return false
+	}
+	s.execs[id] = session
+	return true
+}
+
+func (s *Server) unregisterExecSession(id string) {
+	s.execMu.Lock()
+	delete(s.execs, id)
+	s.execMu.Unlock()
+}
+
+func (s *Server) execSession(id string) *execSession {
+	s.execMu.Lock()
+	defer s.execMu.Unlock()
+	return s.execs[id]
+}
+
 func (s *Server) cancelStream(id string) bool {
 	s.streamMu.Lock()
 	cancel, exists := s.streams[id]
@@ -747,6 +1295,143 @@ func (p *patchParams) validate() error {
 		return errors.New("patch must be a JSON object")
 	}
 	return nil
+}
+
+type manifestApplyParams struct {
+	resourceParams
+	ExpectedUID string `json:"expectedUID"`
+	Kind        string `json:"kind"`
+	Manifest    string `json:"manifest"`
+	Confirm     bool   `json:"confirm"`
+}
+
+func decodeManifestApplyParams(raw json.RawMessage) (manifestApplyParams, error) {
+	var params manifestApplyParams
+	if err := decodeParams(raw, &params); err != nil {
+		return params, err
+	}
+	if err := params.validate(); err != nil {
+		return params, err
+	}
+	return params, nil
+}
+
+func (p manifestApplyParams) identity() ManifestIdentity {
+	return ManifestIdentity{
+		Group: p.Group, Version: p.Version, Resource: p.Resource, Namespaced: p.isNamespaced(),
+		Namespace: p.Namespace, Name: p.Name, UID: p.ExpectedUID, Kind: p.Kind,
+	}
+}
+
+func (p manifestApplyParams) request(dryRun bool) ManifestApplyRequest {
+	return ManifestApplyRequest{Identity: p.identity(), Object: p.object(), DryRun: dryRun}
+}
+
+func (p *manifestApplyParams) validate() error {
+	if err := p.validateResource(); err != nil {
+		return err
+	}
+	p.ExpectedUID = strings.TrimSpace(p.ExpectedUID)
+	p.Kind = strings.TrimSpace(p.Kind)
+	p.Manifest = strings.TrimSpace(p.Manifest)
+	if p.Name == "" || p.ExpectedUID == "" || p.Kind == "" {
+		return errors.New("name, expectedUID, and kind are required")
+	}
+	if p.isNamespaced() && p.Namespace == "" {
+		return errors.New("namespace is required for a namespaced resource")
+	}
+	if p.Manifest == "" {
+		return errors.New("manifest is required")
+	}
+	object, err := parseManifestYAML(p.Manifest)
+	if err != nil {
+		return err
+	}
+	if object.GetAPIVersion() != p.gvr().GroupVersion().String() || object.GetKind() != p.Kind {
+		return fmt.Errorf("manifest apiVersion and kind must remain %s and %s", p.gvr().GroupVersion().String(), p.Kind)
+	}
+	if object.GetName() != p.Name {
+		return fmt.Errorf("manifest metadata.name must remain %q", p.Name)
+	}
+	if p.isNamespaced() && object.GetNamespace() != p.Namespace {
+		return fmt.Errorf("manifest metadata.namespace must remain %q", p.Namespace)
+	}
+	if !p.isNamespaced() && object.GetNamespace() != "" {
+		return errors.New("manifest metadata.namespace must be empty for a cluster-scoped resource")
+	}
+	if uid := string(object.GetUID()); uid != "" && uid != p.ExpectedUID {
+		return errors.New("manifest metadata.uid does not match expectedUID")
+	}
+	for _, field := range []string{"resourceVersion", "managedFields", "creationTimestamp", "generation", "selfLink", "deletionTimestamp", "deletionGracePeriodSeconds"} {
+		if _, found, _ := unstructured.NestedFieldNoCopy(object.Object, "metadata", field); found {
+			return fmt.Errorf("manifest metadata.%s is server-managed and must be omitted", field)
+		}
+	}
+	if _, found, _ := unstructured.NestedFieldNoCopy(object.Object, "status"); found {
+		return errors.New("manifest status is server-managed and must be omitted")
+	}
+	return nil
+}
+
+func (p manifestApplyParams) object() *unstructured.Unstructured {
+	object, _ := parseManifestYAML(p.Manifest)
+	return object
+}
+
+func parseManifestYAML(source string) (*unstructured.Unstructured, error) {
+	var object map[string]any
+	if err := yaml.UnmarshalStrict([]byte(source), &object); err != nil {
+		return nil, fmt.Errorf("invalid manifest YAML: %w", err)
+	}
+	if object == nil {
+		return nil, errors.New("manifest must be a YAML object")
+	}
+	result := &unstructured.Unstructured{Object: object}
+	if result.GetAPIVersion() == "" || result.GetKind() == "" {
+		return nil, errors.New("manifest apiVersion and kind are required")
+	}
+	if result.GetName() == "" {
+		return nil, errors.New("manifest metadata.name is required")
+	}
+	return result, nil
+}
+
+func NewManifestDocument(object *unstructured.Unstructured, identity ManifestIdentity) (ManifestDocument, error) {
+	if object == nil {
+		return ManifestDocument{}, errors.New("Kubernetes returned an empty manifest")
+	}
+	editable := canonicalEditableObject(object)
+	encoded, err := yaml.Marshal(editable.Object)
+	if err != nil {
+		return ManifestDocument{}, fmt.Errorf("marshal canonical manifest YAML: %w", err)
+	}
+	identity.Kind = object.GetKind()
+	if identity.UID == "" {
+		identity.UID = string(object.GetUID())
+	}
+	return ManifestDocument{Identity: identity, YAML: string(encoded)}, nil
+}
+
+// canonicalEditableObject strips fields owned by the API server. They are not
+// useful in an editor and would make a read → edit → apply cycle noisy or
+// invalid, especially for dynamic custom resources.
+func canonicalEditableObject(object *unstructured.Unstructured) *unstructured.Unstructured {
+	editable := object.DeepCopy()
+	unstructured.RemoveNestedField(editable.Object, "status")
+	for _, field := range []string{"uid", "resourceVersion", "managedFields", "creationTimestamp", "generation", "selfLink", "deletionTimestamp", "deletionGracePeriodSeconds"} {
+		unstructured.RemoveNestedField(editable.Object, "metadata", field)
+	}
+	return editable
+}
+
+func manifestOperationError(err error, fallback string) *operationError {
+	if apierrors.IsConflict(err) {
+		return &operationError{code: "manifest_conflict", err: fmt.Errorf("%s: %w", fallback, err)}
+	}
+	if errors.Is(err, ErrManifestIdentityMismatch) {
+		return &operationError{code: "identity_mismatch", err: err}
+	}
+	return &operationError{code: "manifest_validation_failed", err: fmt.Errorf("%s: %w", fallback, err)}
 }
 
 type scaleParams struct {

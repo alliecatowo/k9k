@@ -2,9 +2,18 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"time"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/tools/remotecommand"
 )
+
+// ErrManifestIdentityMismatch is returned when the object selected for an
+// editor was deleted/recreated or otherwise no longer has its original UID.
+var ErrManifestIdentityMismatch = errors.New("manifest identity no longer matches the selected resource")
 
 type Context struct {
 	Name    string `json:"name"`
@@ -159,4 +168,57 @@ type PortForwardBinding struct {
 	LocalAddress string `json:"localAddress"`
 	LocalPort    int    `json:"localPort"`
 	RemotePort   int    `json:"remotePort"`
+}
+
+// PodExecRequest describes a single command run inside an existing container.
+// Command is an argv array, never a shell fragment: the helper sends it to the
+// Kubernetes pods/exec API unchanged and does not invoke a local shell.
+type PodExecRequest struct {
+	Namespace string   `json:"namespace"`
+	Pod       string   `json:"pod"`
+	Container string   `json:"container,omitempty"`
+	Command   []string `json:"command"`
+	Stdin     bool     `json:"stdin"`
+	TTY       bool     `json:"tty"`
+}
+
+// PodExecStreams are the byte-oriented endpoints of an exec session. stdout
+// and stderr deliberately remain separate when TTY is false; a TTY combines
+// them according to Kubernetes remotecommand semantics.
+type PodExecStreams struct {
+	Stdin             io.Reader
+	Stdout            io.Writer
+	Stderr            io.Writer
+	TerminalSizeQueue remotecommand.TerminalSizeQueue
+}
+
+// ManifestIdentity pins an editor session to the exact object that was opened.
+// UID is deliberately included: a name can be deleted and recreated while an
+// editor is open, and applying to that replacement would be surprising.
+type ManifestIdentity struct {
+	Group      string `json:"group,omitempty"`
+	Version    string `json:"version"`
+	Resource   string `json:"resource"`
+	Namespaced bool   `json:"namespaced"`
+	Namespace  string `json:"namespace,omitempty"`
+	Name       string `json:"name"`
+	UID        string `json:"uid"`
+	Kind       string `json:"kind"`
+}
+
+// ManifestDocument is an editor-safe representation of a selected Kubernetes
+// object. YAML excludes server-managed metadata and status while Identity
+// carries the immutable selection guard required for an update.
+type ManifestDocument struct {
+	Identity ManifestIdentity `json:"identity"`
+	YAML     string           `json:"yaml"`
+}
+
+// ManifestApplyRequest crosses into the direct client-go layer only after the
+// protocol has parsed YAML and checked identity. DryRun invokes Kubernetes
+// admission/defaulting without persisting anything.
+type ManifestApplyRequest struct {
+	Identity ManifestIdentity
+	Object   *unstructured.Unstructured
+	DryRun   bool
 }

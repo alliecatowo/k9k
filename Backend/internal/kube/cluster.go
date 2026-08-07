@@ -22,9 +22,11 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
+	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport/spdy"
 	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 	metricsclient "k8s.io/metrics/pkg/client/clientset/versioned/typed/metrics/v1beta1"
@@ -220,6 +222,46 @@ func (c *Cluster) Patch(ctx context.Context, gvr schema.GroupVersionResource, na
 	return resource.Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{})
 }
 
+// Manifest returns an editor-safe canonical YAML document. It never exports
+// status or volatile server metadata, but carries the object UID separately so
+// a later apply cannot silently target a delete/recreate replacement.
+func (c *Cluster) Manifest(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string, namespaced bool) (api.ManifestDocument, error) {
+	object, err := c.Get(ctx, gvr, namespace, name, namespaced)
+	if err != nil {
+		return api.ManifestDocument{}, err
+	}
+	return api.NewManifestDocument(object, api.ManifestIdentity{
+		Group: gvr.Group, Version: gvr.Version, Resource: gvr.Resource, Namespaced: namespaced,
+		Namespace: namespace, Name: name, UID: string(object.GetUID()), Kind: object.GetKind(),
+	})
+}
+
+// ApplyManifest uses server-side apply directly through the dynamic client. A
+// fresh GET guards the original UID before *each* dry run or actual write; the
+// two-step protocol therefore cannot mutate an object that was recreated after
+// the editor opened. Force is intentionally left false so ownership conflicts
+// remain visible to the native editor instead of stealing fields.
+func (c *Cluster) ApplyManifest(ctx context.Context, request api.ManifestApplyRequest) (*unstructured.Unstructured, error) {
+	identity := request.Identity
+	gvr := schema.GroupVersionResource{Group: identity.Group, Version: identity.Version, Resource: identity.Resource}
+	resource, err := c.resource(gvr, identity.Namespace, identity.Namespaced)
+	if err != nil {
+		return nil, err
+	}
+	current, err := resource.Get(ctx, identity.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if string(current.GetUID()) != identity.UID || current.GetKind() != identity.Kind || current.GetAPIVersion() != gvr.GroupVersion().String() {
+		return nil, api.ErrManifestIdentityMismatch
+	}
+	options := metav1.ApplyOptions{FieldManager: "k9k"}
+	if request.DryRun {
+		options.DryRun = []string{metav1.DryRunAll}
+	}
+	return resource.Apply(ctx, identity.Name, request.Object, options)
+}
+
 func (c *Cluster) PodLogs(ctx context.Context, namespace, pod, container string, previous, follow, timestamps bool, tailLines int64) (io.ReadCloser, error) {
 	c.mu.RLock()
 	typed := c.typed
@@ -232,6 +274,49 @@ func (c *Cluster) PodLogs(ctx context.Context, namespace, pod, container string,
 		options.TailLines = &tailLines
 	}
 	return typed.CoreV1().Pods(namespace).GetLogs(pod, options).Stream(ctx)
+}
+
+// PodExec connects directly to Kubernetes' pods/exec SPDY endpoint using the
+// selected kubeconfig. Command is an argv array supplied to PodExecOptions;
+// there is no local shell or kubectl subprocess in this execution path.
+func (c *Cluster) PodExec(ctx context.Context, request api.PodExecRequest, streams api.PodExecStreams) error {
+	c.mu.RLock()
+	typed := c.typed
+	var restConfig *rest.Config
+	if c.rest != nil {
+		restConfig = rest.CopyConfig(c.rest)
+	}
+	c.mu.RUnlock()
+	if typed == nil || restConfig == nil {
+		return fmt.Errorf("no usable Kubernetes context is selected")
+	}
+
+	options := &corev1.PodExecOptions{
+		Container: request.Container,
+		Command:   append([]string(nil), request.Command...),
+		Stdin:     request.Stdin,
+		Stdout:    streams.Stdout != nil,
+		Stderr:    streams.Stderr != nil && !request.TTY,
+		TTY:       request.TTY,
+	}
+	endpoint := typed.CoreV1().RESTClient().Post().
+		Namespace(request.Namespace).
+		Resource("pods").
+		Name(request.Pod).
+		SubResource("exec").
+		VersionedParams(options, scheme.ParameterCodec).
+		URL()
+	executor, err := remotecommand.NewSPDYExecutor(restConfig, http.MethodPost, endpoint)
+	if err != nil {
+		return fmt.Errorf("create pod exec transport: %w", err)
+	}
+	if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdin: streams.Stdin, Stdout: streams.Stdout, Stderr: streams.Stderr,
+		Tty: request.TTY, TerminalSizeQueue: streams.TerminalSizeQueue,
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 // PortForward establishes a direct SPDY connection to the selected API server
