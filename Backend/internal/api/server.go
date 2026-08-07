@@ -69,6 +69,8 @@ type ClusterClient interface {
 	RollbackDeployment(context.Context, DeploymentRollbackRequest) (DeploymentRollbackResult, error)
 	RollbackHelm(context.Context, HelmRollbackRequest) (HelmRollbackResult, error)
 	UninstallHelm(context.Context, HelmUninstallRequest) (HelmUninstallResult, error)
+	PlanHelmUpgrade(context.Context, HelmUpgradeRequest) (HelmUpgradePlan, error)
+	UpgradeHelm(context.Context, HelmUpgradeRequest) (HelmUpgradeResult, error)
 	CheckAccess(context.Context, AccessCheck) (AccessReview, error)
 	PortForward(context.Context, PortForwardRequest, func(PortForwardBinding)) error
 	PodExec(context.Context, PodExecRequest, PodExecStreams) error
@@ -218,7 +220,7 @@ func protectedReadOnlyOperation(operation string) bool {
 	case "context.select", "context.update", "context.rename", "context.copy", "context.delete", "config.write",
 		"resource.patch", "resource.delete", "resource.scale", "manifest.apply", "manifest.applyBatch", "manifest.applyMixed", "manifest.deleteBatch",
 		"node.drain", "pod.debug", "cronjob.trigger", "deployment.rollback", "exec.open", "attach.open", "portforward.open",
-		"helm.rollback", "helm.uninstall":
+		"helm.rollback", "helm.uninstall", "helm.upgrade":
 		return true
 	default:
 		return false
@@ -680,6 +682,67 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(uninstallErr)
 		}
 		return result, nil
+	case "helm.upgrade.plan":
+		var params struct {
+			HelmUpgradeRequest
+			AcknowledgeSensitive bool `json:"acknowledgeSensitive"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		validated, err := validateHelmUpgradeParams(params.HelmUpgradeRequest, false)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		if !params.AcknowledgeSensitive {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("Helm upgrade planning requires acknowledgeSensitive: true because rendered manifests and values may reveal secrets")}
+		}
+		if err := s.verifyHelmCurrentRevision(ctx, validated.Namespace, validated.Release, validated.ExpectedStorageName, validated.ExpectedRevision); err != nil {
+			if errors.Is(err, ErrHelmReleaseChanged) || errors.Is(err, ErrHelmReleaseUnsafe) {
+				return nil, &operationError{code: "stale_release", err: err}
+			}
+			return nil, kubeError(err)
+		}
+		if accessErr := s.checkHelmStorageAccess(ctx, validated.Namespace, "get", "list", "create", "update"); accessErr != nil {
+			return nil, accessErr
+		}
+		result, planErr := s.cluster.PlanHelmUpgrade(ctx, validated)
+		if planErr != nil {
+			return nil, kubeError(planErr)
+		}
+		archive, _ := base64.StdEncoding.DecodeString(validated.ChartArchiveBase64)
+		result.PlanDigest = helmUpgradeDigest(validated, archive)
+		return result, nil
+	case "helm.upgrade":
+		var params struct {
+			HelmUpgradeRequest
+			Confirm              bool `json:"confirm"`
+			AcknowledgeSensitive bool `json:"acknowledgeSensitive"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		validated, err := validateHelmUpgradeParams(params.HelmUpgradeRequest, true)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		if !params.Confirm || !params.AcknowledgeSensitive {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("Helm upgrade requires confirm: true and acknowledgeSensitive: true after reviewing its plan")}
+		}
+		if err := s.verifyHelmCurrentRevision(ctx, validated.Namespace, validated.Release, validated.ExpectedStorageName, validated.ExpectedRevision); err != nil {
+			if errors.Is(err, ErrHelmReleaseChanged) || errors.Is(err, ErrHelmReleaseUnsafe) {
+				return nil, &operationError{code: "stale_release", err: err}
+			}
+			return nil, kubeError(err)
+		}
+		if accessErr := s.checkHelmStorageAccess(ctx, validated.Namespace, "get", "list", "create", "update"); accessErr != nil {
+			return nil, accessErr
+		}
+		result, upgradeErr := s.cluster.UpgradeHelm(ctx, validated)
+		if upgradeErr != nil {
+			return nil, kubeError(upgradeErr)
+		}
+		return result, nil
 	case "relationships.get":
 		params, err := decodeResourceParams(request.Params, true)
 		if err != nil {
@@ -709,6 +772,16 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, invalidParams(errors.New("manifest diff requires an existing selected resource"))
 		}
 		result, diffErr := s.diffManifest(ctx, params)
+		if diffErr != nil {
+			return nil, diffErr
+		}
+		return result, nil
+	case "manifest.diffImported":
+		params, err := decodeManifestImportedDiffParams(request.Params)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		result, diffErr := s.diffImportedManifest(ctx, params.Manifest)
 		if diffErr != nil {
 			return nil, diffErr
 		}
@@ -1962,6 +2035,13 @@ type manifestBatchDeleteParams struct {
 	Confirm bool               `json:"confirm"`
 }
 
+// manifestImportedDiffParams is intentionally source-only. The helper resolves
+// the GVR from live discovery and fetches the live UID itself, so a workspace
+// can compare a selected YAML file without trusting a local plural or UID.
+type manifestImportedDiffParams struct {
+	Manifest string `json:"manifest"`
+}
+
 // manifestDiscoveryError keeps a live-cluster failure distinct from an invalid
 // import. The native client can then distinguish a transient RBAC/API outage
 // from YAML a user needs to correct.
@@ -2023,6 +2103,26 @@ func decodeManifestBatchDeleteParams(raw json.RawMessage) (manifestBatchDeletePa
 		seen[key] = struct{}{}
 		params.Items[index] = identity
 	}
+	return params, nil
+}
+
+func decodeManifestImportedDiffParams(raw json.RawMessage) (manifestImportedDiffParams, error) {
+	var params manifestImportedDiffParams
+	if err := decodeParams(raw, &params); err != nil {
+		return params, err
+	}
+	params.Manifest = strings.TrimSpace(params.Manifest)
+	if params.Manifest == "" {
+		return params, errors.New("manifest is required")
+	}
+	documents, err := parseManifestYAMLDocuments(params.Manifest)
+	if err != nil {
+		return params, err
+	}
+	if len(documents) != 1 {
+		return params, errors.New("manifest diff from workspace requires exactly one YAML document")
+	}
+	params.Manifest = documents[0]
 	return params, nil
 }
 
@@ -2210,6 +2310,39 @@ func (s *Server) deleteManifestBatch(ctx context.Context, items []ManifestIdenti
 		}
 	}
 	return ManifestBatchDeleteResult{Validated: true, Deleted: true, Items: items}, nil
+}
+
+// diffImportedManifest turns one selected local YAML document into the same
+// UID-pinned SSA comparison used by the editor. It resolves the document from
+// active discovery and obtains the expected UID solely from a fresh API read;
+// the workspace cannot choose either value itself.
+func (s *Server) diffImportedManifest(ctx context.Context, source string) (ManifestDiffResult, *operationError) {
+	documents, parseErr := parseManifestYAMLDocuments(source)
+	if parseErr != nil {
+		return ManifestDiffResult{}, invalidParams(parseErr)
+	}
+	items, resolveErr := s.resolveMixedManifestItems(ctx, documents)
+	if resolveErr != nil {
+		var discoveryErr *manifestDiscoveryError
+		if errors.As(resolveErr, &discoveryErr) {
+			return ManifestDiffResult{}, kubeError(discoveryErr)
+		}
+		return ManifestDiffResult{}, invalidParams(resolveErr)
+	}
+	if len(items) != 1 {
+		return ManifestDiffResult{}, invalidParams(errors.New("manifest diff from workspace requires exactly one YAML document"))
+	}
+	params := items[0]
+	live, manifestErr := s.cluster.Manifest(ctx, params.gvr(), params.Namespace, params.Name, params.isNamespaced())
+	if manifestErr != nil {
+		return ManifestDiffResult{}, kubeError(manifestErr)
+	}
+	if live.Identity.UID == "" {
+		return ManifestDiffResult{}, manifestOperationError(ErrManifestIdentityMismatch, "live manifest has no UID")
+	}
+	params.Create = false
+	params.ExpectedUID = live.Identity.UID
+	return s.diffManifest(ctx, params)
 }
 
 // diffManifest intentionally uses the same non-forced SSA dry-run as Apply.

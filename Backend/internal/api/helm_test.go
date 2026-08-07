@@ -1,6 +1,7 @@
 package api
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -224,8 +225,8 @@ func TestHelmLifecycleRejectsStaleReleaseAndUninstallConfirmation(t *testing.T) 
 		"chart": map[string]any{"metadata": map[string]any{"name": "web-chart", "version": "1.2.0"}},
 	})
 	client := &fakeCluster{
-		list: []ResourceSummary{{Name: current.GetName(), Namespace: "demo", Labels: current.GetLabels()}},
-		objects: map[string]*unstructured.Unstructured{"demo/" + current.GetName(): current},
+		list:     []ResourceSummary{{Name: current.GetName(), Namespace: "demo", Labels: current.GetLabels()}},
+		objects:  map[string]*unstructured.Unstructured{"demo/" + current.GetName(): current},
 		accessFn: func(AccessCheck) AccessReview { return AccessReview{Allowed: true} },
 	}
 	responses := runRequests(t, client,
@@ -243,6 +244,84 @@ func TestHelmLifecycleRejectsStaleReleaseAndUninstallConfirmation(t *testing.T) 
 	if len(client.helmUninstalls) != 0 {
 		t.Fatalf("uninstalls must not run for stale or unconfirmed requests: %#v", client.helmUninstalls)
 	}
+}
+
+func TestHelmUpgradeRequiresSensitivePlanAndExactDigest(t *testing.T) {
+	current := helmStorageSecret(t, "demo", "web", 7, map[string]any{
+		"name": "web", "namespace": "demo", "version": 7,
+		"chart": map[string]any{"metadata": map[string]any{"name": "web-chart", "version": "1.0.0"}},
+	})
+	client := &fakeCluster{
+		list:     []ResourceSummary{{Name: current.GetName(), Namespace: "demo", Labels: current.GetLabels()}},
+		objects:  map[string]*unstructured.Unstructured{"demo/" + current.GetName(): current},
+		accessFn: func(AccessCheck) AccessReview { return AccessReview{Allowed: true} },
+	}
+	params := map[string]any{
+		"namespace": "demo", "release": "web", "expectedStorageName": current.GetName(), "expectedRevision": 7,
+		"chartArchiveBase64": helmTestChartArchive(t), "valuesYAML": "replicas: 3\n", "valuesMode": "reset",
+	}
+	withAcknowledgement := make(map[string]any, len(params)+1)
+	for key, value := range params {
+		withAcknowledgement[key] = value
+	}
+	withAcknowledgement["acknowledgeSensitive"] = true
+	responses := runRequests(t, client,
+		request("refuse", "helm.upgrade.plan", params),
+		request("plan", "helm.upgrade.plan", withAcknowledgement),
+	)
+	if failure := envelopeByID(t, responses, "refuse"); failure.Error == nil || failure.Error.Code != "confirmation_required" {
+		t.Fatalf("unacknowledged plan = %#v", failure)
+	}
+	plan := decodeResult[HelmUpgradePlan](t, envelopeByID(t, responses, "plan").Result)
+	if plan.PlanDigest == "" || plan.ChartName != "test" || plan.NextRevision != 8 {
+		t.Fatalf("upgrade plan = %#v", plan)
+	}
+	upgrade := make(map[string]any, len(withAcknowledgement)+2)
+	for key, value := range withAcknowledgement {
+		upgrade[key] = value
+	}
+	upgrade["planDigest"] = plan.PlanDigest
+	upgrade["confirm"] = true
+	responses = runRequests(t, client,
+		request("missing-digest", "helm.upgrade", withAcknowledgement),
+		request("upgrade", "helm.upgrade", upgrade),
+	)
+	if failure := envelopeByID(t, responses, "missing-digest"); failure.Error == nil || failure.Error.Code != "invalid_params" {
+		t.Fatalf("upgrade without plan digest = %#v", failure)
+	}
+	if response := envelopeByID(t, responses, "upgrade"); response.Error != nil {
+		t.Fatalf("upgrade = %#v", response)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.helmUpgradePlans) != 1 || len(client.helmUpgrades) != 1 || client.helmUpgrades[0].PlanDigest != plan.PlanDigest {
+		t.Fatalf("upgrade calls = plans %#v, upgrades %#v", client.helmUpgradePlans, client.helmUpgrades)
+	}
+}
+
+func helmTestChartArchive(t *testing.T) string {
+	t.Helper()
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	tarWriter := tar.NewWriter(gz)
+	for name, contents := range map[string]string{
+		"test/Chart.yaml":               "apiVersion: v2\nname: test\nversion: 1.0.0\n",
+		"test/templates/configmap.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Release.Name }}\n",
+	} {
+		if err := tarWriter.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(contents)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatalf("write chart header: %v", err)
+		}
+		if _, err := tarWriter.Write([]byte(contents)); err != nil {
+			t.Fatalf("write chart entry: %v", err)
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatalf("close chart tar: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close chart gzip: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(compressed.Bytes())
 }
 
 func helmStorageSecret(t *testing.T, namespace, release string, revision int, payload map[string]any) *unstructured.Unstructured {

@@ -192,6 +192,43 @@ type HelmUninstallResult struct {
 	Message     string `json:"message"`
 }
 
+// HelmUpgradeRequest accepts only a bounded, explicitly selected packaged
+// chart archive. K9k deliberately does not fetch HTTP/OCI repositories or
+// inherit a Helm repository credential store from a GUI action.
+type HelmUpgradeRequest struct {
+	Namespace           string `json:"namespace"`
+	Release             string `json:"release"`
+	ExpectedStorageName string `json:"expectedStorageName"`
+	ExpectedRevision    int    `json:"expectedRevision"`
+	ChartArchiveBase64  string `json:"chartArchiveBase64"`
+	ValuesYAML          string `json:"valuesYAML,omitempty"`
+	ValuesMode          string `json:"valuesMode"`
+	PlanDigest          string `json:"planDigest,omitempty"`
+}
+
+// HelmUpgradePlan is sensitive by design: rendered manifests and values can
+// include credentials. The server returns it only after acknowledgement and
+// bounds the manifest before it crosses the helper IPC boundary.
+type HelmUpgradePlan struct {
+	Namespace      string `json:"namespace"`
+	Release        string `json:"release"`
+	ChartName      string `json:"chartName"`
+	ChartVersion   string `json:"chartVersion"`
+	ValuesMode     string `json:"valuesMode"`
+	PlanDigest     string `json:"planDigest"`
+	Manifest       string `json:"manifest"`
+	ManifestDigest string `json:"manifestDigest"`
+	Notes          string `json:"notes,omitempty"`
+	NextRevision   int    `json:"nextRevision"`
+}
+
+type HelmUpgradeResult struct {
+	Namespace string `json:"namespace"`
+	Release   string `json:"release"`
+	Revision  int    `json:"revision"`
+	Message   string `json:"message"`
+}
+
 // RelationshipGraph is a bounded, read-only topology snapshot centred on one
 // selected object. Nodes use stable object identity where Kubernetes provided
 // a UID; unresolved references are retained rather than silently discarded.

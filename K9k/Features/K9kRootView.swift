@@ -203,7 +203,7 @@ struct K9kRootView: View {
         .sheet(item: $pluginToRun) { plugin in
             if let resource = store.resource(for: store.selectedResources.first) { K9sPluginRunnerView(plugin: plugin, resource: resource) }
         }
-        .sheet(isPresented: $manifestImportPresented) { ManifestImportView() }
+        .sheet(isPresented: $manifestImportPresented) { ManifestWorkspaceView() }
         .sheet(isPresented: $pulsePresented) { PulseView(isPresented: $pulsePresented) }
         .sheet(isPresented: $accessCheckPresented) {
             AccessCheckView(initialType: store.selectedResourceType, initialResource: store.resource(for: store.selectedResources.first))

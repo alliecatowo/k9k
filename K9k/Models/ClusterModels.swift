@@ -220,6 +220,22 @@ struct HelmSensitiveContents: Codable, Hashable {
     let valuesTruncated: Bool
 }
 
+/// A sensitive, server-side Helm upgrade preview. The app only receives this
+/// after the operator acknowledges that rendered manifests and values can
+/// expose production credentials.
+struct HelmUpgradePlan: Codable, Hashable {
+    let namespace: String
+    let release: String
+    let chartName: String
+    let chartVersion: String
+    let valuesMode: String
+    let planDigest: String
+    let manifest: String
+    let manifestDigest: String
+    let notes: String?
+    let nextRevision: Int
+}
+
 struct NodeDrainResult: Codable, Hashable {
     let node: String
     let evicted: [NodeDrainPod]
@@ -316,10 +332,36 @@ struct PortForwardBinding: Codable, Hashable {
     var endpoint: String { "\(localAddress):\(localPort) → \(pod):\(remotePort)" }
 }
 
+enum PortForwardConnectionState: Hashable {
+    case connected
+    case reconnecting(attempt: Int, maximumAttempts: Int)
+    case failed(message: String)
+
+    var isConnected: Bool {
+        if case .connected = self { return true }
+        return false
+    }
+
+    var detail: String {
+        switch self {
+        case .connected:
+            "Connected"
+        case let .reconnecting(attempt, maximumAttempts):
+            "Reconnecting (attempt \(attempt) of \(maximumAttempts))"
+        case let .failed(message):
+            "Disconnected: \(message)"
+        }
+    }
+}
+
+/// A forward's identity survives transport reconnection. `streamID` changes
+/// for every direct SPDY session, while `id` lets the native UI preserve the
+/// same row and lets Stop cancel a pending retry as well as a live tunnel.
 struct ActivePortForward: Identifiable, Hashable {
-    let streamID: String
-    let binding: PortForwardBinding
-    var id: String { streamID }
+    let id: UUID
+    var streamID: String
+    var binding: PortForwardBinding
+    var connectionState: PortForwardConnectionState
 }
 
 struct MetricsListResponse: Codable, Hashable {

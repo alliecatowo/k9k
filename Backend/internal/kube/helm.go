@@ -1,12 +1,23 @@
 package kube
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
+	"io"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/k9k-app/k9k/backend/internal/api"
 	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart"
+	"helm.sh/helm/v3/pkg/chart/loader"
+	"helm.sh/helm/v3/pkg/chartutil"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
@@ -17,6 +28,13 @@ import (
 )
 
 const helmAPITimeout = 45 * time.Second
+
+const (
+	maxHelmChartFiles       = 2048
+	maxHelmChartContentSize = 32 << 20
+	maxHelmChartFileSize    = 4 << 20
+	maxHelmPlanManifestSize = 1 << 20
+)
 
 // helmRESTClientGetter bridges the already-selected K9k kubeconfig context to
 // Helm's SDK. It never invokes the helm executable, reads a second kubeconfig,
@@ -150,4 +168,146 @@ func (c *Cluster) UninstallHelm(ctx context.Context, request api.HelmUninstallRe
 		Namespace: request.Namespace, Release: request.Release, KeepHistory: true, Info: info,
 		Message: "Uninstall started through Helm. Release history was retained.",
 	}, nil
+}
+
+// PlanHelmUpgrade renders an exact packaged chart through Helm's server
+// dry-run upgrade path. Its archive parser accepts only bounded regular tar
+// files, so neither a path from the sandboxed UI nor a compressed chart bomb
+// becomes an out-of-band filesystem read or unbounded helper allocation.
+func (c *Cluster) PlanHelmUpgrade(ctx context.Context, request api.HelmUpgradeRequest) (api.HelmUpgradePlan, error) {
+	chart, values, err := loadHelmUpgradeInput(request)
+	if err != nil {
+		return api.HelmUpgradePlan{}, err
+	}
+	config, err := c.helmActionConfiguration(request.Namespace)
+	if err != nil {
+		return api.HelmUpgradePlan{}, err
+	}
+	upgrade := configuredHelmUpgrade(config, request)
+	upgrade.DryRun = true
+	upgrade.DryRunOption = "server"
+	upgrade.HideSecret = true
+	release, err := upgrade.RunWithContext(ctx, request.Release, chart, values)
+	if err != nil {
+		return api.HelmUpgradePlan{}, fmt.Errorf("plan Helm upgrade %q: %w", request.Release, err)
+	}
+	if release == nil || release.Chart == nil || release.Chart.Metadata == nil {
+		return api.HelmUpgradePlan{}, fmt.Errorf("Helm upgrade plan returned no chart metadata")
+	}
+	if len(release.Manifest) > maxHelmPlanManifestSize {
+		return api.HelmUpgradePlan{}, fmt.Errorf("rendered Helm manifest exceeds the %d-byte review limit", maxHelmPlanManifestSize)
+	}
+	manifestDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(release.Manifest)))
+	return api.HelmUpgradePlan{
+		Namespace: request.Namespace, Release: request.Release,
+		ChartName: release.Chart.Metadata.Name, ChartVersion: release.Chart.Metadata.Version,
+		ValuesMode: request.ValuesMode, Manifest: release.Manifest, ManifestDigest: manifestDigest,
+		Notes: release.Info.Notes, NextRevision: release.Version,
+	}, nil
+}
+
+// UpgradeHelm applies the exact packaged chart represented by a previously
+// reviewed plan digest. It does not resolve repositories, execute a local
+// shell, or use a persisted Helm repository/config directory.
+func (c *Cluster) UpgradeHelm(ctx context.Context, request api.HelmUpgradeRequest) (api.HelmUpgradeResult, error) {
+	chart, values, err := loadHelmUpgradeInput(request)
+	if err != nil {
+		return api.HelmUpgradeResult{}, err
+	}
+	config, err := c.helmActionConfiguration(request.Namespace)
+	if err != nil {
+		return api.HelmUpgradeResult{}, err
+	}
+	release, err := configuredHelmUpgrade(config, request).RunWithContext(ctx, request.Release, chart, values)
+	if err != nil {
+		return api.HelmUpgradeResult{}, fmt.Errorf("Helm upgrade %q: %w", request.Release, err)
+	}
+	if release == nil {
+		return api.HelmUpgradeResult{}, fmt.Errorf("Helm upgrade returned no release")
+	}
+	return api.HelmUpgradeResult{
+		Namespace: request.Namespace, Release: request.Release, Revision: release.Version,
+		Message: "Upgrade started through Helm; watch the release resources for rollout status.",
+	}, nil
+}
+
+func configuredHelmUpgrade(config *action.Configuration, request api.HelmUpgradeRequest) *action.Upgrade {
+	upgrade := action.NewUpgrade(config)
+	upgrade.Namespace = request.Namespace
+	upgrade.Wait = false
+	upgrade.Timeout = helmAPITimeout
+	upgrade.CleanupOnFail = true
+	upgrade.MaxHistory = 128
+	switch request.ValuesMode {
+	case "reuse":
+		upgrade.ReuseValues = true
+	case "reset-then-reuse":
+		upgrade.ResetThenReuseValues = true
+	default:
+		upgrade.ResetValues = true
+	}
+	return upgrade
+}
+
+func loadHelmUpgradeInput(request api.HelmUpgradeRequest) (*chart.Chart, map[string]interface{}, error) {
+	archive, err := base64.StdEncoding.DecodeString(request.ChartArchiveBase64)
+	if err != nil || len(archive) == 0 || len(archive) > 8<<20 {
+		return nil, nil, fmt.Errorf("invalid bounded packaged chart archive")
+	}
+	chart, err := loadBoundedHelmArchive(archive)
+	if err != nil {
+		return nil, nil, err
+	}
+	values, err := chartutil.ReadValues([]byte(request.ValuesYAML))
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse Helm values YAML: %w", err)
+	}
+	return chart, values, nil
+}
+
+func loadBoundedHelmArchive(archive []byte) (*chart.Chart, error) {
+	reader, err := gzip.NewReader(bytes.NewReader(archive))
+	if err != nil {
+		return nil, fmt.Errorf("packaged chart must be gzip-compressed tar: %w", err)
+	}
+	defer reader.Close()
+	tarReader := tar.NewReader(reader)
+	files := make([]*loader.BufferedFile, 0, 64)
+	var total int64
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read packaged chart archive: %w", err)
+		}
+		if header.Typeflag == tar.TypeDir {
+			continue
+		}
+		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+			return nil, fmt.Errorf("packaged chart contains unsupported non-regular entry %q", header.Name)
+		}
+		name := path.Clean(strings.TrimPrefix(header.Name, "./"))
+		if name == "." || path.IsAbs(name) || strings.HasPrefix(name, "../") || strings.Contains(name, "\\") {
+			return nil, fmt.Errorf("packaged chart contains unsafe path %q", header.Name)
+		}
+		if header.Size < 0 || header.Size > maxHelmChartFileSize || total+header.Size > maxHelmChartContentSize || len(files) >= maxHelmChartFiles {
+			return nil, fmt.Errorf("packaged chart exceeds K9k archive limits")
+		}
+		data, err := io.ReadAll(io.LimitReader(tarReader, header.Size+1))
+		if err != nil || int64(len(data)) != header.Size {
+			return nil, fmt.Errorf("read packaged chart entry %q", header.Name)
+		}
+		total += int64(len(data))
+		files = append(files, &loader.BufferedFile{Name: name, Data: data})
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("packaged chart is empty")
+	}
+	chart, err := loader.LoadFiles(files)
+	if err != nil {
+		return nil, fmt.Errorf("load packaged chart: %w", err)
+	}
+	return chart, nil
 }

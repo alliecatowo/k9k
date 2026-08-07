@@ -10,6 +10,14 @@ private struct RollbackSource {
     let revision: String?
 }
 
+/// Retains the user's original target so a reconnect can resolve a Service's
+/// current backing Pod again instead of blindly retrying a deleted Pod name.
+private struct PortForwardReconnectRequest {
+    let resource: ResourceSummary
+    let remotePort: Int
+    let localPort: Int
+}
+
 @MainActor
 @Observable
 final class ClusterStore {
@@ -110,6 +118,10 @@ final class ClusterStore {
     private let navigationHistoryDefaultsKey = "k9k.resourceNavigationHistory.v1"
     private let navigationHistoryLimit = 30
     private let savedResourceQueriesDefaultsKey = "k9k.savedResourceQueries.v1"
+    private let maximumPortForwardReconnectAttempts = 3
+    private var portForwardReconnectRequests: [ActivePortForward.ID: PortForwardReconnectRequest] = [:]
+    private var portForwardReconnectTasks: [ActivePortForward.ID: Task<Void, Never>] = [:]
+    private var portForwardFailureMessages: [String: String] = [:]
 
     private let client = CoreClient()
 
@@ -243,6 +255,10 @@ final class ClusterStore {
         isLoading = true
         defer { isLoading = false }
         do {
+            // A loopback listener must never silently retarget a different
+            // kubeconfig context. Stop its live SPDY stream and any scheduled
+            // reconnect before swapping credentials/cluster clients.
+            await closeAllPortForwards()
             _ = try await client.request("context.select", parameters: .object(["name": .string(context.name)]))
             selectedContext = context
             contexts = contexts.map { KubeContext(name: $0.name, cluster: $0.cluster, user: $0.user, namespace: $0.namespace, active: $0.id == context.id) }
@@ -1521,6 +1537,16 @@ final class ClusterStore {
         return try decode((try await client.request("manifest.diff", parameters: .object(parameters))).result, as: ManifestDiffResult.self)
     }
 
+    /// Compares exactly one selected manifest-workspace document with the
+    /// live object it declares. The helper resolves discovery and fresh UID on
+    /// its own, preserving the editor's stale-object protection for local
+    /// files that have never been opened in the resource browser.
+    func diffImportedManifest(source: String) async throws -> ManifestDiffResult {
+        try decode((try await client.request("manifest.diffImported", parameters: .object([
+            "manifest": .string(source),
+        ]))).result, as: ManifestDiffResult.self)
+    }
+
     func applyManifest(type: ResourceType, document: ManifestDocument, source: String) async throws -> ManifestApplyResult {
         try await submitManifest(type: type, document: document, source: source, confirm: true)
     }
@@ -1663,39 +1689,50 @@ final class ClusterStore {
         activeLogStreamID = nil
     }
 
-    func openPortForward(for resource: ResourceSummary, remotePort: Int, localPort: Int = 0) async -> PortForwardBinding? {
-        guard let namespace = resource.namespace else { return nil }
+    func openPortForward(for resource: ResourceSummary, remotePort: Int, localPort: Int = 0) async -> ActivePortForward? {
+        guard resource.namespace != nil else { return nil }
         guard (1...65535).contains(remotePort), (0...65535).contains(localPort) else {
             errorMessage = "Ports must be between 1 and 65535 (or use 0 for an automatic local port)."
             return nil
         }
-        let target: (pod: ResourceSummary, remotePort: Int)
         do {
-            if resource.kind == "Service" { target = try await resolveServiceForward(resource, servicePort: remotePort) }
-            else if resource.kind == "Pod" { target = (resource, remotePort) }
-            else { return nil }
+            guard resource.kind == "Service" || resource.kind == "Pod" else { return nil }
+            let request = PortForwardReconnectRequest(resource: resource, remotePort: remotePort, localPort: localPort)
+            let session = try await startPortForward(request)
+            let forward = ActivePortForward(
+                id: UUID(), streamID: session.streamID, binding: session.binding, connectionState: .connected
+            )
+            portForwardReconnectRequests[forward.id] = request
+            activePortForwards.append(forward)
+            return forward
         } catch {
             errorMessage = error.localizedDescription
             return nil
+        }
+    }
+
+    private func startPortForward(_ request: PortForwardReconnectRequest) async throws -> (streamID: String, binding: PortForwardBinding) {
+        guard let namespace = request.resource.namespace else {
+            throw NSError(domain: "K9k", code: 5, userInfo: [NSLocalizedDescriptionKey: "The selected resource has no namespace for a port forward."])
+        }
+        let target: (pod: ResourceSummary, remotePort: Int)
+        if request.resource.kind == "Service" {
+            target = try await resolveServiceForward(request.resource, servicePort: request.remotePort)
+        } else if request.resource.kind == "Pod" {
+            target = (request.resource, request.remotePort)
+        } else {
+            throw NSError(domain: "K9k", code: 6, userInfo: [NSLocalizedDescriptionKey: "K9k can only port forward a Pod or Service."])
         }
         let streamID = UUID().uuidString
-        do {
-            let result = try await client.request("portforward.open", parameters: .object([
-                "streamID": .string(streamID),
-                "namespace": .string(namespace),
-                "pod": .string(target.pod.name),
-                "remotePort": .number(Double(target.remotePort)),
-                "localPort": .number(Double(localPort)),
-                "localAddress": .string("127.0.0.1")
-            ]))
-            let binding = try decode(result.result, as: PortForwardBinding.self)
-            activePortForwards.removeAll { $0.streamID == streamID }
-            activePortForwards.append(ActivePortForward(streamID: streamID, binding: binding))
-            return binding
-        } catch {
-            errorMessage = error.localizedDescription
-            return nil
-        }
+        let result = try await client.request("portforward.open", parameters: .object([
+            "streamID": .string(streamID),
+            "namespace": .string(namespace),
+            "pod": .string(target.pod.name),
+            "remotePort": .number(Double(target.remotePort)),
+            "localPort": .number(Double(request.localPort)),
+            "localAddress": .string("127.0.0.1")
+        ]))
+        return (streamID, try decode(result.result, as: PortForwardBinding.self))
     }
 
     /// Kubernetes port-forward itself only targets Pods. For a Service, match
@@ -1738,8 +1775,82 @@ final class ClusterStore {
     }
 
     func closePortForward(streamID: String) async {
+        guard let forward = activePortForwards.first(where: { $0.streamID == streamID }) else {
+            await client.cancel(streamID: streamID)
+            return
+        }
+        portForwardReconnectTasks.removeValue(forKey: forward.id)?.cancel()
+        portForwardReconnectRequests.removeValue(forKey: forward.id)
+        portForwardFailureMessages.removeValue(forKey: streamID)
+        activePortForwards.removeAll { $0.id == forward.id }
         await client.cancel(streamID: streamID)
-        activePortForwards.removeAll { $0.streamID == streamID }
+    }
+
+    func retryPortForward(id: ActivePortForward.ID) {
+        portForwardReconnectTasks.removeValue(forKey: id)?.cancel()
+        guard let index = activePortForwards.firstIndex(where: { $0.id == id }) else { return }
+        activePortForwards[index].connectionState = .reconnecting(attempt: 0, maximumAttempts: maximumPortForwardReconnectAttempts)
+        schedulePortForwardReconnect(id: id)
+    }
+
+    private func closeAllPortForwards() async {
+        let forwards = activePortForwards
+        portForwardReconnectTasks.values.forEach { $0.cancel() }
+        portForwardReconnectTasks.removeAll()
+        portForwardReconnectRequests.removeAll()
+        portForwardFailureMessages.removeAll()
+        activePortForwards.removeAll()
+        for forward in forwards { await client.cancel(streamID: forward.streamID) }
+    }
+
+    private func schedulePortForwardReconnect(id: ActivePortForward.ID, reason: String? = nil) {
+        guard let index = activePortForwards.firstIndex(where: { $0.id == id }),
+              portForwardReconnectRequests[id] != nil else { return }
+        let nextAttempt: Int
+        if case let .reconnecting(attempt, _) = activePortForwards[index].connectionState {
+            nextAttempt = attempt + 1
+        } else {
+            nextAttempt = 1
+        }
+        guard nextAttempt <= maximumPortForwardReconnectAttempts else {
+            activePortForwards[index].connectionState = .failed(message: reason ?? "K9k could not restore this tunnel. Retry when the target is available.")
+            return
+        }
+        activePortForwards[index].connectionState = .reconnecting(attempt: nextAttempt, maximumAttempts: maximumPortForwardReconnectAttempts)
+        let delay = UInt64(nextAttempt * nextAttempt) * 500_000_000
+        portForwardReconnectTasks[id]?.cancel()
+        portForwardReconnectTasks[id] = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: delay) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            await self?.reconnectPortForward(id: id)
+        }
+    }
+
+    private func reconnectPortForward(id: ActivePortForward.ID) async {
+        guard let request = portForwardReconnectRequests[id],
+              activePortForwards.contains(where: { $0.id == id }) else { return }
+        do {
+            let session = try await startPortForward(request)
+            guard let currentIndex = activePortForwards.firstIndex(where: { $0.id == id }) else {
+                await client.cancel(streamID: session.streamID)
+                return
+            }
+            activePortForwards[currentIndex].streamID = session.streamID
+            activePortForwards[currentIndex].binding = session.binding
+            activePortForwards[currentIndex].connectionState = .connected
+            portForwardReconnectTasks.removeValue(forKey: id)
+        } catch {
+            guard let currentIndex = activePortForwards.firstIndex(where: { $0.id == id }) else { return }
+            let message = error.localizedDescription
+            if case let .reconnecting(attempt, _) = activePortForwards[currentIndex].connectionState,
+               attempt >= maximumPortForwardReconnectAttempts {
+                activePortForwards[currentIndex].connectionState = .failed(message: message)
+                portForwardReconnectTasks.removeValue(forKey: id)
+            } else {
+                schedulePortForwardReconnect(id: id, reason: message)
+            }
+        }
     }
 
     func resource(for id: ResourceSummary.ID?) -> ResourceSummary? { guard let id else { return nil }; return resources.first(where: { $0.id == id }) }
@@ -1885,8 +1996,22 @@ final class ClusterStore {
             if logLines.count > 10_000 { logLines.removeFirst(logLines.count - 10_000) }
             return
         }
+        if event.type == "portforward.error", let streamID = event.streamID,
+           let message = event.result?.objectValue?["message"]?.stringValue {
+            portForwardFailureMessages[streamID] = message
+            return
+        }
         if event.type == "portforward.closed", let streamID = event.streamID {
-            activePortForwards.removeAll { $0.streamID == streamID }
+            guard let forward = activePortForwards.first(where: { $0.streamID == streamID }) else { return }
+            let failureMessage = portForwardFailureMessages.removeValue(forKey: streamID)
+            let reason = event.result?.objectValue?["reason"]?.stringValue ?? "completed"
+            guard reason != "cancelled" else {
+                activePortForwards.removeAll { $0.id == forward.id }
+                portForwardReconnectRequests.removeValue(forKey: forward.id)
+                portForwardReconnectTasks.removeValue(forKey: forward.id)?.cancel()
+                return
+            }
+            schedulePortForwardReconnect(id: forward.id, reason: failureMessage ?? "The port-forward connection closed unexpectedly.")
             return
         }
         if event.streamID == activeStreamID, event.type == "resource.watch.closed" {

@@ -21,6 +21,7 @@ struct HelmReleaseInspectionView: View {
     @State private var sensitiveAcknowledged = false
     @State private var rollbackConfirmationPresented = false
     @State private var uninstallConfirmationPresented = false
+    @State private var upgradePresented = false
     @State private var isActing = false
     @State private var lifecycleMessage: String?
 
@@ -55,6 +56,10 @@ struct HelmReleaseInspectionView: View {
                         }
                         if canUninstall {
                             Divider()
+                            Button("Upgrade Release…", systemImage: "arrow.up.circle") {
+                                upgradePresented = true
+                            }
+                            .disabled(isActing)
                             Button("Uninstall Release…", systemImage: "trash", role: .destructive) {
                                 uninstallConfirmationPresented = true
                             }
@@ -90,6 +95,11 @@ struct HelmReleaseInspectionView: View {
             HelmUninstallConfirmationSheet(release: release, isActing: $isActing) { confirmationText in
                 uninstallConfirmationPresented = false
                 Task { await uninstall(confirmationText: confirmationText) }
+            }
+        }
+        .sheet(isPresented: $upgradePresented) {
+            if let currentRevision {
+                HelmUpgradeView(release: release, namespace: namespace, currentRevision: currentRevision)
             }
         }
     }

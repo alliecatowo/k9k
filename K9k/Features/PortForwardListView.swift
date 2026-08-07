@@ -18,11 +18,20 @@ struct PortForwardListView: View {
                                 VStack(alignment: .leading, spacing: 7) {
                                     Text(forward.binding.endpoint).font(.system(.body, design: .monospaced))
                                     Text("\(forward.binding.namespace) · loopback only").font(.caption).foregroundStyle(.secondary)
+                                    Text(forward.connectionState.detail)
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(forward.connectionState.isConnected ? .green : .orange)
                                     HStack {
                                         Button("Copy") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString("http://\(forward.binding.localAddress):\(forward.binding.localPort)", forType: .string) }
+                                            .disabled(!forward.connectionState.isConnected)
                                         Button("Open") { NSWorkspace.shared.open(URL(string: "http://\(forward.binding.localAddress):\(forward.binding.localPort)")!) }
+                                            .disabled(!forward.connectionState.isConnected)
                                         Button("Benchmark…") { benchmarkForward = forward }
+                                            .disabled(!forward.connectionState.isConnected)
                                         Spacer()
+                                        if !forward.connectionState.isConnected {
+                                            Button("Retry Now") { store.retryPortForward(id: forward.id) }
+                                        }
                                         Button("Stop", role: .destructive) { Task { await store.closePortForward(streamID: forward.streamID) } }
                                     }
                                     .accessibilityElement(children: .contain)

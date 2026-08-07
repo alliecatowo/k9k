@@ -51,37 +51,40 @@ type fakeCluster struct {
 	triggerCronJobErr                                   error
 	rollbackDeploymentErr                               error
 	helmRollbackErr, helmUninstallErr                   error
+	helmUpgradePlanErr, helmUpgradeErr                  error
 	execErr                                             error
 	manifestErr, applyManifestErr                       error
 	manifestDeleteErr                                   error
 
-	selected        []string
-	contextUpdates  []Context
-	contextRenames  [][2]string
-	contextCopies   [][3]string
-	contextDeletes  []string
-	lists           []resourceCall
-	gets            []resourceCall
-	watches         []resourceCall
-	deletes         []resourceCall
-	patches         []patchCall
-	accesses        []AccessCheck
-	forwards        []PortForwardRequest
-	metrics         []MetricsQuery
-	metricItems     []ResourceMetrics
-	drains          []NodeDrainRequest
-	nodeShells      []NodeShellTarget
-	debugs          []PodDebugRequest
-	cronJobTriggers []CronJobTriggerRequest
-	rollbacks       []DeploymentRollbackRequest
-	helmRollbacks   []HelmRollbackRequest
-	helmUninstalls  []HelmUninstallRequest
-	execs           []PodExecRequest
-	execFn          func(context.Context, PodExecRequest, PodExecStreams) error
-	manifests       []resourceCall
-	applyManifests  []ManifestApplyRequest
-	manifestDeletes []ManifestIdentity
-	accessFn        func(AccessCheck) AccessReview
+	selected         []string
+	contextUpdates   []Context
+	contextRenames   [][2]string
+	contextCopies    [][3]string
+	contextDeletes   []string
+	lists            []resourceCall
+	gets             []resourceCall
+	watches          []resourceCall
+	deletes          []resourceCall
+	patches          []patchCall
+	accesses         []AccessCheck
+	forwards         []PortForwardRequest
+	metrics          []MetricsQuery
+	metricItems      []ResourceMetrics
+	drains           []NodeDrainRequest
+	nodeShells       []NodeShellTarget
+	debugs           []PodDebugRequest
+	cronJobTriggers  []CronJobTriggerRequest
+	rollbacks        []DeploymentRollbackRequest
+	helmRollbacks    []HelmRollbackRequest
+	helmUninstalls   []HelmUninstallRequest
+	helmUpgradePlans []HelmUpgradeRequest
+	helmUpgrades     []HelmUpgradeRequest
+	execs            []PodExecRequest
+	execFn           func(context.Context, PodExecRequest, PodExecStreams) error
+	manifests        []resourceCall
+	applyManifests   []ManifestApplyRequest
+	manifestDeletes  []ManifestIdentity
+	accessFn         func(AccessCheck) AccessReview
 }
 
 type resourceCall struct {
@@ -332,6 +335,26 @@ func (f *fakeCluster) UninstallHelm(_ context.Context, request HelmUninstallRequ
 		return HelmUninstallResult{}, f.helmUninstallErr
 	}
 	return HelmUninstallResult{Namespace: request.Namespace, Release: request.Release, KeepHistory: true, Message: "uninstall started"}, nil
+}
+
+func (f *fakeCluster) PlanHelmUpgrade(_ context.Context, request HelmUpgradeRequest) (HelmUpgradePlan, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.helmUpgradePlans = append(f.helmUpgradePlans, request)
+	if f.helmUpgradePlanErr != nil {
+		return HelmUpgradePlan{}, f.helmUpgradePlanErr
+	}
+	return HelmUpgradePlan{Namespace: request.Namespace, Release: request.Release, ChartName: "test", ChartVersion: "1.0.0", ValuesMode: request.ValuesMode, Manifest: "kind: ConfigMap\n", ManifestDigest: "test", NextRevision: request.ExpectedRevision + 1}, nil
+}
+
+func (f *fakeCluster) UpgradeHelm(_ context.Context, request HelmUpgradeRequest) (HelmUpgradeResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.helmUpgrades = append(f.helmUpgrades, request)
+	if f.helmUpgradeErr != nil {
+		return HelmUpgradeResult{}, f.helmUpgradeErr
+	}
+	return HelmUpgradeResult{Namespace: request.Namespace, Release: request.Release, Revision: request.ExpectedRevision + 1, Message: "upgrade started"}, nil
 }
 
 func (f *fakeCluster) CheckAccess(_ context.Context, check AccessCheck) (AccessReview, error) {
@@ -718,6 +741,30 @@ func TestManifestApplyClassifiesIdentityAndServerValidationFailures(t *testing.T
 	validation := envelopeByID(t, runRequests(t, &fakeCluster{applyManifestErr: errors.New("admission denied")}, request("invalid", "manifest.apply", params)), "invalid")
 	if validation.Error == nil || validation.Error.Code != "manifest_validation_failed" {
 		t.Errorf("validation failure = %#v", validation.Error)
+	}
+}
+
+func TestManifestImportedDiffResolvesDiscoveryAndPinsFreshLiveUID(t *testing.T) {
+	client := &fakeCluster{
+		discovery: []ResourceType{{Version: "v1", Resource: "configmaps", Kind: "ConfigMap", Namespaced: true}},
+		object: &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "settings", "namespace": "demo", "uid": "live-uid"},
+			"data": map[string]any{"theme": "light"},
+		}},
+	}
+	manifest := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: demo\ndata:\n  theme: dark\n"
+	response := envelopeByID(t, runRequests(t, client, request("diff", "manifest.diffImported", map[string]any{"manifest": manifest})), "diff")
+	if response.Error != nil {
+		t.Fatalf("workspace diff error = %#v", response.Error)
+	}
+	result := decodeResult[ManifestDiffResult](t, response.Result)
+	if !result.Changed || result.Identity.UID != "live-uid" {
+		t.Errorf("workspace diff = %#v", result)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.manifests) != 2 || len(client.applyManifests) != 1 || !client.applyManifests[0].DryRun || client.applyManifests[0].Identity.UID != "live-uid" {
+		t.Errorf("workspace diff calls = manifests=%#v applies=%#v", client.manifests, client.applyManifests)
 	}
 }
 

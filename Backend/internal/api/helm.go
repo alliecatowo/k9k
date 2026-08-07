@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +24,8 @@ const (
 	maxHelmHistoryRevisions      = 128
 	maxHelmDecodedReleaseBytes   = 4 << 20
 	maxHelmSensitiveContentBytes = 1 << 20
+	maxHelmUpgradeChartBytes     = 8 << 20
+	maxHelmUpgradeValuesBytes    = 1 << 20
 	helmSensitiveContentWarning  = "This release content can contain credentials, tokens, endpoints, or other production-sensitive values."
 )
 
@@ -190,6 +194,58 @@ func validateHelmUninstallParams(params HelmUninstallRequest) (HelmUninstallRequ
 		return HelmUninstallRequest{}, fmt.Errorf("a valid current Helm storage revision is required")
 	}
 	return params, nil
+}
+
+func validateHelmUpgradeParams(params HelmUpgradeRequest, requirePlanDigest bool) (HelmUpgradeRequest, error) {
+	namespace, release, err := validateHelmHistoryParams(params.Namespace, params.Release)
+	if err != nil {
+		return HelmUpgradeRequest{}, err
+	}
+	params.Namespace, params.Release = namespace, release
+	params.ExpectedStorageName = strings.TrimSpace(params.ExpectedStorageName)
+	params.ValuesMode = strings.ToLower(strings.TrimSpace(params.ValuesMode))
+	params.PlanDigest = strings.ToLower(strings.TrimSpace(params.PlanDigest))
+	if params.Namespace == "" || params.ExpectedRevision < 1 || params.ExpectedStorageName == "" || len(params.ExpectedStorageName) > 253 {
+		return HelmUpgradeRequest{}, fmt.Errorf("namespace and a valid current Helm storage revision are required")
+	}
+	if params.ValuesMode == "" {
+		params.ValuesMode = "reset"
+	}
+	switch params.ValuesMode {
+	case "reset", "reuse", "reset-then-reuse":
+	default:
+		return HelmUpgradeRequest{}, fmt.Errorf("valuesMode must be reset, reuse, or reset-then-reuse")
+	}
+	if len(params.ValuesYAML) > maxHelmUpgradeValuesBytes {
+		return HelmUpgradeRequest{}, fmt.Errorf("valuesYAML exceeds the %d-byte limit", maxHelmUpgradeValuesBytes)
+	}
+	if len(params.ChartArchiveBase64) == 0 || len(params.ChartArchiveBase64) > base64.StdEncoding.EncodedLen(maxHelmUpgradeChartBytes) {
+		return HelmUpgradeRequest{}, fmt.Errorf("chartArchiveBase64 must contain a packaged chart no larger than %d bytes", maxHelmUpgradeChartBytes)
+	}
+	archive, err := base64.StdEncoding.DecodeString(params.ChartArchiveBase64)
+	if err != nil || len(archive) == 0 || len(archive) > maxHelmUpgradeChartBytes {
+		return HelmUpgradeRequest{}, fmt.Errorf("chartArchiveBase64 is not a valid bounded packaged chart")
+	}
+	if requirePlanDigest {
+		if len(params.PlanDigest) != sha256.Size*2 {
+			return HelmUpgradeRequest{}, fmt.Errorf("a planDigest from helm.upgrade.plan is required")
+		}
+		if _, err := hex.DecodeString(params.PlanDigest); err != nil {
+			return HelmUpgradeRequest{}, fmt.Errorf("planDigest must be hexadecimal")
+		}
+		if !strings.EqualFold(params.PlanDigest, helmUpgradeDigest(params, archive)) {
+			return HelmUpgradeRequest{}, fmt.Errorf("planDigest does not match this exact chart, values, and release revision")
+		}
+	}
+	return params, nil
+}
+
+func helmUpgradeDigest(params HelmUpgradeRequest, archive []byte) string {
+	hash := sha256.New()
+	for _, value := range [][]byte{[]byte(params.Namespace), []byte{0}, []byte(params.Release), []byte{0}, []byte(params.ExpectedStorageName), []byte{0}, []byte(strconv.Itoa(params.ExpectedRevision)), []byte{0}, []byte(params.ValuesMode), []byte{0}, []byte(params.ValuesYAML), []byte{0}, archive} {
+		_, _ = hash.Write(value)
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
 // verifyHelmCurrentRevision closes the UI-to-action race as far as Kubernetes
