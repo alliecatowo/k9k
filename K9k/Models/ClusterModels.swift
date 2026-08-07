@@ -236,6 +236,19 @@ struct HelmUpgradePlan: Codable, Hashable {
     let nextRevision: Int
 }
 
+/// Public metadata from a user-selected Helm repositories.yaml file. K9k
+/// deliberately excludes every credential-related field from this model.
+struct HelmRepositoryInspection: Codable, Hashable {
+    let repositories: [HelmRepositorySource]
+    let warnings: [String]
+}
+
+struct HelmRepositorySource: Codable, Hashable, Identifiable {
+    let name: String
+    let url: String
+    var id: String { "\(name)\u{0}\(url)" }
+}
+
 struct NodeDrainResult: Codable, Hashable {
     let node: String
     let evicted: [NodeDrainPod]
@@ -386,6 +399,71 @@ struct ContainerMetrics: Codable, Identifiable, Hashable {
     let name: String
     let usage: [String: String]
     var id: String { name }
+}
+
+/// A per-collection status for Pulse. Kubernetes clusters may publish pod and
+/// node metrics independently (or partially), so one unavailable endpoint
+/// must not erase a usable companion collection or be presented as zero load.
+enum MetricsCollectionState: String, Codable, Hashable {
+    case available
+    case unavailable
+    case failed
+
+    var displayName: String {
+        switch self {
+        case .available: "Available"
+        case .unavailable: "Unavailable"
+        case .failed: "Request failed"
+        }
+    }
+}
+
+struct MetricsCollectionDiagnostic: Identifiable, Codable, Hashable {
+    let resource: String
+    let state: MetricsCollectionState
+    let itemCount: Int
+    let message: String?
+    let sampledAt: Date
+
+    var id: String { resource }
+    var title: String { resource.capitalized }
+}
+
+/// One bounded in-memory Pulse sample. Values are intentionally normalized to
+/// millicores and MiB only for charting/export; the original Kubernetes
+/// quantities remain available in the live metrics responses.
+struct PulseHistorySample: Identifiable, Codable, Hashable {
+    let timestamp: Date
+    let cpuMilli: Double
+    let memoryMi: Double
+    let nodeCount: Int
+    let podCount: Int
+
+    var id: Date { timestamp }
+}
+
+/// Self-describing export payload for an operator's short Pulse capture.
+/// History is strictly session-local and capped by PulseView; no cluster data
+/// is persisted automatically.
+struct PulseHistoryExport: Codable, Hashable {
+    let schemaVersion: Int
+    let exportedAt: Date
+    let context: String?
+    let sampleIntervalSeconds: Int
+    let maximumSamples: Int
+    let diagnostics: [MetricsCollectionDiagnostic]
+    let samples: [PulseHistorySample]
+}
+
+/// Immutable identity passed from an inspector metric section into Pulse.
+/// It intentionally contains no raw object data or credentials.
+struct PulseDrilldownTarget: Identifiable, Hashable {
+    let kind: String
+    let namespace: String?
+    let name: String
+
+    var id: String { "\(kind)/\(namespace ?? "")/\(name)" }
+    var metricResource: String { kind == "Pod" ? "pods" : "nodes" }
 }
 
 /// The immutable selection guard returned with an editable Kubernetes object.

@@ -21,6 +21,7 @@ struct HelmUpgradeView: View {
     @State private var isPlanning = false
     @State private var isUpgrading = false
     @State private var upgradeConfirmationPresented = false
+    @State private var repositorySourcesPresented = false
     @State private var errorMessage: String?
 
     var body: some View {
@@ -56,6 +57,9 @@ struct HelmUpgradeView: View {
             Text("Helm will create a new release revision from the exact chart and values shown in this plan. Hooks remain enabled; K9k will not wait for workload readiness.")
         }
         .onDisappear { client.stop() }
+        .sheet(isPresented: $repositorySourcesPresented) {
+            HelmRepositorySourcesView()
+        }
     }
 
     private var sourceSection: some View {
@@ -71,6 +75,8 @@ struct HelmUpgradeView: View {
                 Button("Choose Chart…") { chooseChart() }
                     .disabled(isPlanning || isUpgrading)
             }
+            Button("Inspect Repository Sources…") { repositorySourcesPresented = true }
+                .disabled(isPlanning || isUpgrading)
             if let chartArchive {
                 LabeledContent("Archive size", value: ByteCountFormatter.string(fromByteCount: Int64(chartArchive.count), countStyle: .file))
             }

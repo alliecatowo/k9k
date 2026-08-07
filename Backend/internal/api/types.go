@@ -229,6 +229,19 @@ type HelmUpgradeResult struct {
 	Message   string `json:"message"`
 }
 
+// HelmRepositoryInspection intentionally contains only public repository
+// metadata. Credentials, TLS paths, auth headers, and registry config are
+// never accepted by this protocol, let alone returned to Swift.
+type HelmRepositoryInspection struct {
+	Repositories []HelmRepositorySource `json:"repositories"`
+	Warnings     []string               `json:"warnings"`
+}
+
+type HelmRepositorySource struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
 // RelationshipGraph is a bounded, read-only topology snapshot centred on one
 // selected object. Nodes use stable object identity where Kubernetes provided
 // a UID; unresolved references are retained rather than silently discarded.

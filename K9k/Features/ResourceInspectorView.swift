@@ -173,6 +173,9 @@ struct ResourceInspectorView: View {
                         LabeledContent(container.name, value: "CPU \(container.usage["cpu"] ?? "—") · Memory \(container.usage["memory"] ?? "—")")
                     }
                 }
+                Button("Open in Pulse…") { store.openPulseDrilldown(for: resource) }
+                    .accessibilityHint("Shows this \(resource.kind)'s metrics in the bounded cluster Pulse view")
+                Button("Refresh Usage") { Task { await store.loadMetrics(for: resource) } }
             }
         } else if store.isLoadingMetrics, resource.kind == "Pod" || resource.kind == "Node" {
             Section("Metrics") { LabeledContent("Usage") { ProgressView().controlSize(.small) } }
@@ -180,6 +183,8 @@ struct ResourceInspectorView: View {
             Section("Metrics") {
                 LabeledContent("Usage", value: "Unavailable")
                 Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                Button("Open Pulse Diagnostics…") { store.openPulseDrilldown(for: resource) }
+                Button("Retry Metrics") { Task { await store.loadMetrics(for: resource) } }
             }
         }
     }

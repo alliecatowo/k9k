@@ -299,6 +299,35 @@ func TestHelmUpgradeRequiresSensitivePlanAndExactDigest(t *testing.T) {
 	}
 }
 
+func TestHelmRepositoryInspectionReturnsOnlyCredentialFreeMetadata(t *testing.T) {
+	inspection, err := inspectHelmRepositoryConfig(`apiVersion: v1
+repositories:
+  - name: public
+    url: https://charts.example.invalid/stable
+    username: hidden
+    password: hidden
+  - name: embedded-credentials
+    url: https://token@example.invalid/charts
+  - name: non-http
+    url: oci://registry.example.invalid/charts
+  - name: public
+    url: https://charts.example.invalid/stable
+`)
+	if err != nil {
+		t.Fatalf("inspect repository config: %v", err)
+	}
+	if got, want := inspection.Repositories, []HelmRepositorySource{{Name: "public", URL: "https://charts.example.invalid/stable"}}; len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("repositories = %#v, want %#v", got, want)
+	}
+	if len(inspection.Warnings) != 2 {
+		t.Fatalf("warnings = %#v", inspection.Warnings)
+	}
+	responses := runRequests(t, &fakeCluster{}, request("inspect", "helm.repository.inspect", map[string]any{"document": "repositories: []\n"}))
+	if response := envelopeByID(t, responses, "inspect"); response.Error != nil {
+		t.Fatalf("repository inspect protocol = %#v", response)
+	}
+}
+
 func helmTestChartArchive(t *testing.T) string {
 	t.Helper()
 	var compressed bytes.Buffer

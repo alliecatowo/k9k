@@ -43,6 +43,9 @@ struct K9kRootView: View {
                 await store.loadSelectedResourceSummary(for: selection.first)
             }
         }
+        .onChange(of: store.pulseDrilldownTarget) { _, target in
+            if target != nil { pulsePresented = true }
+        }
         .modifier(rootPresentations(
             destructiveConfirmation: $destructiveConfirmation,
             restartConfirmation: $restartConfirmation,
@@ -204,7 +207,9 @@ struct K9kRootView: View {
             if let resource = store.resource(for: store.selectedResources.first) { K9sPluginRunnerView(plugin: plugin, resource: resource) }
         }
         .sheet(isPresented: $manifestImportPresented) { ManifestWorkspaceView() }
-        .sheet(isPresented: $pulsePresented) { PulseView(isPresented: $pulsePresented) }
+        .sheet(isPresented: $pulsePresented, onDismiss: { store.clearPulseDrilldown() }) {
+            PulseView(isPresented: $pulsePresented, drilldownTarget: store.pulseDrilldownTarget)
+        }
         .sheet(isPresented: $accessCheckPresented) {
             AccessCheckView(initialType: store.selectedResourceType, initialResource: store.resource(for: store.selectedResources.first))
         }

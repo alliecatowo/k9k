@@ -11,10 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"gopkg.in/yaml.v3"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -26,6 +29,7 @@ const (
 	maxHelmSensitiveContentBytes = 1 << 20
 	maxHelmUpgradeChartBytes     = 8 << 20
 	maxHelmUpgradeValuesBytes    = 1 << 20
+	maxHelmRepositoryConfigBytes = 1 << 20
 	helmSensitiveContentWarning  = "This release content can contain credentials, tokens, endpoints, or other production-sensitive values."
 )
 
@@ -246,6 +250,47 @@ func helmUpgradeDigest(params HelmUpgradeRequest, archive []byte) string {
 		_, _ = hash.Write(value)
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil))
+}
+
+// inspectHelmRepositoryConfig parses a user-selected repositories.yaml as a
+// metadata-only document. It deliberately ignores every credential-related
+// field supported by Helm's on-disk format and never performs a network call.
+func inspectHelmRepositoryConfig(document string) (HelmRepositoryInspection, error) {
+	if len(document) == 0 || len(document) > maxHelmRepositoryConfigBytes {
+		return HelmRepositoryInspection{}, fmt.Errorf("repository configuration must be between 1 byte and %d bytes", maxHelmRepositoryConfigBytes)
+	}
+	var parsed struct {
+		APIVersion   string `yaml:"apiVersion"`
+		Repositories []struct {
+			Name string `yaml:"name"`
+			URL  string `yaml:"url"`
+		} `yaml:"repositories"`
+	}
+	if err := yaml.Unmarshal([]byte(document), &parsed); err != nil {
+		return HelmRepositoryInspection{}, fmt.Errorf("parse Helm repository configuration: %w", err)
+	}
+	result := HelmRepositoryInspection{Repositories: []HelmRepositorySource{}, Warnings: []string{}}
+	seen := make(map[string]struct{}, len(parsed.Repositories))
+	for _, candidate := range parsed.Repositories {
+		name, rawURL := strings.TrimSpace(candidate.Name), strings.TrimSpace(candidate.URL)
+		if name == "" || rawURL == "" {
+			result.Warnings = append(result.Warnings, "Ignored a repository entry without both a name and URL.")
+			continue
+		}
+		parsedURL, err := url.Parse(rawURL)
+		if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "https" && parsedURL.Scheme != "http") || parsedURL.User != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Ignored repository %q because its URL is not a credential-free HTTP(S) endpoint.", name))
+			continue
+		}
+		key := strings.ToLower(name) + "\x00" + rawURL
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result.Repositories = append(result.Repositories, HelmRepositorySource{Name: name, URL: rawURL})
+	}
+	sort.Slice(result.Repositories, func(i, j int) bool { return result.Repositories[i].Name < result.Repositories[j].Name })
+	return result, nil
 }
 
 // verifyHelmCurrentRevision closes the UI-to-action race as far as Kubernetes

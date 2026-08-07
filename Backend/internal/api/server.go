@@ -623,6 +623,18 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(inspectErr)
 		}
 		return result, nil
+	case "helm.repository.inspect":
+		var params struct {
+			Document string `json:"document"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		result, inspectErr := inspectHelmRepositoryConfig(params.Document)
+		if inspectErr != nil {
+			return nil, invalidParams(inspectErr)
+		}
+		return result, nil
 	case "helm.rollback":
 		var params struct {
 			HelmRollbackRequest

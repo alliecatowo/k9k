@@ -559,7 +559,7 @@ func boundedObjectReferences(object map[string]any, namespace string) ([]Relatio
 				// declarations, unlike arbitrary {kind,name} user data in CRDs.
 				apiVersion = apiVersionForReference(item)
 				kind, _ = item["kind"].(string)
-			case "subject":
+			case "subject", "subjects":
 				// RBAC users/groups are external identities, but a ServiceAccount
 				// subject is a navigable Kubernetes object in this namespace.
 				if subjectKind, _ := item["kind"].(string); subjectKind == "ServiceAccount" {

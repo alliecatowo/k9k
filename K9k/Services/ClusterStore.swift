@@ -18,6 +18,21 @@ private struct PortForwardReconnectRequest {
     let localPort: Int
 }
 
+private struct PulseMetricsCollectionResult {
+    let resource: String
+    let items: [ResourceMetrics]
+    let state: MetricsCollectionState
+    let message: String?
+    let sampledAt: Date
+
+    var diagnostic: MetricsCollectionDiagnostic {
+        MetricsCollectionDiagnostic(
+            resource: resource, state: state, itemCount: items.count,
+            message: message, sampledAt: sampledAt
+        )
+    }
+}
+
 @MainActor
 @Observable
 final class ClusterStore {
@@ -78,7 +93,9 @@ final class ClusterStore {
     var pulseNodeMetrics: [ResourceMetrics] = []
     var pulsePodMetrics: [ResourceMetrics] = []
     var pulseMetricsUnavailableMessage: String?
+    var pulseMetricsDiagnostics: [MetricsCollectionDiagnostic] = []
     var isLoadingPulseMetrics = false
+    var pulseDrilldownTarget: PulseDrilldownTarget?
     var deleteAccess: AccessReview?
     var isCheckingDeleteAccess = false
     var scaleAccess: AccessReview?
@@ -151,6 +168,19 @@ final class ClusterStore {
     var canNavigateForward: Bool {
         guard let navigationHistoryIndex else { return false }
         return navigationHistory.indices.dropFirst(navigationHistoryIndex + 1).contains { navigationHistory[$0].contextName == selectedContext?.name }
+    }
+
+    var hasUsablePulseMetrics: Bool {
+        pulseMetricsDiagnostics.contains { $0.state == .available }
+    }
+
+    func openPulseDrilldown(for resource: ResourceSummary) {
+        guard resource.kind == "Pod" || resource.kind == "Node" else { return }
+        pulseDrilldownTarget = PulseDrilldownTarget(kind: resource.kind, namespace: resource.namespace, name: resource.name)
+    }
+
+    func clearPulseDrilldown() {
+        pulseDrilldownTarget = nil
     }
 
     /// Cache search results when input changes instead of filtering the full
@@ -1671,24 +1701,47 @@ final class ClusterStore {
     /// independent from selection metrics so switching a resource never
     /// interrupts the operator's rolling cluster observation.
     func loadPulseMetrics() async {
+
+        // Refresh and the five-second sampler can race. Keep exactly one pair
+        // of collection requests in flight, rather than accumulating helper
+        // requests while a slow Metrics Server catches up.
+        guard !isLoadingPulseMetrics else { return }
         isLoadingPulseMetrics = true
         defer { isLoadingPulseMetrics = false }
         pulseMetricsUnavailableMessage = nil
+        async let nodeResult = fetchPulseMetrics(resource: "nodes")
+        async let podResult = fetchPulseMetrics(resource: "pods")
+        let (nodes, pods) = await (nodeResult, podResult)
+        guard !Task.isCancelled else { return }
+
+        pulseNodeMetrics = nodes.items
+        pulsePodMetrics = pods.items
+        pulseMetricsDiagnostics = [nodes.diagnostic, pods.diagnostic]
+
+        // A partial response still has value. Only use the unavailable empty
+        // state when neither collection could provide data, and preserve the
+        // individual diagnostics in every other case.
+        guard !hasUsablePulseMetrics else { return }
+        pulseMetricsUnavailableMessage = pulseMetricsDiagnostics
+            .map { diagnostic in
+                "\(diagnostic.title): \(diagnostic.message ?? diagnostic.state.displayName)"
+            }
+            .joined(separator: "\n")
+    }
+
+    private func fetchPulseMetrics(resource: String) async -> PulseMetricsCollectionResult {
+        let sampledAt = Date.now
         do {
-            async let nodesEnvelope = client.request("metrics.list", parameters: .object(["resource": .string("nodes")]))
-            async let podsEnvelope = client.request("metrics.list", parameters: .object(["resource": .string("pods")]))
-            let nodes = try decode((try await nodesEnvelope).result, as: MetricsListResponse.self)
-            let pods = try decode((try await podsEnvelope).result, as: MetricsListResponse.self)
-            pulseNodeMetrics = nodes.items
-            pulsePodMetrics = pods.items
-        } catch let error as CoreError where error.code == "metrics_unavailable" {
-            pulseNodeMetrics = []
-            pulsePodMetrics = []
-            pulseMetricsUnavailableMessage = error.message
+            let envelope = try await client.request("metrics.list", parameters: .object(["resource": .string(resource)]))
+            let response = try decode(envelope.result, as: MetricsListResponse.self)
+            return PulseMetricsCollectionResult(resource: resource, items: response.items, state: .available, message: nil, sampledAt: sampledAt)
+        } catch let error as CoreError {
+            let state: MetricsCollectionState = error.code == "metrics_unavailable" ? .unavailable : .failed
+            return PulseMetricsCollectionResult(resource: resource, items: [], state: state, message: error.message, sampledAt: sampledAt)
+        } catch is CancellationError {
+            return PulseMetricsCollectionResult(resource: resource, items: [], state: .failed, message: "Sampling cancelled.", sampledAt: sampledAt)
         } catch {
-            pulseNodeMetrics = []
-            pulsePodMetrics = []
-            pulseMetricsUnavailableMessage = "K9k could not load cluster metrics: \(error.localizedDescription)"
+            return PulseMetricsCollectionResult(resource: resource, items: [], state: .failed, message: "K9k could not load metrics: \(error.localizedDescription)", sampledAt: sampledAt)
         }
     }
 

@@ -13,6 +13,8 @@ struct ImageScanView: View {
     @State private var isRunning = false
     @State private var isCancelling = false
     @State private var output = ""
+    @State private var normalizedReports: [ImageScanNormalizedReport] = []
+    @State private var showingNormalizedResults = true
     @State private var currentImage: String?
     @State private var operation: ImageScanOperation?
 
@@ -74,15 +76,27 @@ struct ImageScanView: View {
                 Divider()
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("Scanner output").font(.headline)
+                        Text(showingNormalizedResults && configuration.reportFormat == .grypeJSON ? "Vulnerability findings" : "Scanner output").font(.headline)
                         Spacer()
                         if let currentImage { Text(currentImage).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
                     }
-                    ScrollView {
-                        Text(output.isEmpty ? "Output is shown only after you explicitly run a configured scanner." : output)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                    if configuration.reportFormat == .grypeJSON, !normalizedReports.isEmpty {
+                        Picker("Result presentation", selection: $showingNormalizedResults) {
+                            Text("Findings").tag(true)
+                            Text("Raw Output").tag(false)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                    }
+                    if showingNormalizedResults, configuration.reportFormat == .grypeJSON, !normalizedReports.isEmpty {
+                        ImageScanFindingsView(reports: normalizedReports)
+                    } else {
+                        ScrollView {
+                            Text(output.isEmpty ? "Output is shown only after you explicitly run a configured scanner." : output)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
                 }
                 .padding()
@@ -127,6 +141,8 @@ struct ImageScanView: View {
         let operation = ImageScanOperation()
         self.operation = operation
         output = ""
+        normalizedReports = []
+        showingNormalizedResults = configuration.reportFormat == .grypeJSON
         currentImage = nil
         isRunning = true
         isCancelling = false
@@ -137,10 +153,19 @@ struct ImageScanView: View {
                 if operation.isCancelled { break }
                 DispatchQueue.main.async { currentImage = target.image }
                 let result = operation.run(configuration: configuration, image: target.image)
+                let normalized = configuration.reportFormat == .grypeJSON
+                    ? ImageScanReportNormalizer.normalizeGrypeJSON(result.output, image: target.image)
+                    : nil
                 let heading = "\n$ \(configuration.executablePath) \(configuration.expandedArguments(for: target.image).joined(separator: " "))\n"
                 report += heading + result.renderedOutput + "\n\(result.status)\n"
                 let visibleReport = ImageScanOutputRedactor.redact(report)
-                DispatchQueue.main.async { output = visibleReport }
+                DispatchQueue.main.async {
+                    output = visibleReport
+                    if let normalized {
+                        normalizedReports.removeAll { $0.image == normalized.image }
+                        normalizedReports.append(normalized)
+                    }
+                }
             }
             DispatchQueue.main.async {
                 if operation.isCancelled && report.isEmpty { output = "Scan cancelled before a scanner process started." }
@@ -204,6 +229,14 @@ struct ImageScanSettingsSection: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Picker("Normalized report", selection: $configuration.reportFormat) {
+                ForEach(ImageScanReportFormat.allCases) { format in Text(format.title).tag(format) }
+            }
+            if configuration.reportFormat == .grypeJSON {
+                Text("K9k will parse only valid Grype JSON into CVE/package/severity/fix fields. Configure Grype's JSON output yourself (for example, separate arguments `-o` and `json`); K9k does not alter or infer scanner arguments.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if let message = configuration.validationMessage() {
                 Label(message, systemImage: "exclamationmark.triangle")
                     .font(.caption)
@@ -219,6 +252,73 @@ struct ImageScanSettingsSection: View {
         }
         .onChange(of: configuration) { _, updated in ImageScanPreferences.save(updated) }
         .onAppear { configuration = ImageScanPreferences.load() }
+    }
+}
+
+private struct ImageScanFindingsView: View {
+    let reports: [ImageScanNormalizedReport]
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(reports.sorted { $0.image.localizedStandardCompare($1.image) == .orderedAscending }) { report in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(report.image)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        if let diagnostic = report.diagnostic {
+                            Label(diagnostic, systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        } else if report.findings.isEmpty {
+                            Label("No vulnerabilities reported", systemImage: "checkmark.circle")
+                                .font(.caption)
+                                .foregroundStyle(.green)
+                        } else {
+                            ForEach(report.findings.sorted { lhs, rhs in
+                                if lhs.severityRank != rhs.severityRank { return lhs.severityRank < rhs.severityRank }
+                                return lhs.vulnerabilityID.localizedStandardCompare(rhs.vulnerabilityID) == .orderedAscending
+                            }) { finding in
+                                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                    Text(finding.severity.uppercased())
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(severityColor(finding.severity))
+                                        .frame(width: 64, alignment: .leading)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(finding.vulnerabilityID).font(.system(.caption, design: .monospaced))
+                                        Text("\(finding.package) \(finding.installedVersion)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer(minLength: 8)
+                                    if let fixedIn = finding.fixedIn, !fixedIn.isEmpty {
+                                        Text("Fix: \(fixedIn)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                }
+                                .padding(.vertical, 3)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 8)
+                    Divider()
+                }
+            }
+        }
+    }
+
+    private func severityColor(_ severity: String) -> Color {
+        switch severity.uppercased() {
+        case "CRITICAL": .red
+        case "HIGH": .orange
+        case "MEDIUM", "MODERATE": .yellow
+        case "LOW": .blue
+        case "NEGLIGIBLE": .secondary
+        default: .secondary
+        }
     }
 }
 
