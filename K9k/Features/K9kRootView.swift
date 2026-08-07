@@ -14,6 +14,7 @@ struct K9kRootView: View {
     @State private var terminalPresented = false
     @State private var terminalMode: PodTerminalMode = .shell
     @State private var podFileTransferPresented = false
+    @State private var imageScanPresented = false
     @State private var manifestEditorPresented = false
     @State private var relationshipsPresented = false
     @State private var nodeCordonConfirmation = false
@@ -64,11 +65,17 @@ struct K9kRootView: View {
             manifestImportPresented: $manifestImportPresented,
             pulsePresented: $pulsePresented,
             accessCheckPresented: $accessCheckPresented,
-            navigationHelpPresented: $navigationHelpPresented
+            navigationHelpPresented: $navigationHelpPresented,
+            imageScanPresented: $imageScanPresented
         ))
         .sheet(isPresented: $podFileTransferPresented) {
             if let resource = store.resource(for: store.selectedResources.first) {
                 PodFileTransferView(resource: resource)
+            }
+        }
+        .sheet(isPresented: $imageScanPresented) {
+            if let resource = store.resource(for: store.selectedResources.first) {
+                ImageScanView(resource: resource)
             }
         }
     }
@@ -98,7 +105,7 @@ struct K9kRootView: View {
         paletteIsPresented: Binding<Bool>, logsPresented: Binding<Bool>, portForwardPresented: Binding<Bool>, portForwardListPresented: Binding<Bool>,
         scalePresented: Binding<Bool>, terminalPresented: Binding<Bool>, terminalMode: Binding<PodTerminalMode>, manifestEditorPresented: Binding<Bool>,
         relationshipsPresented: Binding<Bool>, nodeDrainPresented: Binding<Bool>, nodeShellPresented: Binding<Bool>, debugPresented: Binding<Bool>, resourceSelectorsPresented: Binding<Bool>,
-        pluginToRun: Binding<K9sPlugin?>, manifestImportPresented: Binding<Bool>, pulsePresented: Binding<Bool>, accessCheckPresented: Binding<Bool>, navigationHelpPresented: Binding<Bool>
+        pluginToRun: Binding<K9sPlugin?>, manifestImportPresented: Binding<Bool>, pulsePresented: Binding<Bool>, accessCheckPresented: Binding<Bool>, navigationHelpPresented: Binding<Bool>, imageScanPresented: Binding<Bool>
     ) -> some ViewModifier {
         RootPresentations(
             destructiveConfirmation: destructiveConfirmation, restartConfirmation: restartConfirmation, rollbackConfirmation: rollbackConfirmation, cronJobTriggerConfirmation: cronJobTriggerConfirmation,
@@ -107,11 +114,12 @@ struct K9kRootView: View {
             terminalPresented: terminalPresented, terminalMode: terminalMode, manifestEditorPresented: manifestEditorPresented,
             relationshipsPresented: relationshipsPresented, nodeDrainPresented: nodeDrainPresented, nodeShellPresented: nodeShellPresented, debugPresented: debugPresented,
             resourceSelectorsPresented: resourceSelectorsPresented, pluginToRun: pluginToRun, manifestImportPresented: manifestImportPresented, pulsePresented: pulsePresented,
-            accessCheckPresented: accessCheckPresented, navigationHelpPresented: navigationHelpPresented
+            accessCheckPresented: accessCheckPresented, navigationHelpPresented: navigationHelpPresented, imageScanPresented: imageScanPresented
         )
     }
 
     private struct RootPresentations: ViewModifier {
+        private static let imageScannableKinds: Set<String> = ["Pod", "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "Job", "CronJob"]
         @Environment(ClusterStore.self) private var store
         @Binding var destructiveConfirmation: Bool
         @Binding var restartConfirmation: Bool
@@ -136,6 +144,7 @@ struct K9kRootView: View {
         @Binding var pulsePresented: Bool
         @Binding var accessCheckPresented: Bool
         @Binding var navigationHelpPresented: Bool
+        @Binding var imageScanPresented: Bool
 
         func body(content: Content) -> some View {
             content
@@ -293,6 +302,9 @@ struct K9kRootView: View {
                     Button("File Transfer…") { podFileTransferPresented = true }
                         .disabled(store.isReadOnly)
                 }
+                if let resource = store.resource(for: store.selectedResources.first), Self.imageScannableKinds.contains(resource.kind) {
+                    Button("Image Scan…") { imageScanPresented = true }
+                }
                 if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Service" {
                     Button("Port Forward…") { portForwardPresented = true }
                 }
@@ -388,6 +400,7 @@ struct SettingsView: View {
                     }
                 }
             }
+            ImageScanSettingsSection()
             Section("K9s compatibility") {
                 if let config = store.k9sConfig {
                     LabeledContent("Configuration directory", value: config.directory)

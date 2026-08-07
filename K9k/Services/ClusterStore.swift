@@ -715,6 +715,85 @@ final class ClusterStore {
         return true
     }
 
+    /// Follows an object returned by a *confirmed* manifest import in the
+    /// normal resource browser. Import identities originate in the helper's
+    /// post-apply Kubernetes response, so this never guesses a plural from a
+    /// Kind or reuses the importer's YAML as an authority for the destination.
+    ///
+    /// Like relationship navigation, the focused name selector deliberately
+    /// keeps the regular list/watch lifecycle alive. In addition, the returned
+    /// UID is checked after the list arrives: a delete-and-recreate at the same
+    /// name cannot silently become the object an operator meant to follow.
+    @discardableResult
+    func openImportedManifest(_ document: ManifestDocument) async -> Bool {
+        let identity = document.identity
+        guard let contextName = selectedContext?.name else {
+            errorMessage = "Connect to a Kubernetes context before following an imported object."
+            return false
+        }
+        guard let type = discoveredResources.first(where: {
+            $0.group == (identity.group ?? "") &&
+                $0.version == identity.version &&
+                $0.resource == identity.resource &&
+                $0.namespaced == identity.namespaced &&
+                $0.kind == identity.kind
+        }) else {
+            errorMessage = "K9k could not find the exact \(identity.group.map { "\($0)/" } ?? "")\(identity.version)/\(identity.resource) API resource in this context. Refresh discovery and try again."
+            return false
+        }
+
+        let namespace: String
+        if type.namespaced {
+            guard let value = identity.namespace?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+                errorMessage = "K9k cannot follow \(identity.kind)/\(identity.name) because the import result has no namespace."
+                return false
+            }
+            namespace = value
+        } else {
+            guard identity.namespace?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else {
+                errorMessage = "K9k cannot follow \(identity.kind)/\(identity.name) because a cluster-scoped import result contains a namespace."
+                return false
+            }
+            namespace = "All Namespaces"
+        }
+        guard !identity.uid.isEmpty else {
+            errorMessage = "K9k cannot follow \(identity.kind)/\(identity.name) because Kubernetes did not return an immutable UID."
+            return false
+        }
+
+        // Install every part of the destination before recording it. This
+        // produces one useful history entry rather than an intermediate GVR
+        // with the source namespace or selector attached.
+        isRestoringNavigation = true
+        selectedNamespace = namespace
+        labelSelector = ""
+        fieldSelector = "metadata.name=\(identity.name)"
+        selectorResourceTypeID = type.id
+        selectedResources.removeAll()
+        selectedResourceType = type
+        isRestoringNavigation = false
+        recordNavigation(to: type)
+
+        await loadResources()
+        guard selectedContext?.name == contextName,
+              selectedResourceType?.id == type.id,
+              selectedNamespace == namespace,
+              fieldSelector == "metadata.name=\(identity.name)" else {
+            // A newer navigation or context switch owns the browser now.
+            return false
+        }
+        guard let target = resources.first(where: {
+            $0.name == identity.name &&
+                (!type.namespaced || $0.namespace == namespace) &&
+                $0.uid == identity.uid
+        }) else {
+            errorMessage = "\(identity.kind)/\(identity.name) is no longer the object returned by the import. It may have been deleted or recreated."
+            return false
+        }
+        selectedResources = [target.id]
+        return true
+    }
+
     /// Keeps selection changes lightweight enough for the system inspector's
     /// show/hide animation. Historically every row click started ten-plus
     /// independent access reviews and an event list request, even though the

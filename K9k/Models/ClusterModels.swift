@@ -391,7 +391,7 @@ struct ManifestDiffChange: Codable, Hashable, Identifiable {
     let live: String?
     let preview: String?
 
-    var id: String { "\(path)|\(operation)|\(live ?? \"\")|\(preview ?? \"\")" }
+    var id: String { "\(path)|\(operation)|\(live ?? "")|\(preview ?? "")" }
 }
 
 /// Result of a multi-document manifest import. Each item was dry-run before

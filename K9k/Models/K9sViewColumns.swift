@@ -43,7 +43,7 @@ struct K9sViewColumn: Identifiable, Hashable {
         case .resourceVersion: resource.resourceVersion ?? "—"
         case .labels:
             guard let labels = resource.labels, !labels.isEmpty else { return "—" }
-            return labels.keys.sorted().map { "\($0)=\(labels[$0] ?? \"\")" }.joined(separator: ", ")
+            return labels.keys.sorted().map { "\($0)=\(labels[$0] ?? "")" }.joined(separator: ", ")
         case .label(let key):
             return resource.labels?[key] ?? "—"
         case .projection(let path):
@@ -54,7 +54,7 @@ struct K9sViewColumn: Identifiable, Hashable {
             let ready = resource.columns?[readyPath] ?? valueFromHydratedObject(readyPath, resource.raw)
             let desired = resource.columns?[desiredPath] ?? valueFromHydratedObject(desiredPath, resource.raw)
             guard ready != nil || desired != nil else { return "—" }
-            return "\(ready ?? \"0\")/\(desired ?? \"0\")"
+            return "\(ready ?? "0")/\(desired ?? "0")"
         }
     }
 

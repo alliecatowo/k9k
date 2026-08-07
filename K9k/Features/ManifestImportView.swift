@@ -30,6 +30,13 @@ struct ManifestImportView: View {
                     .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 Spacer()
                 if let appliedBatch {
+                    Menu("Follow Imported") {
+                        ForEach(appliedBatch.items, id: \.identity) { document in
+                            Button(followLabel(for: document)) { follow(document) }
+                        }
+                    }
+                    .disabled(isWorking)
+                    .help("Open an exact post-apply Kubernetes object in the live browser and start its normal watch")
                     Button("Prepare Removal…") { prepareRemoval(appliedBatch.items.map(\.identity)) }
                         .disabled(isWorking || store.isReadOnly || appliedBatch.items.contains { $0.identity.uid.isEmpty })
                         .help("Recheck delete authorization and the UID of every applied object before asking for confirmation")
@@ -142,10 +149,24 @@ struct ManifestImportView: View {
             do {
                 let result = try await store.importMixedManifests(source: source, confirm: true)
                 appliedBatch = result
-                validationMessage = "Applied \(result.items.count) document\(result.items.count == 1 ? "" : "s"). You can now prepare a UID-pinned removal of this exact batch."
+                validationMessage = "Applied \(result.items.count) document\(result.items.count == 1 ? "" : "s"). Follow any exact returned object, or prepare a UID-pinned removal of this batch."
                 await store.loadResources()
             }
             catch { validationMessage = "Batch apply failed. Earlier documents may have been applied."; store.errorMessage = error.localizedDescription }
+        }
+    }
+
+    private func followLabel(for document: ManifestDocument) -> String {
+        let identity = document.identity
+        let scope = identity.namespaced ? " · \(identity.namespace ?? "unknown namespace")" : " · cluster-scoped"
+        return "\(identity.kind) · \(identity.name)\(scope)"
+    }
+
+    private func follow(_ document: ManifestDocument) {
+        isWorking = true
+        Task {
+            defer { isWorking = false }
+            if await store.openImportedManifest(document) { dismiss() }
         }
     }
 
