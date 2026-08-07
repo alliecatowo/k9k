@@ -111,7 +111,9 @@ struct K9kRootView: View {
         }
         ToolbarItem(placement: .principal) {
             Picker("Namespace", selection: Binding(get: { store.selectedNamespace }, set: { store.selectedNamespace = $0 })) {
-                ForEach(store.namespaces, id: \.self) { Text($0).tag($0) }
+                ForEach(store.orderedNamespaces, id: \.self) { namespace in
+                    Text(store.favoriteNamespaces.contains(namespace) ? "★ \(namespace)" : namespace).tag(namespace)
+                }
             }
             .frame(maxWidth: 180)
             .accessibilityLabel("Namespace scope")
@@ -119,6 +121,19 @@ struct K9kRootView: View {
         ToolbarItemGroup(placement: .primaryAction) {
             Button { Task { await store.loadResources() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                 .help("Refresh resource list")
+            Menu("Namespace") {
+                if store.selectedNamespace != "All Namespaces" {
+                    Button(store.favoriteNamespaces.contains(store.selectedNamespace) ? "Remove Current Favourite" : "Favourite Current Namespace") {
+                        store.toggleFavoriteNamespace(store.selectedNamespace)
+                    }
+                }
+                if !store.favoriteNamespaces.isEmpty {
+                    Divider()
+                    ForEach(store.favoriteNamespaces, id: \.self) { namespace in
+                        Button(namespace) { store.selectedNamespace = namespace }
+                    }
+                }
+            }
             Button { resourceSelectorsPresented = true } label: { Label("Filter Resources", systemImage: "line.3.horizontal.decrease.circle") }
                 .help("Filter the current Kubernetes resource list with label or field selectors")
             Button { paletteIsPresented = true } label: { Label("Open Command Palette", systemImage: "command") }
@@ -228,6 +243,15 @@ struct SettingsView: View {
                 }
                 Button("Manage Contexts…") { contextManagerPresented = true }
                 Text("Credentials remain in kubeconfig and are never displayed by K9k.").font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Namespace favourites") {
+                if store.favoriteNamespaces.isEmpty {
+                    Text("Choose a namespace, then use the Namespace toolbar menu to add it here.").foregroundStyle(.secondary)
+                } else {
+                    ForEach(store.favoriteNamespaces, id: \.self) { namespace in
+                        HStack { Text(namespace); Spacer(); Button("Remove") { store.toggleFavoriteNamespace(namespace) } }
+                    }
+                }
             }
             Section("K9s compatibility") {
                 if let config = store.k9sConfig {

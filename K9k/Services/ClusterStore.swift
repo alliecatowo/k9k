@@ -10,6 +10,9 @@ final class ClusterStore {
     var discoveredResources: [ResourceType] = []
     var selectedContext: KubeContext?
     var selectedNamespace = UserDefaults.standard.string(forKey: "k9k.selectedNamespace") ?? "All Namespaces" { didSet { UserDefaults.standard.set(selectedNamespace, forKey: "k9k.selectedNamespace") } }
+    var favoriteNamespaces = UserDefaults.standard.stringArray(forKey: "k9k.favoriteNamespaces") ?? [] {
+        didSet { UserDefaults.standard.set(favoriteNamespaces, forKey: "k9k.favoriteNamespaces") }
+    }
     var selectedResourceType: ResourceType?
     var resources: [ResourceSummary] = []
     var selectedResources = Set<ResourceSummary.ID>()
@@ -73,6 +76,18 @@ final class ClusterStore {
         return resources.filter { resource in
             resource.name.lowercased().contains(query) || resource.kind.lowercased().contains(query) || resource.namespace?.lowercased().contains(query) == true
         }
+    }
+
+    var orderedNamespaces: [String] {
+        let favorites = favoriteNamespaces.filter { namespaces.contains($0) }
+        let remaining = namespaces.filter { $0 != "All Namespaces" && !favorites.contains($0) }.sorted()
+        return ["All Namespaces"] + favorites + remaining
+    }
+
+    func toggleFavoriteNamespace(_ namespace: String) {
+        guard namespace != "All Namespaces" else { return }
+        if let index = favoriteNamespaces.firstIndex(of: namespace) { favoriteNamespaces.remove(at: index) }
+        else { favoriteNamespaces.append(namespace); favoriteNamespaces.sort() }
     }
 
     func connect() async {
