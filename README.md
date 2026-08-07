@@ -115,7 +115,7 @@ These tasks use the disposable `kind-k9k-test` context. Switch back to your prod
 
 ## Parity status
 
-K9k is actively developed and deliberately candid about parity. It covers many high-value K9s workflows today, but it is not yet complete K9s parity. Notable remaining areas include host SSH, Helm mutation actions, image scanning, manifest-directory follow/delete workflows, and specialised K9s views. Node Shell is available through an explicitly configured, existing trusted DaemonSet rather than an automatically created privileged Pod.
+K9k is actively developed and deliberately candid about parity. It covers many high-value K9s workflows today, but it is not yet complete K9s parity. Notable remaining areas include host SSH, Helm upgrade/non-Secret storage, general manifest-directory browsing, and specialised K9s views. Image scanning is available only through an explicitly configured local scanner; K9k never downloads, guesses, or auto-runs one. Node Shell is available through an explicitly configured, existing trusted DaemonSet rather than an automatically created privileged Pod.
 
 See [K9S_PARITY.md](Docs/K9S_PARITY.md) for the source-pinned capability ledger, [ARCHITECTURE.md](Docs/ARCHITECTURE.md) for design, and [IPC_PROTOCOL.md](Docs/IPC_PROTOCOL.md) for the helper contract.
 
