@@ -238,6 +238,7 @@ type PodExecRequest struct {
 	Command   []string `json:"command"`
 	Stdin     bool     `json:"stdin"`
 	TTY       bool     `json:"tty"`
+	Attach    bool     `json:"attach,omitempty"`
 }
 
 // PodExecStreams are the byte-oriented endpoints of an exec session. stdout

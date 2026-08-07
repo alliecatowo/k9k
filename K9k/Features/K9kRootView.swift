@@ -10,6 +10,7 @@ struct K9kRootView: View {
     @State private var scalePresented = false
     @State private var restartConfirmation = false
     @State private var terminalPresented = false
+    @State private var terminalMode: PodTerminalMode = .shell
     @State private var manifestEditorPresented = false
     @State private var relationshipsPresented = false
     @State private var nodeCordonConfirmation = false
@@ -41,6 +42,7 @@ struct K9kRootView: View {
                 await store.updateScaleAccess()
                 await store.updateRestartAccess()
                 await store.updateExecAccess()
+                await store.updateAttachAccess()
                 await store.updateManifestAccess()
                 await store.updateNodePatchAccess()
                 await store.updateNodeDrainAccess()
@@ -64,7 +66,7 @@ struct K9kRootView: View {
         }
         .sheet(isPresented: $scalePresented) { ScaleWorkloadView(isPresented: $scalePresented) }
         .sheet(isPresented: $terminalPresented) {
-            if let resource = store.resource(for: store.selectedResources.first) { TerminalSessionView(resource: resource) }
+            if let resource = store.resource(for: store.selectedResources.first) { TerminalSessionView(resource: resource, initialMode: terminalMode) }
         }
         .sheet(isPresented: $manifestEditorPresented) {
             if let resource = store.resource(for: store.selectedResources.first), let type = store.selectedResourceType {
@@ -116,8 +118,10 @@ struct K9kRootView: View {
                 if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Pod" {
                     Button("View Logs") { logsPresented = true }
                     Button("Port Forward…") { portForwardPresented = true }
-                    Button("Open Terminal…") { terminalPresented = true }
+                    Button("Open Terminal…") { terminalMode = .shell; terminalPresented = true }
                         .disabled(!store.canOpenExec)
+                    Button("Attach…") { terminalMode = .attach; terminalPresented = true }
+                        .disabled(!store.canOpenAttach)
                 }
                 if store.isSelectedResourceScalable {
                     Button("Scale…") { scalePresented = true }

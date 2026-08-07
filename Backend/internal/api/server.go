@@ -174,6 +174,10 @@ func (s *Server) dispatch(ctx context.Context, request protocol.Request) {
 		s.startExec(ctx, request)
 		return
 	}
+	if request.Operation == "attach.open" {
+		s.startAttach(ctx, request)
+		return
+	}
 
 	result, opErr := s.handle(ctx, request)
 	if opErr != nil {
@@ -766,6 +770,50 @@ func (p execParams) initialDimensions() (uint16, uint16) {
 	return uint16(columns), uint16(rows)
 }
 
+// attachParams deliberately shares the terminal transport controls with exec
+// but accepts no command: Kubernetes attaches to the container's primary
+// process rather than starting a shell inside it.
+type attachParams struct {
+	StreamID       string `json:"streamID"`
+	Namespace      string `json:"namespace"`
+	Pod            string `json:"pod"`
+	Container      string `json:"container"`
+	TTY            *bool  `json:"tty"`
+	Stdin          *bool  `json:"stdin"`
+	InitialColumns int    `json:"initialColumns"`
+	InitialRows    int    `json:"initialRows"`
+}
+
+func (p attachParams) tty() bool { return p.TTY == nil || *p.TTY }
+func (p attachParams) stdin() bool {
+	if p.Stdin != nil {
+		return *p.Stdin
+	}
+	return p.tty()
+}
+func (p attachParams) validate() error {
+	if strings.TrimSpace(p.Namespace) == "" || strings.TrimSpace(p.Pod) == "" {
+		return errors.New("namespace and pod are required")
+	}
+	if p.InitialColumns < 0 || p.InitialColumns > 65535 || p.InitialRows < 0 || p.InitialRows > 65535 {
+		return errors.New("initialColumns and initialRows must be between 0 and 65535")
+	}
+	return nil
+}
+func (p attachParams) initialDimensions() (uint16, uint16) {
+	columns, rows := p.InitialColumns, p.InitialRows
+	if columns == 0 {
+		columns = 80
+	}
+	if rows == 0 {
+		rows = 24
+	}
+	return uint16(columns), uint16(rows)
+}
+func (p attachParams) request() PodExecRequest {
+	return PodExecRequest{Namespace: p.Namespace, Pod: p.Pod, Container: p.Container, Stdin: p.stdin(), TTY: p.tty(), Attach: true}
+}
+
 type execInputParams struct {
 	StreamID   string  `json:"streamID"`
 	Data       *string `json:"data"`
@@ -958,6 +1006,85 @@ func (s *Server) startExec(ctx context.Context, request protocol.Request) {
 			s.write(protocol.Event(streamID, "exec.error", closeResult))
 		}
 		closeResult["reason"] = reason
+		s.write(protocol.Event(streamID, "exec.closed", closeResult))
+	}()
+}
+
+// startAttach mirrors exec's byte-stream lifecycle while marking the direct
+// client-go request as an attach. Keeping the stream event names identical
+// lets the native VT terminal safely reuse its ordered stdin/resize transport.
+func (s *Server) startAttach(ctx context.Context, request protocol.Request) {
+	var params attachParams
+	if err := decodeParams(request.Params, &params); err != nil {
+		s.writeFailure(request.ID, "invalid_params", err, nil)
+		return
+	}
+	if err := params.validate(); err != nil {
+		s.writeFailure(request.ID, "invalid_params", err, nil)
+		return
+	}
+	streamID := request.StreamID
+	if streamID == "" {
+		streamID = params.StreamID
+	}
+	if streamID == "" {
+		s.writeFailure(request.ID, "invalid_params", errors.New("streamID is required"), nil)
+		return
+	}
+	streamContext, cancel := context.WithCancel(ctx)
+	if !s.registerStream(streamID, cancel) {
+		cancel()
+		s.writeFailure(request.ID, "stream_exists", fmt.Errorf("stream %q already exists", streamID), nil)
+		return
+	}
+	input := newExecInput()
+	var resize *resizeQueue
+	if params.tty() {
+		columns, rows := params.initialDimensions()
+		resize = newResizeQueue(columns, rows)
+	}
+	session := &execSession{input: input, resize: resize, stdin: params.stdin()}
+	if !s.registerExecSession(streamID, session) {
+		s.unregisterStream(streamID)
+		input.Close()
+		if resize != nil {
+			resize.Close()
+		}
+		cancel()
+		s.writeFailure(request.ID, "stream_exists", fmt.Errorf("exec stream %q already exists", streamID), nil)
+		return
+	}
+	result := map[string]any{"streamID": streamID, "status": "started", "namespace": params.Namespace, "pod": params.Pod, "container": params.Container, "attach": true, "tty": params.tty(), "stdin": params.stdin()}
+	s.write(protocol.Response(request.ID, result))
+	s.write(protocol.Event(streamID, "exec.started", result))
+	s.work.Add(1)
+	go func() {
+		defer s.work.Done()
+		defer s.unregisterExecSession(streamID)
+		defer s.unregisterStream(streamID)
+		defer cancel()
+		defer input.Close()
+		if resize != nil {
+			defer resize.Close()
+		}
+		streams := PodExecStreams{Stdout: execEventWriter{server: s, streamID: streamID, event: "exec.stdout"}, Stderr: execEventWriter{server: s, streamID: streamID, event: "exec.stderr"}}
+		if params.stdin() {
+			streams.Stdin = input
+		}
+		if resize != nil {
+			streams.TerminalSizeQueue = resize
+		}
+		err := s.cluster.PodExec(streamContext, params.request(), streams)
+		closeResult := map[string]any{"reason": "completed", "exitCode": 0}
+		if streamContext.Err() != nil {
+			closeResult = map[string]any{"reason": "cancelled"}
+		} else if err != nil {
+			closeResult = map[string]any{"reason": "error", "message": err.Error()}
+			if exitCode, isExit := remoteExitCode(err); isExit {
+				closeResult["exitCode"] = exitCode
+			}
+			s.write(protocol.Event(streamID, "exec.error", closeResult))
+		}
 		s.write(protocol.Event(streamID, "exec.closed", closeResult))
 	}()
 }

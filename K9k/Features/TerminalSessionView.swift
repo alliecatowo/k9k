@@ -1,5 +1,7 @@
 import SwiftUI
 
+enum PodTerminalMode { case shell, attach }
+
 /// A Kubernetes exec is a byte stream. The body is intentionally hosted by an
 /// AppKit terminal emulator rather than a SwiftUI text control, preserving VT
 /// state, colors, keyboard input, copy/paste, mouse reporting, and scrollback.
@@ -7,6 +9,7 @@ struct TerminalSessionView: View {
     @Environment(ClusterStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     let resource: ResourceSummary
+    let initialMode: PodTerminalMode
     @State private var isStarting = false
     @State private var selectedContainer = ""
 
@@ -18,7 +21,7 @@ struct TerminalSessionView: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Pod Terminal").font(.headline)
+                    Text(initialMode == .attach ? "Pod Attach" : "Pod Terminal").font(.headline)
                     Text("\(resource.namespace ?? "default") / \(resource.name) · active Kubernetes context")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -52,7 +55,7 @@ struct TerminalSessionView: View {
                     }.frame(maxWidth: 180)
                 }
                 if store.activeExecStreamID == nil {
-                    Button("Start Shell") { startShell() }
+                    Button(initialMode == .attach ? "Attach to Process" : "Start Shell") { startTerminal() }
                         .keyboardShortcut(.defaultAction)
                         .disabled(isStarting)
                 } else {
@@ -71,10 +74,14 @@ struct TerminalSessionView: View {
         }
     }
 
-    private func startShell() {
+    private func startTerminal() {
         isStarting = true
         Task {
-            await store.openExec(for: resource, command: ["/bin/sh"], container: selectedContainer)
+            if initialMode == .attach {
+                await store.openAttach(for: resource, container: selectedContainer)
+            } else {
+                await store.openExec(for: resource, command: ["/bin/sh"], container: selectedContainer)
+            }
             isStarting = false
         }
     }

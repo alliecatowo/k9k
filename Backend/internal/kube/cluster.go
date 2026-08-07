@@ -310,9 +310,9 @@ func (c *Cluster) PodLogs(ctx context.Context, namespace, pod, container string,
 	return typed.CoreV1().Pods(namespace).GetLogs(pod, options).Stream(ctx)
 }
 
-// PodExec connects directly to Kubernetes' pods/exec SPDY endpoint using the
-// selected kubeconfig. Command is an argv array supplied to PodExecOptions;
-// there is no local shell or kubectl subprocess in this execution path.
+// PodExec connects directly to Kubernetes' pods/exec or pods/attach SPDY
+// endpoint using the selected kubeconfig. There is no local shell or kubectl
+// subprocess in either execution path.
 func (c *Cluster) PodExec(ctx context.Context, request api.PodExecRequest, streams api.PodExecStreams) error {
 	c.mu.RLock()
 	typed := c.typed
@@ -325,21 +325,18 @@ func (c *Cluster) PodExec(ctx context.Context, request api.PodExecRequest, strea
 		return fmt.Errorf("no usable Kubernetes context is selected")
 	}
 
-	options := &corev1.PodExecOptions{
-		Container: request.Container,
-		Command:   append([]string(nil), request.Command...),
-		Stdin:     request.Stdin,
-		Stdout:    streams.Stdout != nil,
-		Stderr:    streams.Stderr != nil && !request.TTY,
-		TTY:       request.TTY,
-	}
-	endpoint := typed.CoreV1().RESTClient().Post().
+	endpointRequest := typed.CoreV1().RESTClient().Post().
 		Namespace(request.Namespace).
 		Resource("pods").
-		Name(request.Pod).
-		SubResource("exec").
-		VersionedParams(options, scheme.ParameterCodec).
-		URL()
+		Name(request.Pod)
+	if request.Attach {
+		options := &corev1.PodAttachOptions{Container: request.Container, Stdin: request.Stdin, Stdout: streams.Stdout != nil, Stderr: streams.Stderr != nil && !request.TTY, TTY: request.TTY}
+		endpointRequest = endpointRequest.SubResource("attach").VersionedParams(options, scheme.ParameterCodec)
+	} else {
+		options := &corev1.PodExecOptions{Container: request.Container, Command: append([]string(nil), request.Command...), Stdin: request.Stdin, Stdout: streams.Stdout != nil, Stderr: streams.Stderr != nil && !request.TTY, TTY: request.TTY}
+		endpointRequest = endpointRequest.SubResource("exec").VersionedParams(options, scheme.ParameterCodec)
+	}
+	endpoint := endpointRequest.URL()
 	executor, err := remotecommand.NewSPDYExecutor(restConfig, http.MethodPost, endpoint)
 	if err != nil {
 		return fmt.Errorf("create pod exec transport: %w", err)

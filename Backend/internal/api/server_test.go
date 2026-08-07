@@ -977,6 +977,28 @@ func TestServerExecStreamsInteractiveBytesResizeAndCancellation(t *testing.T) {
 	}
 }
 
+func TestServerAttachStartsTerminalWithoutCommand(t *testing.T) {
+	client := &fakeCluster{execFn: func(_ context.Context, request PodExecRequest, streams PodExecStreams) error {
+		if !request.Attach || request.Namespace != "demo" || request.Pod != "api" || request.Container != "app" || !request.TTY || !request.Stdin || len(request.Command) != 0 {
+			t.Errorf("attach request = %#v", request)
+		}
+		_, err := streams.Stdout.Write([]byte("attached\\n"))
+		return err
+	}}
+	responses := runRequests(t, client, request("attach", "attach.open", map[string]any{"streamID": "attach-stream", "namespace": "demo", "pod": "api", "container": "app"}))
+	if got := envelopeByID(t, responses, "attach"); got.Error != nil {
+		t.Errorf("attach response = %#v", got)
+	}
+	if !hasEnvelope(responses, "", "exec.started") || !hasEnvelope(responses, "", "exec.stdout") || !hasEnvelope(responses, "", "exec.closed") {
+		t.Errorf("attach lifecycle missing from %#v", responses)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.execs) != 1 || !client.execs[0].Attach {
+		t.Errorf("attach calls = %#v", client.execs)
+	}
+}
+
 func TestServerExecReportsRemoteExitAndRejectsBadFrames(t *testing.T) {
 	client := &fakeCluster{execErr: kubeexec.CodeExitError{Err: errors.New("command terminated with exit code 7"), Code: 7}}
 	inputReader, inputWriter := io.Pipe()

@@ -30,6 +30,7 @@ final class ClusterStore {
     var activePortForwardStreamID: String?
     var activeExecStreamID: String?
     var execAccess: AccessReview?
+    var attachAccess: AccessReview?
     var isCheckingExecAccess = false
     var manifestAccess: AccessReview?
     var isCheckingManifestAccess = false
@@ -252,6 +253,10 @@ final class ClusterStore {
 
     var canOpenExec: Bool {
         !isReadOnly && selectedPodResource != nil && execAccess?.allowed == true
+    }
+
+    var canOpenAttach: Bool {
+        !isReadOnly && selectedPodResource != nil && attachAccess?.allowed == true
     }
 
     var isSelectedResourcePod: Bool { selectedPodResource != nil }
@@ -478,6 +483,20 @@ final class ClusterStore {
         }
     }
 
+    func updateAttachAccess() async {
+        guard let type = selectedResourceType, let resource = selectedPodResource else { attachAccess = nil; return }
+        do {
+            attachAccess = try decode(
+                (try await client.request("rbac.check", parameters: operationParameters(type: type, resource: resource, additional: [
+                    "verb": .string("create"), "subresource": .string("attach")
+                ]))).result,
+                as: AccessReview.self
+            )
+        } catch {
+            attachAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify Pod attach permission: \(error.localizedDescription)", evaluationError: nil)
+        }
+    }
+
     func openExec(for resource: ResourceSummary, command: [String], container: String? = nil) async {
         guard resource.kind == "Pod", let namespace = resource.namespace else { return }
         await updateExecAccess()
@@ -505,6 +524,25 @@ final class ClusterStore {
             activeExecStreamID = nil
             errorMessage = error.localizedDescription
         }
+    }
+
+    func openAttach(for resource: ResourceSummary, container: String? = nil) async {
+        guard resource.kind == "Pod", let namespace = resource.namespace else { return }
+        await updateAttachAccess()
+        guard canOpenAttach else {
+            errorMessage = attachAccess?.reason ?? "The active Kubernetes identity is not authorized to attach to this Pod."
+            return
+        }
+        await closeExec()
+        let streamID = UUID().uuidString
+        activeExecStreamID = streamID
+        var parameters: [String: JSONValue] = [
+            "streamID": .string(streamID), "namespace": .string(namespace), "pod": .string(resource.name),
+            "tty": .bool(true), "stdin": .bool(true), "initialColumns": .number(Double(terminalColumns)), "initialRows": .number(Double(terminalRows))
+        ]
+        if let container, !container.isEmpty { parameters["container"] = .string(container) }
+        do { _ = try await client.request("attach.open", parameters: .object(parameters)) }
+        catch { activeExecStreamID = nil; errorMessage = error.localizedDescription }
     }
 
     func sendExecInput(_ input: String) async {
