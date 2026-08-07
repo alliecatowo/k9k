@@ -10,6 +10,7 @@ struct LogStreamView: View {
     @State private var previous = false
     @State private var timestamps = true
     @State private var filter = ""
+    @State private var wrapsLines = false
 
     private var containers: [String] { resource.raw?.objectValue?["spec"]?.objectValue?["containers"]?.arrayValue?.compactMap { $0.objectValue?["name"]?.stringValue } ?? [] }
     private var visibleLines: [String] {
@@ -32,7 +33,9 @@ struct LogStreamView: View {
                 Toggle("Timestamps", isOn: $timestamps).toggleStyle(.switch)
                 Toggle("Follow", isOn: $isFollowing).toggleStyle(.switch)
                 Button("Reload") { Task { await store.openLogs(for: resource, container: selectedContainer, previous: previous, timestamps: timestamps) } }
+                Toggle("Wrap", isOn: $wrapsLines).toggleStyle(.switch)
                 Button("Copy") { copyVisibleLines() }.disabled(visibleLines.isEmpty)
+                Button("Save…") { saveVisibleLines() }.disabled(visibleLines.isEmpty)
                 Button("Close") { dismiss() }
             }
             .padding()
@@ -42,10 +45,16 @@ struct LogStreamView: View {
                 .padding(.horizontal)
                 .padding(.vertical, 8)
             ScrollViewReader { proxy in
-                ScrollView {
+                ScrollView([.vertical, .horizontal]) {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(Array(visibleLines.enumerated()), id: \.offset) { offset, line in
-                            Text(line).font(.system(.caption, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).id(offset)
+                            Text(line)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .lineLimit(wrapsLines ? nil : 1)
+                                .fixedSize(horizontal: !wrapsLines, vertical: true)
+                                .frame(maxWidth: wrapsLines ? .infinity : nil, alignment: .leading)
+                                .id(offset)
                         }
                     }
                     .padding()
@@ -61,5 +70,22 @@ struct LogStreamView: View {
     private func copyVisibleLines() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(visibleLines.joined(separator: "\n"), forType: .string)
+    }
+
+    private func saveVisibleLines() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(resource.name)-logs.txt"
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            guard let data = visibleLines.joined(separator: "\n").data(using: .utf8) else {
+                store.errorMessage = "K9k could not encode the visible log lines."
+                return
+            }
+            try data.write(to: url, options: .atomic)
+        } catch {
+            store.errorMessage = "K9k could not save logs: \(error.localizedDescription)"
+        }
     }
 }
