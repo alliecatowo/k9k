@@ -147,6 +147,20 @@ struct SettingsView: View {
         Form {
             Toggle("Read-only Mode", isOn: $store.isReadOnly)
             LabeledContent("Kubeconfig") { Text(ProcessInfo.processInfo.environment["KUBECONFIG"] ?? "~/.kube/config") }
+            Section("Kubernetes Contexts") {
+                ForEach(store.contexts) { context in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(context.name).fontWeight(context.active ? .semibold : .regular)
+                            Text("Cluster: \(context.cluster) · User: \(context.user)").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if context.active { Text("Active").font(.caption).foregroundStyle(.green) }
+                        else { Button("Use") { Task { await store.selectContext(context) } } }
+                    }
+                }
+                Text("Credentials remain in kubeconfig and are never displayed by K9k.").font(.caption).foregroundStyle(.secondary)
+            }
             Section("K9s compatibility") {
                 if let config = store.k9sConfig {
                     LabeledContent("Configuration directory", value: config.directory)
