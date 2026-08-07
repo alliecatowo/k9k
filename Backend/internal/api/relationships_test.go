@@ -59,6 +59,38 @@ func TestObjectReferencesExtractsCommonPodDependencies(t *testing.T) {
 	}
 }
 
+func TestObjectReferencesExtractsExplicitRoutingAutoscalingAndRBACReferences(t *testing.T) {
+	object := map[string]any{
+		"spec": map[string]any{
+			"serviceName":    "web-headless",
+			"scaleTargetRef": map[string]any{"apiVersion": "apps/v1", "kind": "Deployment", "name": "web"},
+			"backend":        map[string]any{"service": map[string]any{"name": "web-api"}},
+		},
+		"roleRef":   map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "view"},
+		"subjects":  []any{map[string]any{"kind": "ServiceAccount", "name": "deployer", "namespace": "tools"}},
+		"targetRef": map[string]any{"apiVersion": "v1", "kind": "Pod", "name": "web-abc"},
+	}
+	refs := objectReferences(object, "demo")
+	want := map[string]bool{
+		"v1/Service/demo/web-headless":                   true,
+		"apps/v1/Deployment/demo/web":                    true,
+		"v1/Service/demo/web-api":                        true,
+		"rbac.authorization.k8s.io/v1/ClusterRole//view": true,
+		"v1/ServiceAccount/tools/deployer":               true,
+		"v1/Pod/demo/web-abc":                            true,
+	}
+	for _, ref := range refs {
+		key := ref.APIVersion + "/" + ref.Kind + "/" + ref.Namespace + "/" + ref.Name
+		if !want[key] {
+			t.Errorf("unexpected reference %q", key)
+		}
+		delete(want, key)
+	}
+	for key := range want {
+		t.Errorf("missing explicit reference %q from %#v", key, refs)
+	}
+}
+
 func TestSelectorsMatchServiceAndWorkloadSelectors(t *testing.T) {
 	labels := map[string]string{"app": "web", "tier": "frontend"}
 	if !selectorsMatch(map[string]any{"spec": map[string]any{"selector": map[string]any{"app": "web"}}}, labels) {

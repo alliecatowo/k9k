@@ -24,6 +24,7 @@ const (
 	maxRelationshipCandidateItems = 160
 	maxRelationshipInventory      = 640
 	maxRelationshipResolutions    = 48
+	maxRelationshipObjectRefs     = 64
 )
 
 var errRelationshipResolutionLimit = errors.New("relationship resolution limit reached")
@@ -107,7 +108,11 @@ func (s *Server) relationships(ctx context.Context, params resourceParams) (Rela
 			}
 		}
 
-		for _, reference := range objectReferences(current.item.object, current.item.node.Namespace) {
+		references, referencesTruncated := boundedObjectReferences(current.item.object, current.item.node.Namespace)
+		if referencesTruncated {
+			graph.markTruncated("A resource declared more than 64 direct references; XRay kept the first 64.")
+		}
+		for _, reference := range references {
 			resolved, resolvedObject, resolveErr := resolver.resolve(ctx, reference)
 			if resolveErr != nil && !isMissingRelationshipKind(resolveErr) && !errors.Is(resolveErr, errRelationshipResolutionLimit) {
 				graph.addWarning("Could not resolve reference " + reference.Kind + "/" + reference.Name + ": " + resolveErr.Error())
@@ -477,14 +482,57 @@ func referencesObject(object map[string]any, kind, name, namespace string) bool 
 }
 
 func objectReferences(object map[string]any, namespace string) []RelationshipNode {
+	references, _ := boundedObjectReferences(object, namespace)
+	return references
+}
+
+func boundedObjectReferences(object map[string]any, namespace string) ([]RelationshipNode, bool) {
 	result := []RelationshipNode{}
 	seen := map[string]bool{}
+	const clusterScopedReference = "\x00"
+	truncated := false
+	add := func(apiVersion, kind, referenceNamespace, name string) {
+		apiVersion = strings.TrimSpace(apiVersion)
+		kind = strings.TrimSpace(kind)
+		name = strings.TrimSpace(name)
+		if apiVersion == "" {
+			apiVersion = "v1"
+		}
+		if referenceNamespace == clusterScopedReference {
+			referenceNamespace = ""
+		} else if referenceNamespace == "" {
+			referenceNamespace = namespace
+		}
+		if kind == "" || name == "" {
+			return
+		}
+		node := RelationshipNode{ID: relationshipID(apiVersion, kind, referenceNamespace, name, ""), APIVersion: apiVersion, Kind: kind, Namespace: referenceNamespace, Name: name}
+		if !seen[node.ID] {
+			if len(result) >= maxRelationshipObjectRefs {
+				truncated = true
+				return
+			}
+			seen[node.ID] = true
+			result = append(result, node)
+		}
+	}
+	apiVersionForReference := func(item map[string]any) string {
+		if apiVersion, ok := item["apiVersion"].(string); ok && apiVersion != "" {
+			return apiVersion
+		}
+		if group, ok := item["apiGroup"].(string); ok && group != "" {
+			return group + "/v1"
+		}
+		return "v1"
+	}
 	var visit func(any, string)
 	visit = func(value any, key string) {
 		switch item := value.(type) {
 		case map[string]any:
 			name, hasName := item["name"].(string)
+			referenceNamespace, _ := item["namespace"].(string)
 			kind := ""
+			apiVersion := "v1"
 			switch key {
 			case "configMapKeyRef", "configMapRef", "configMap":
 				kind = "ConfigMap"
@@ -492,6 +540,31 @@ func objectReferences(object map[string]any, namespace string) []RelationshipNod
 				kind = "Secret"
 			case "persistentVolumeClaim":
 				kind = "PersistentVolumeClaim"
+			case "service":
+				// networking.k8s.io/v1 Ingress backends and Gateway-style
+				// backends commonly declare {service: {name: …}}.
+				kind = "Service"
+			case "roleRef":
+				// RoleBinding/ClusterRoleBinding point at the policy object
+				// through apiGroup rather than apiVersion.
+				apiVersion = apiVersionForReference(item)
+				if roleKind, ok := item["kind"].(string); ok && (roleKind == "Role" || roleKind == "ClusterRole") {
+					kind = roleKind
+					if roleKind == "ClusterRole" {
+						referenceNamespace = clusterScopedReference
+					}
+				}
+			case "targetRef", "scaleTargetRef", "objectReference":
+				// These Kubernetes ObjectReference-shaped fields are explicit
+				// declarations, unlike arbitrary {kind,name} user data in CRDs.
+				apiVersion = apiVersionForReference(item)
+				kind, _ = item["kind"].(string)
+			case "subject":
+				// RBAC users/groups are external identities, but a ServiceAccount
+				// subject is a navigable Kubernetes object in this namespace.
+				if subjectKind, _ := item["kind"].(string); subjectKind == "ServiceAccount" {
+					kind = subjectKind
+				}
 			}
 			if key == "persistentVolumeClaim" {
 				if value, ok := item["claimName"].(string); ok {
@@ -504,11 +577,7 @@ func objectReferences(object map[string]any, namespace string) []RelationshipNod
 				}
 			}
 			if hasName && kind != "" {
-				node := RelationshipNode{ID: relationshipID("v1", kind, namespace, name, ""), APIVersion: "v1", Kind: kind, Namespace: namespace, Name: name}
-				if !seen[node.ID] {
-					seen[node.ID] = true
-					result = append(result, node)
-				}
+				add(apiVersion, kind, referenceNamespace, name)
 			}
 			for childKey, child := range item {
 				visit(child, childKey)
@@ -518,15 +587,16 @@ func objectReferences(object map[string]any, namespace string) []RelationshipNod
 				visit(child, key)
 			}
 		case string:
-			if key == "serviceAccountName" && item != "" {
-				node := RelationshipNode{ID: relationshipID("v1", "ServiceAccount", namespace, item, ""), APIVersion: "v1", Kind: "ServiceAccount", Namespace: namespace, Name: item}
-				if !seen[node.ID] {
-					seen[node.ID] = true
-					result = append(result, node)
-				}
+			switch key {
+			case "serviceAccountName":
+				add("v1", "ServiceAccount", namespace, item)
+			case "serviceName":
+				// StatefulSet serviceName and legacy Ingress serviceName are
+				// direct Service dependencies, not loose text matches.
+				add("v1", "Service", namespace, item)
 			}
 		}
 	}
 	visit(object, "")
-	return result
+	return result, truncated
 }

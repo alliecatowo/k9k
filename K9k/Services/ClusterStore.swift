@@ -102,6 +102,10 @@ final class ClusterStore {
     private var manifestAccessGeneration = 0
     private var eventsGeneration = 0
     private var resourceMetricsGeneration = 0
+    // XRay may refresh while an operator also presses Refresh. Only the most
+    // recent request is allowed to replace the visible topology; a slow older
+    // snapshot must not rewind the sheet after a newer cluster read finishes.
+    private var relationshipLoadGeneration = 0
     private var terminalOutputSink: ((Data) -> Void)?
     private var terminalColumns = 120
     private var terminalRows = 36
@@ -409,7 +413,7 @@ final class ClusterStore {
             params["selector"] = .string(labelSelector)
             params["fieldSelector"] = .string(fieldSelector)
             params["limit"] = .number(Double(resourcePageLimit))
-            params["columns"] = .array(customColumnPaths(for: type).map(JSONValue.string))
+            params["columns"] = .array(browserProjectionPaths(for: type).map(JSONValue.string))
             var continuation: String?
             var snapshot: [ResourceSummary] = []
             var snapshotResourceVersion = ""
@@ -446,8 +450,16 @@ final class ClusterStore {
         return view.columns.compactMap { K9sViewColumn.parse($0, for: type) }
     }
 
-    private func customColumnPaths(for type: ResourceType) -> [String] {
-        Array(Set(customColumns(for: type).flatMap(\.projectionPaths))).sorted()
+    /// A configured K9s view wins when it contains at least one usable
+    /// column. Otherwise use the native operational layout for the resource
+    /// type rather than emitting empty renderer placeholders.
+    func browserColumns(for type: ResourceType) -> [K9sViewColumn] {
+        let configured = customColumns(for: type)
+        return configured.isEmpty ? K9sViewColumn.nativeColumns(for: type) : configured
+    }
+
+    private func browserProjectionPaths(for type: ResourceType) -> [String] {
+        Array(Set(browserColumns(for: type).flatMap(\.projectionPaths))).sorted()
     }
 
     @discardableResult
@@ -666,14 +678,23 @@ final class ClusterStore {
 
     func loadRelationships(for resource: ResourceSummary?, type: ResourceType?) async {
         guard let resource, let type else { relationshipGraph = nil; return }
+        relationshipLoadGeneration += 1
+        let generation = relationshipLoadGeneration
         isLoadingRelationships = true
-        defer { isLoadingRelationships = false }
+        defer {
+            if generation == relationshipLoadGeneration {
+                isLoadingRelationships = false
+            }
+        }
         do {
-            relationshipGraph = try decode(
+            let graph = try decode(
                 (try await client.request("relationships.get", parameters: operationParameters(type: type, resource: resource))).result,
                 as: RelationshipGraph.self
             )
+            guard generation == relationshipLoadGeneration else { return }
+            relationshipGraph = graph
         } catch {
+            guard generation == relationshipLoadGeneration else { return }
             relationshipGraph = nil
             errorMessage = error.localizedDescription
         }

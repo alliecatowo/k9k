@@ -9,7 +9,7 @@ struct ManifestWorkspaceView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var workspaceRoot: ManifestWorkspaceEntry?
-    @State private var selectedEntryID: String?
+    @State private var selectedEntryIDs = Set<String>()
     @State private var selectedFiles: [URL] = []
     @State private var source = ""
     @State private var statusMessage: String?
@@ -19,6 +19,8 @@ struct ManifestWorkspaceView: View {
     @State private var appliedBatch: ManifestBatchApplyResult?
     @State private var diffResult: ManifestDiffResult?
     @State private var diffPresented = false
+    @State private var validatedBatch: ManifestBatchApplyResult?
+    @State private var batchPreviewPresented = false
 
     var body: some View {
         NavigationSplitView {
@@ -26,22 +28,25 @@ struct ManifestWorkspaceView: View {
                 HStack {
                     Button("Open Manifest Directory…") { openWorkspace() }
                         .disabled(isWorking || appliedBatch != nil)
+                    Button("Reload from Disk") { reloadWorkspace() }
+                        .disabled(workspaceRoot == nil || isWorking || appliedBatch != nil)
+                        .help("Rescan the selected local workspace. K9k never watches or changes files in the background.")
                     Spacer()
                 }
                 .padding()
                 Divider()
 
                 if let root = workspaceRoot {
-                    List(selection: $selectedEntryID) {
+                    List(selection: $selectedEntryIDs) {
                         OutlineGroup([root], children: \.children) { entry in
                             Label(entry.name, systemImage: entry.isDirectory ? "folder" : "doc.text")
                                 .tag(entry.id)
                         }
                     }
                     .listStyle(.sidebar)
-                    .onChange(of: selectedEntryID) { _, value in
-                        guard let value, let entry = root.entry(id: value) else { return }
-                        select(entry)
+                    .onChange(of: selectedEntryIDs) { _, values in
+                        let entries = values.compactMap(root.entry(id:))
+                        select(entries)
                     }
                 } else {
                     ContentUnavailableView("No Manifest Workspace", systemImage: "folder", description: Text("Choose a YAML file or directory to browse its manifest hierarchy."))
@@ -59,6 +64,14 @@ struct ManifestWorkspaceView: View {
                             .lineLimit(2)
                     }
                     Spacer()
+                    if let selectedEntry, let parent = workspaceRoot?.parentID(of: selectedEntry.id) {
+                        Button("Up") { selectedEntryIDs = [parent] }
+                            .help("Select the containing manifest directory")
+                    }
+                    if let root = workspaceRoot {
+                        Button("Reveal") { NSWorkspace.shared.activateFileViewerSelecting([selectedEntry?.url ?? root.url]) }
+                            .help("Reveal the selected manifest or workspace in Finder")
+                    }
                     Button("Close") { dismiss() }
                 }
                 .padding()
@@ -90,6 +103,10 @@ struct ManifestWorkspaceView: View {
                         Button("Prepare Removal…") { prepareRemoval(appliedBatch.items.map(\.identity)) }
                             .disabled(isWorking || store.isReadOnly || appliedBatch.items.contains { $0.identity.uid.isEmpty })
                     } else {
+                        if let validatedBatch {
+                            Button("Review Preview") { batchPreviewPresented = true }
+                                .help("Review the exact Kubernetes identities returned by dry-run validation")
+                        }
                         Button("Compare with Live") { compareWithLive() }
                             .disabled(isWorking || source.isEmpty || selectedFiles.count != 1)
                             .help("Compare exactly one selected YAML file to its UID-pinned live object")
@@ -117,6 +134,9 @@ struct ManifestWorkspaceView: View {
         .sheet(isPresented: $diffPresented) {
             if let diffResult { ManifestDiffView(result: diffResult) }
         }
+        .sheet(isPresented: $batchPreviewPresented) {
+            if let validatedBatch { ManifestBatchPreviewView(result: validatedBatch) }
+        }
     }
 
     private var workspaceTitle: String {
@@ -135,6 +155,12 @@ struct ManifestWorkspaceView: View {
         selectedFiles.count == 1 ? "Manifest" : "\(selectedFiles.count) YAML Files"
     }
 
+    private var selectedEntry: ManifestWorkspaceEntry? {
+        guard selectedEntryIDs.count == 1,
+              let id = selectedEntryIDs.first else { return nil }
+        return workspaceRoot?.entry(id: id)
+    }
+
     private func openWorkspace() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -149,20 +175,47 @@ struct ManifestWorkspaceView: View {
             }
             workspaceRoot = root
             appliedBatch = nil
-            selectedEntryID = root.id
-            select(root)
+            validatedBatch = nil
+            selectedEntryIDs = [root.id]
+            select([root])
         } catch {
             statusMessage = "K9k could not read the selected workspace."
             store.errorMessage = error.localizedDescription
         }
     }
 
-    private func select(_ entry: ManifestWorkspaceEntry) {
+    private func reloadWorkspace() {
+        guard let existing = workspaceRoot else { return }
+        let preservedSelection = selectedEntryIDs
         do {
-            let files = entry.descendantFiles
+            guard let reloaded = try ManifestWorkspaceEntry.scan(url: existing.url) else {
+                workspaceRoot = nil
+                selectedEntryIDs = []
+                selectedFiles = []
+                source = ""
+                validatedBatch = nil
+                statusMessage = "No .yaml or .yml files remain in this workspace."
+                return
+            }
+            workspaceRoot = reloaded
+            let retained = Set(preservedSelection.filter { reloaded.entry(id: $0) != nil })
+            selectedEntryIDs = retained.isEmpty ? [reloaded.id] : retained
+            select(selectedEntryIDs.compactMap(reloaded.entry(id:)))
+            validatedBatch = nil
+            statusMessage = "Reloaded the local workspace. Select files with Command-click to change the batch scope."
+        } catch {
+            statusMessage = "K9k could not reload the local workspace; the current preview was kept."
+            store.errorMessage = error.localizedDescription
+        }
+    }
+
+    private func select(_ entries: [ManifestWorkspaceEntry]) {
+        do {
+            let files = Array(Set(entries.flatMap(\.descendantFiles))).sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
             selectedFiles = files
             source = try readSources(files)
-            statusMessage = "Selected \(files.count) YAML file\(files.count == 1 ? "" : "s")."
+            validatedBatch = nil
+            statusMessage = "Selected \(entries.count) item\(entries.count == 1 ? "" : "s") containing \(files.count) YAML file\(files.count == 1 ? "" : "s")."
         } catch {
             source = ""
             selectedFiles = []
@@ -195,6 +248,7 @@ struct ManifestWorkspaceView: View {
             defer { isWorking = false }
             do {
                 let result = try await store.importMixedManifests(source: source, confirm: false)
+                validatedBatch = result
                 statusMessage = "Validated \(result.items.count) Kubernetes document\(result.items.count == 1 ? "" : "s") — no changes applied."
             } catch {
                 statusMessage = "Validation failed; no changes were applied."
@@ -224,6 +278,7 @@ struct ManifestWorkspaceView: View {
             do {
                 let result = try await store.importMixedManifests(source: source, confirm: true)
                 appliedBatch = result
+                validatedBatch = result
                 statusMessage = "Applied \(result.items.count) object\(result.items.count == 1 ? "" : "s"). Follow a result or prepare a UID-pinned removal of this exact scope."
                 await store.loadResources()
             } catch {
@@ -287,6 +342,17 @@ private struct ManifestWorkspaceEntry: Identifiable, Hashable {
         return nil
     }
 
+    /// Returns the visible hierarchy parent without consulting the filesystem.
+    /// This keeps directory navigation stable until an operator explicitly
+    /// chooses Reload from Disk.
+    func parentID(of targetID: String) -> String? {
+        for child in children ?? [] {
+            if child.id == targetID { return id }
+            if let parent = child.parentID(of: targetID) { return parent }
+        }
+        return nil
+    }
+
     static func scan(url: URL) throws -> ManifestWorkspaceEntry? {
         let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
         if values.isDirectory == true {
@@ -306,5 +372,49 @@ private struct ManifestWorkspaceEntry: Identifiable, Hashable {
         }
         guard values.isRegularFile == true, ["yaml", "yml"].contains(url.pathExtension.lowercased()) else { return nil }
         return ManifestWorkspaceEntry(url: url, isDirectory: false, children: nil)
+    }
+}
+
+/// A compact diagnostic surface for a batch dry-run. It exposes the exact
+/// resource identities Kubernetes returned, rather than reducing a failed or
+/// surprising directory selection to an opaque count.
+private struct ManifestBatchPreviewView: View {
+    @Environment(\.dismiss) private var dismiss
+    let result: ManifestBatchApplyResult
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Manifest Batch Preview").font(.headline)
+                    Text("Kubernetes validated these \(result.items.count) document\(result.items.count == 1 ? "" : "s"); no changes were applied.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Close") { dismiss() }
+            }
+            .padding()
+            Divider()
+            List(result.items, id: \.identity) { document in
+                let identity = document.identity
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("\(identity.kind) · \(identity.namespace ?? "cluster") / \(identity.name)")
+                        .font(.body.weight(.medium))
+                    Text("\(identity.group.map { "\($0)/" } ?? "")\(identity.version)/\(identity.resource) · \(identity.namespaced ? "namespaced" : "cluster-scoped")")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    if !identity.uid.isEmpty {
+                        Text("UID: \(identity.uid)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                            .textSelection(.enabled)
+                    }
+                }
+                .padding(.vertical, 3)
+            }
+            .listStyle(.inset)
+        }
+        .frame(minWidth: 650, minHeight: 420)
     }
 }

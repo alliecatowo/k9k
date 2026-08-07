@@ -109,6 +109,53 @@ struct K9sViewColumn: Identifiable, Hashable {
         return K9sViewColumn(definition: original, title: displayTitle(for: symbol), source: source, rightAligned: rightAligned, relativeTime: relativeTime)
     }
 
+    /// Resource-specific browser layouts replace the generic dashboard-style
+    /// table with the operational fields an operator needs for that resource.
+    /// They deliberately use only stable scalar fields so the list and watch
+    /// streams remain lean; richer arrays, conditions, and sensitive data stay
+    /// in the selected-object inspector.
+    static func nativeColumns(for type: ResourceType) -> [K9sViewColumn] {
+        func column(_ title: String, _ source: Source, rightAligned: Bool = false) -> K9sViewColumn {
+            K9sViewColumn(definition: "native:\(title)", title: title, source: source, rightAligned: rightAligned, relativeTime: false)
+        }
+        let name = column("Name", .name)
+        let status = column("Status", .status)
+        let age = column("Age", .age, rightAligned: true)
+        let kind = column("Kind", .kind)
+        let projection: (String, String, Bool) -> K9sViewColumn = { title, path, rightAligned in
+            column(title, .projection(path), rightAligned: rightAligned)
+        }
+
+        switch type.kind.lowercased() {
+        case "pod":
+            return [name, status, projection("Pod IP", "status.podIP", false), projection("Node", "spec.nodeName", false), age]
+        case "service":
+            return [name, projection("Type", "spec.type", false), projection("Cluster IP", "spec.clusterIP", false), age]
+        case "node":
+            return [name, status, projection("Kubelet", "status.nodeInfo.kubeletVersion", false), projection("OS Image", "status.nodeInfo.osImage", false), age]
+        case "deployment":
+            return [name, column("Ready", .ready(readyPath: "status.readyReplicas", desiredPath: "spec.replicas"), rightAligned: true), projection("Up-to-date", "status.updatedReplicas", true), projection("Available", "status.availableReplicas", true), age]
+        case "statefulset", "replicaset", "replicationcontroller":
+            return [name, column("Ready", .ready(readyPath: "status.readyReplicas", desiredPath: "spec.replicas"), rightAligned: true), projection("Current", "status.currentReplicas", true), age]
+        case "daemonset":
+            return [name, projection("Desired", "status.desiredNumberScheduled", true), projection("Current", "status.currentNumberScheduled", true), projection("Available", "status.numberAvailable", true), age]
+        case "job":
+            return [name, status, projection("Succeeded", "status.succeeded", true), projection("Failed", "status.failed", true), age]
+        case "cronjob":
+            return [name, status, projection("Schedule", "spec.schedule", false), projection("Suspended", "spec.suspend", false), age]
+        case "configmap":
+            return [name, projection("Immutable", "immutable", false), age]
+        case "secret":
+            return [name, projection("Type", "type", false), projection("Immutable", "immutable", false), age]
+        case "rolebinding", "clusterrolebinding":
+            return [name, projection("Role", "roleRef.name", false), projection("Role Kind", "roleRef.kind", false), age]
+        case "role", "clusterrole", "serviceaccount":
+            return [name, age]
+        default:
+            return [name, status, age, kind]
+        }
+    }
+
     private static func source(forSymbol symbol: String, type: ResourceType) -> Source? {
         switch symbol {
         case "NAME": .name

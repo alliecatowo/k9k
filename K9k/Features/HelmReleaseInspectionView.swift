@@ -312,8 +312,6 @@ private struct HelmUninstallConfirmationSheet: View {
                 Section("Confirm") {
                     TextField("Release name", text: $confirmationText, prompt: Text(release))
                         .textFieldStyle(.roundedBorder)
-                        .textInputAutocapitalization(.never)
-                        .disableAutocorrection(true)
                     Text("Type \(release) to enable uninstall.")
                         .font(.caption)
                         .foregroundStyle(.secondary)

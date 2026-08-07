@@ -6,8 +6,12 @@ import SwiftUI
 struct RelationshipGraphView: View {
     @Environment(ClusterStore.self) private var store
     @Environment(\.dismiss) private var dismiss
+    @State private var autoRefreshEnabled = true
+    @State private var lastRefresh: Date?
     let resource: ResourceSummary
     let type: ResourceType
+
+    private let automaticRefreshInterval: UInt64 = 20_000_000_000
 
     var body: some View {
         VStack(spacing: 0) {
@@ -18,7 +22,16 @@ struct RelationshipGraphView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Refresh") { Task { await store.loadRelationships(for: resource, type: type) } }
+                if let lastRefresh {
+                    Text(lastRefresh, format: .relative(presentation: .numeric))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Toggle("Auto-refresh", isOn: $autoRefreshEnabled)
+                    .toggleStyle(.checkbox)
+                    .help("While this XRay sheet is open, re-read the bounded topology every 20 seconds. No background watch continues after closing the sheet.")
+                Button("Refresh") { Task { await refreshTopology() } }
+                    .disabled(store.isLoadingRelationships)
                 Button("Close") { dismiss() }
             }
             .padding()
@@ -36,7 +49,26 @@ struct RelationshipGraphView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 720, minHeight: 500)
-        .task { await store.loadRelationships(for: resource, type: type) }
+        .task(id: refreshTaskID) {
+            // Toggling auto-refresh off cancels the loop without issuing one
+            // final, surprising request. The initial sheet state is on, so a
+            // newly opened XRay still always loads its first snapshot.
+            guard autoRefreshEnabled else { return }
+            await refreshTopology()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: automaticRefreshInterval)
+                guard !Task.isCancelled else { return }
+                await refreshTopology()
+            }
+        }
+    }
+
+    private var refreshTaskID: String { "\(resource.id)-\(autoRefreshEnabled)" }
+
+    private func refreshTopology() async {
+        await store.loadRelationships(for: resource, type: type)
+        guard !Task.isCancelled else { return }
+        lastRefresh = .now
     }
 
     @ViewBuilder

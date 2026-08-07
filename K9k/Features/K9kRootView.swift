@@ -306,7 +306,7 @@ struct K9kRootView: View {
                     Button("File Transfer…") { podFileTransferPresented = true }
                         .disabled(store.isReadOnly)
                 }
-                if let resource = store.resource(for: store.selectedResources.first), Self.imageScannableKinds.contains(resource.kind) {
+                if let resource = store.resource(for: store.selectedResources.first), RootPresentations.imageScannableKinds.contains(resource.kind) {
                     Button("Image Scan…") { imageScanPresented = true }
                 }
                 if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Service" {

@@ -19,7 +19,7 @@ struct ManifestDiffView: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 Image(systemName: result.changed ? "arrow.left.arrow.right" : "checkmark.circle")
-                    .foregroundStyle(result.changed ? .secondary : .green)
+                    .foregroundStyle(result.changed ? Color.secondary : Color.green)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Manifest Diff").font(.headline)
                     Text("\(result.identity.kind) · \(result.identity.namespace ?? "cluster") / \(result.identity.name)")
@@ -29,7 +29,7 @@ struct ManifestDiffView: View {
                 Spacer()
                 Text(result.changed ? "\(result.changes.count) change\(result.changes.count == 1 ? "" : "s")" : "No changes")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(result.changed ? .secondary : .green)
+                    .foregroundStyle(result.changed ? Color.secondary : Color.green)
                 Button("Close") { dismiss() }
             }
             .padding()

@@ -144,20 +144,14 @@ struct ResourceInspectorView: View {
                 Section("Access") { LabeledContent("Delete") { ProgressView().controlSize(.small) } }
             }
             metrics(resource)
+            podDetails(resource)
+            serviceDetails(resource)
+            nodeDetails(resource)
+            configurationDetails(resource)
             rolloutDetails(resource)
             rbacDetails(resource)
             if resource.labels?["owner"] == "helm", let release = helmReleaseName(resource), let namespace = resource.namespace, !namespace.isEmpty {
                 HelmReleaseHistorySection(release: release, namespace: namespace)
-            }
-            if resource.kind == "Pod", let containers = resource.raw?.objectValue?["spec"]?.objectValue?["containers"]?.arrayValue, !containers.isEmpty {
-                Section("Containers") {
-                    ForEach(Array(containers.enumerated()), id: \.offset) { _, container in
-                        if let object = container.objectValue {
-                            LabeledContent(object["name"]?.stringValue ?? "Container", value: object["image"]?.stringValue ?? "—")
-                                .textSelection(.enabled)
-                        }
-                    }
-                }
             }
             if let labels = resource.labels, !labels.isEmpty {
                 Section("Labels") { ForEach(labels.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in LabeledContent(key, value: value).textSelection(.enabled) } }
@@ -186,6 +180,167 @@ struct ResourceInspectorView: View {
             Section("Metrics") {
                 LabeledContent("Usage", value: "Unavailable")
                 Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+        }
+    }
+
+    @ViewBuilder private func podDetails(_ resource: ResourceSummary) -> some View {
+        guard resource.kind == "Pod", let raw = resource.raw?.objectValue else { return }
+        let spec = raw["spec"]?.objectValue ?? [:]
+        let status = raw["status"]?.objectValue ?? [:]
+        Section("Pod") {
+            if let node = spec["nodeName"]?.stringValue { LabeledContent("Node", value: node) }
+            if let serviceAccount = spec["serviceAccountName"]?.stringValue { LabeledContent("Service account", value: serviceAccount) }
+            if let podIP = status["podIP"]?.stringValue { LabeledContent("Pod IP", value: podIP) }
+            if let hostIP = status["hostIP"]?.stringValue { LabeledContent("Host IP", value: hostIP) }
+            if let qos = status["qosClass"]?.stringValue { LabeledContent("QoS class", value: qos) }
+            if let policy = spec["restartPolicy"]?.stringValue { LabeledContent("Restart policy", value: policy) }
+        }
+        let statuses = status["containerStatuses"]?.arrayValue ?? []
+        let initStatuses = status["initContainerStatuses"]?.arrayValue ?? []
+        let containers = spec["containers"]?.arrayValue ?? []
+        if !containers.isEmpty || !initStatuses.isEmpty {
+            Section("Containers") {
+                ForEach(Array(containers.enumerated()), id: \.offset) { _, container in
+                    if let value = container.objectValue {
+                        let name = value["name"]?.stringValue ?? "Container"
+                        let runtime = statuses.first { $0.objectValue?["name"]?.stringValue == name }?.objectValue
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(name).fontWeight(.medium)
+                                Spacer()
+                                let ready = runtime?["ready"]?.boolValue
+                                if let ready {
+                                    Label(ready ? "Ready" : "Not ready", systemImage: ready ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(ready ? .green : .orange)
+                                }
+                            }
+                            Text(value["image"]?.stringValue ?? "—").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            if let restarts = runtime?["restartCount"]?.intValue { Text("Restarts: \(restarts)").font(.caption).foregroundStyle(.secondary) }
+                            if let state = containerState(runtime) { Text(state).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                        }
+                    }
+                }
+                if !initStatuses.isEmpty {
+                    Divider()
+                    Text("Init containers").font(.caption).foregroundStyle(.secondary)
+                    ForEach(Array(initStatuses.enumerated()), id: \.offset) { _, container in
+                        if let value = container.objectValue {
+                            LabeledContent(value["name"]?.stringValue ?? "Init container", value: containerState(value) ?? "Completed status unavailable")
+                        }
+                    }
+                }
+            }
+        }
+        let conditions = status["conditions"]?.arrayValue ?? []
+        if !conditions.isEmpty {
+            Section("Conditions") {
+                ForEach(Array(conditions.enumerated()), id: \.offset) { _, condition in
+                    if let value = condition.objectValue, let type = value["type"]?.stringValue {
+                        LabeledContent(type, value: value["status"]?.stringValue ?? "Unknown")
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func serviceDetails(_ resource: ResourceSummary) -> some View {
+        guard resource.kind == "Service", let raw = resource.raw?.objectValue else { return }
+        let spec = raw["spec"]?.objectValue ?? [:]
+        let status = raw["status"]?.objectValue ?? [:]
+        Section("Service") {
+            LabeledContent("Type", value: spec["type"]?.stringValue ?? "ClusterIP")
+            if let clusterIP = spec["clusterIP"]?.stringValue { LabeledContent("Cluster IP", value: clusterIP) }
+            let clusterIPs = spec["clusterIPs"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            if clusterIPs.count > 1 { LabeledContent("Cluster IPs", value: clusterIPs.joined(separator: ", ")) }
+            if let external = spec["externalName"]?.stringValue, !external.isEmpty { LabeledContent("External name", value: external) }
+            if let affinity = spec["sessionAffinity"]?.stringValue { LabeledContent("Session affinity", value: affinity) }
+            let selector = spec["selector"]?.objectValue ?? [:]
+            if !selector.isEmpty { LabeledContent("Selector", value: selector.keys.sorted().map { "\($0)=\(selector[$0]?.stringValue ?? "")" }.joined(separator: ", ")) }
+        }
+        let ports = spec["ports"]?.arrayValue ?? []
+        if !ports.isEmpty {
+            Section("Ports") {
+                ForEach(Array(ports.enumerated()), id: \.offset) { _, port in
+                    if let value = port.objectValue {
+                        let name = value["name"]?.stringValue
+                        let number = value["port"]?.intValue.map(String.init) ?? "—"
+                        let target = scalar(value["targetPort"]) ?? number
+                        let nodePort = value["nodePort"]?.intValue.map { " · node \($0)" } ?? ""
+                        LabeledContent(name ?? "Port \(number)", value: "\(value["protocol"]?.stringValue ?? "TCP") \(number) → \(target)\(nodePort)")
+                    }
+                }
+            }
+        }
+        let ingress = status["loadBalancer"]?.objectValue?["ingress"]?.arrayValue ?? []
+        let endpoints = ingress.compactMap { $0.objectValue?["ip"]?.stringValue ?? $0.objectValue?["hostname"]?.stringValue }
+        if !endpoints.isEmpty { Section("Load Balancer") { LabeledContent("Ingress", value: endpoints.joined(separator: ", ")).textSelection(.enabled) } }
+    }
+
+    @ViewBuilder private func nodeDetails(_ resource: ResourceSummary) -> some View {
+        guard resource.kind == "Node", let raw = resource.raw?.objectValue else { return }
+        let spec = raw["spec"]?.objectValue ?? [:]
+        let status = raw["status"]?.objectValue ?? [:]
+        Section("Scheduling") {
+            LabeledContent("Scheduling", value: spec["unschedulable"]?.boolValue == true ? "Cordoned" : "Schedulable")
+            if let podCIDR = spec["podCIDR"]?.stringValue, !podCIDR.isEmpty { LabeledContent("Pod CIDR", value: podCIDR) }
+            let taints = spec["taints"]?.arrayValue ?? []
+            if !taints.isEmpty { LabeledContent("Taints", value: taints.compactMap { taintSummary($0.objectValue) }.joined(separator: ", ")).textSelection(.enabled) }
+        }
+        let addresses = status["addresses"]?.arrayValue ?? []
+        if !addresses.isEmpty {
+            Section("Addresses") {
+                ForEach(Array(addresses.enumerated()), id: \.offset) { _, address in
+                    if let value = address.objectValue { LabeledContent(value["type"]?.stringValue ?? "Address", value: value["address"]?.stringValue ?? "—").textSelection(.enabled) }
+                }
+            }
+        }
+        let info = status["nodeInfo"]?.objectValue ?? [:]
+        if !info.isEmpty {
+            Section("System") {
+                if let version = info["kubeletVersion"]?.stringValue { LabeledContent("Kubelet", value: version) }
+                if let runtime = info["containerRuntimeVersion"]?.stringValue { LabeledContent("Container runtime", value: runtime) }
+                if let os = info["osImage"]?.stringValue { LabeledContent("OS image", value: os) }
+                if let kernel = info["kernelVersion"]?.stringValue { LabeledContent("Kernel", value: kernel) }
+                if let architecture = info["architecture"]?.stringValue { LabeledContent("Architecture", value: architecture) }
+            }
+        }
+        let conditions = status["conditions"]?.arrayValue ?? []
+        if !conditions.isEmpty {
+            Section("Conditions") {
+                ForEach(Array(conditions.enumerated()), id: \.offset) { _, condition in
+                    if let value = condition.objectValue, let type = value["type"]?.stringValue { LabeledContent(type, value: value["status"]?.stringValue ?? "Unknown") }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func configurationDetails(_ resource: ResourceSummary) -> some View {
+        guard ["ConfigMap", "Secret"].contains(resource.kind), let raw = resource.raw?.objectValue else { return }
+        let data = raw["data"]?.objectValue ?? [:]
+        let binaryData = raw["binaryData"]?.objectValue ?? [:]
+        if resource.kind == "ConfigMap" {
+            Section("ConfigMap Data") {
+                LabeledContent("Entries", value: "\(data.count + binaryData.count)")
+                if raw["immutable"]?.boolValue == true { LabeledContent("Immutable", value: "Yes") }
+                ForEach(Array(data.keys.sorted().prefix(100)), id: \.self) { key in
+                    LabeledContent(key, value: "\(data[key]?.stringValue?.count ?? 0) characters").textSelection(.enabled)
+                }
+                if data.count > 100 { Text("Showing the first 100 keys.").font(.caption).foregroundStyle(.secondary) }
+            }
+        } else {
+            Section("Secret") {
+                LabeledContent("Type", value: raw["type"]?.stringValue ?? "Opaque")
+                LabeledContent("Data keys", value: "\(data.count + binaryData.count)")
+                if raw["immutable"]?.boolValue == true { LabeledContent("Immutable", value: "Yes") }
+                // Never decode or display Secret values here. The key names and
+                // encoded lengths are useful operationally without widening
+                // accidental disclosure in the normal inspector overview.
+                ForEach(Array(data.keys.sorted().prefix(100)), id: \.self) { key in
+                    LabeledContent(key, value: "\(data[key]?.stringValue?.count ?? 0) encoded characters").textSelection(.enabled)
+                }
+                if data.count > 100 { Text("Showing the first 100 keys.").font(.caption).foregroundStyle(.secondary) }
             }
         }
     }
@@ -251,7 +406,7 @@ struct ResourceInspectorView: View {
     }
 
     @ViewBuilder private func rolloutDetails(_ resource: ResourceSummary) -> some View {
-        if ["Deployment", "StatefulSet", "DaemonSet"].contains(resource.kind),
+        if ["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController"].contains(resource.kind),
            let object = resource.raw?.objectValue,
            let status = object["status"]?.objectValue {
         let desired = object["spec"]?.objectValue?["replicas"]?.intValue
@@ -377,6 +532,37 @@ struct ResourceInspectorView: View {
     private func list(_ value: JSONValue?, fallback: String = "") -> String {
         let values = value?.arrayValue?.compactMap(\.stringValue) ?? []
         return values.isEmpty ? fallback : values.joined(separator: ", ")
+    }
+
+    private func scalar(_ value: JSONValue?) -> String? {
+        if let string = value?.stringValue { return string }
+        if let number = value?.intValue { return String(number) }
+        if let bool = value?.boolValue { return bool ? "true" : "false" }
+        return nil
+    }
+
+    private func containerState(_ container: [String: JSONValue]?) -> String? {
+        guard let state = container?["state"]?.objectValue else { return nil }
+        if let waiting = state["waiting"]?.objectValue {
+            let reason = waiting["reason"]?.stringValue ?? "Waiting"
+            let message = waiting["message"]?.stringValue
+            return message?.isEmpty == false ? "\(reason): \(message!)" : reason
+        }
+        if let terminated = state["terminated"]?.objectValue {
+            let reason = terminated["reason"]?.stringValue ?? "Terminated"
+            let code = terminated["exitCode"]?.intValue
+            return code.map { "\(reason) (exit \($0))" } ?? reason
+        }
+        if state["running"] != nil { return "Running" }
+        return nil
+    }
+
+    private func taintSummary(_ taint: [String: JSONValue]?) -> String? {
+        guard let taint else { return nil }
+        guard let key = taint["key"]?.stringValue else { return nil }
+        let value = taint["value"]?.stringValue
+        let effect = taint["effect"]?.stringValue ?? ""
+        return "\(key)\(value?.isEmpty == false ? "=\(value!)" : "")\(effect.isEmpty ? "" : ":\(effect)")"
     }
 
     private func ruleSummary(_ rule: [String: JSONValue]) -> String {
