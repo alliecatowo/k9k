@@ -30,8 +30,11 @@ final class ClusterStore {
     var isCheckingDeleteAccess = false
     var scaleAccess: AccessReview?
     var isCheckingScaleAccess = false
+    var restartAccess: AccessReview?
+    var isCheckingRestartAccess = false
     private var deleteAccessGeneration = 0
     private var scaleAccessGeneration = 0
+    private var restartAccessGeneration = 0
 
     private let client = CoreClient()
 
@@ -115,6 +118,7 @@ final class ClusterStore {
         selectedResources.removeAll()
         deleteAccess = nil
         scaleAccess = nil
+        restartAccess = nil
     }
 
     func deleteSelected() async {
@@ -142,6 +146,12 @@ final class ClusterStore {
     }
 
     var isSelectedResourceScalable: Bool { selectedScalableResource != nil }
+
+    var canRestartSelected: Bool {
+        !isReadOnly && selectedRestartableResource != nil && restartAccess?.allowed == true
+    }
+
+    var isSelectedResourceRestartable: Bool { selectedRestartableResource != nil }
 
     var selectedReplicaCount: Int {
         selectedScalableResource?.raw?.objectValue?["spec"]?.objectValue?["replicas"]?.intValue ?? 1
@@ -231,6 +241,56 @@ final class ClusterStore {
         }
     }
 
+    func updateRestartAccess() async {
+        restartAccessGeneration &+= 1
+        let generation = restartAccessGeneration
+        guard let type = selectedResourceType, let resource = selectedRestartableResource else {
+            restartAccess = nil
+            isCheckingRestartAccess = false
+            return
+        }
+        isCheckingRestartAccess = true
+        defer {
+            if generation == restartAccessGeneration { isCheckingRestartAccess = false }
+        }
+        do {
+            let review = try decode(
+                (try await client.request("rbac.check", parameters: operationParameters(type: type, resource: resource, additional: ["verb": .string("patch")]))).result,
+                as: AccessReview.self
+            )
+            if generation == restartAccessGeneration { restartAccess = review }
+        } catch {
+            if generation == restartAccessGeneration {
+                restartAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify restart permission: \(error.localizedDescription)", evaluationError: nil)
+            }
+        }
+    }
+
+    func restartSelected() async {
+        guard !isReadOnly, let type = selectedResourceType, let resource = selectedRestartableResource else { return }
+        await updateRestartAccess()
+        guard canRestartSelected else {
+            errorMessage = restartAccess?.reason ?? "The active Kubernetes identity is not authorized to restart this workload."
+            return
+        }
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let patch: JSONValue = .object([
+            "spec": .object([
+                "template": .object([
+                    "metadata": .object([
+                        "annotations": .object(["kubectl.kubernetes.io/restartedAt": .string(timestamp)])
+                    ])
+                ])
+            ])
+        ])
+        do {
+            _ = try await client.request("resource.patch", parameters: operationParameters(type: type, resource: resource, additional: ["patch": patch]))
+            await loadResources()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     func copySelectedName() {
         guard let resource = resources.first(where: { selectedResources.contains($0.id) }) else { return }
         NSPasteboard.general.clearContents()
@@ -299,6 +359,14 @@ final class ClusterStore {
     private var selectedScalableResource: ResourceSummary? {
         guard let type = selectedResourceType,
               ["deployments", "statefulsets", "replicasets", "replicationcontrollers"].contains(type.resource),
+              selectedResources.count == 1,
+              let id = selectedResources.first else { return nil }
+        return resource(for: id)
+    }
+
+    private var selectedRestartableResource: ResourceSummary? {
+        guard let type = selectedResourceType,
+              ["deployments", "statefulsets", "daemonsets"].contains(type.resource),
               selectedResources.count == 1,
               let id = selectedResources.first else { return nil }
         return resource(for: id)

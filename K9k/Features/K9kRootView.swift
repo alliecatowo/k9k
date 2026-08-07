@@ -8,6 +8,7 @@ struct K9kRootView: View {
     @State private var logsPresented = false
     @State private var portForwardPresented = false
     @State private var scalePresented = false
+    @State private var restartConfirmation = false
 
     var body: some View {
         @Bindable var store = store
@@ -32,11 +33,15 @@ struct K9kRootView: View {
                 await store.loadEvents(for: store.resource(for: selection.first))
                 await store.updateDeleteAccess()
                 await store.updateScaleAccess()
+                await store.updateRestartAccess()
             }
         }
         .confirmationDialog("Delete selected resources?", isPresented: $destructiveConfirmation, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { Task { await store.deleteSelected() } }
         } message: { Text("This changes resources in \(store.selectedContext?.name ?? "the active context").") }
+        .confirmationDialog("Restart selected workload?", isPresented: $restartConfirmation, titleVisibility: .visible) {
+            Button("Restart", role: .destructive) { Task { await store.restartSelected() } }
+        } message: { Text("K9k updates the Pod template restart timestamp, which rolls this workload's Pods.") }
         .sheet(isPresented: $paletteIsPresented) { CommandPaletteView(isPresented: $paletteIsPresented) }
         .sheet(isPresented: $logsPresented) {
             if let resource = store.resource(for: store.selectedResources.first) { LogStreamView(resource: resource) }
@@ -82,6 +87,10 @@ struct K9kRootView: View {
                 if store.isSelectedResourceScalable {
                     Button("Scale…") { scalePresented = true }
                         .disabled(!store.canScaleSelected)
+                }
+                if store.isSelectedResourceRestartable {
+                    Button("Restart…", role: .destructive) { restartConfirmation = true }
+                        .disabled(!store.canRestartSelected)
                 }
                 Divider()
                 Toggle("Read-only Mode", isOn: Binding(get: { store.isReadOnly }, set: { store.isReadOnly = $0 }))
