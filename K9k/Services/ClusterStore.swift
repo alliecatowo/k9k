@@ -53,6 +53,7 @@ final class ClusterStore {
     private var terminalOutputSink: ((Data) -> Void)?
     private var terminalColumns = 120
     private var terminalRows = 36
+    private var watchReconnectAttempts = 0
 
     private let client = CoreClient()
 
@@ -154,6 +155,7 @@ final class ClusterStore {
             params["selector"] = .string(labelSelector)
             params["streamID"] = .string(streamID)
             resources = try decodeArray((try await client.request("resource.list", parameters: .object(params))).result, as: ResourceSummary.self)
+            watchReconnectAttempts = 0
             activeStreamID = streamID
             _ = try? await client.request("resource.watch", parameters: .object(params))
         } catch { errorMessage = error.localizedDescription }
@@ -712,6 +714,21 @@ final class ClusterStore {
         if event.streamID == activePortForwardStreamID, event.type == "portforward.closed" {
             activePortForward = nil
             activePortForwardStreamID = nil
+            return
+        }
+        if event.streamID == activeStreamID, event.type == "resource.watch.closed" {
+            activeStreamID = nil
+            guard watchReconnectAttempts < 3 else {
+                errorMessage = "K9k stopped reconnecting the resource watch after repeated failures. Use Refresh to retry."
+                return
+            }
+            watchReconnectAttempts += 1
+            let delay = UInt64(watchReconnectAttempts * watchReconnectAttempts) * 500_000_000
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: delay)
+                guard let self, self.activeStreamID == nil else { return }
+                await self.loadResources()
+            }
             return
         }
         guard event.streamID == activeStreamID, let result = event.result else { return }
