@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -56,6 +57,60 @@ type ClusterEvent struct {
 	FirstSeen time.Time `json:"firstSeen"`
 	LastSeen  time.Time `json:"lastSeen"`
 	Source    string    `json:"source,omitempty"`
+}
+
+// MetricsQuery selects one metrics.k8s.io/v1beta1 collection. Resource is
+// deliberately constrained to Kubernetes' two metrics resources: pods and
+// nodes. An empty Name returns the collection; a non-empty Name returns the
+// matching object when it exists.
+type MetricsQuery struct {
+	Version   string `json:"version"`
+	Resource  string `json:"resource"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name,omitempty"`
+}
+
+// ContainerMetrics retains each container's reported resource quantities.
+// Quantities stay as canonical Kubernetes strings (for example "12m" and
+// "128Mi") so the GUI does not lose precision by converting them to floats.
+type ContainerMetrics struct {
+	Name  string            `json:"name"`
+	Usage map[string]string `json:"usage"`
+}
+
+// ResourceMetrics is the normalized shape used for both pod and node metrics.
+// Pods expose a total Usage plus the individual Containers that contributed to
+// it; node metrics have an empty Containers collection. Timestamp and Window
+// describe the sampling interval supplied by Metrics Server.
+type ResourceMetrics struct {
+	APIVersion string             `json:"apiVersion"`
+	Resource   string             `json:"resource"`
+	Namespace  string             `json:"namespace,omitempty"`
+	Name       string             `json:"name"`
+	Timestamp  time.Time          `json:"timestamp"`
+	Window     string             `json:"window"`
+	Usage      map[string]string  `json:"usage"`
+	Containers []ContainerMetrics `json:"containers"`
+}
+
+// MetricsUnavailableError distinguishes an uninstalled or unavailable
+// metrics.k8s.io API from ordinary API failures such as authorization errors.
+// The protocol maps it to a stable, non-fatal metrics_unavailable code so the
+// GUI can continue displaying resources without fabricating utilization data.
+type MetricsUnavailableError struct{ Err error }
+
+func (e *MetricsUnavailableError) Error() string {
+	if e == nil || e.Err == nil {
+		return "Kubernetes metrics API is unavailable"
+	}
+	return fmt.Sprintf("Kubernetes metrics API is unavailable: %v", e.Err)
+}
+
+func (e *MetricsUnavailableError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 // AccessCheck identifies one Kubernetes resource API action to evaluate for

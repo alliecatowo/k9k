@@ -36,6 +36,7 @@ type ClusterClient interface {
 	Patch(context.Context, schema.GroupVersionResource, string, string, bool, []byte) (*unstructured.Unstructured, error)
 	PodLogs(context.Context, string, string, string, bool, bool, bool, int64) (io.ReadCloser, error)
 	Events(context.Context, string, string) ([]ClusterEvent, error)
+	Metrics(context.Context, MetricsQuery) ([]ResourceMetrics, error)
 	CheckAccess(context.Context, AccessCheck) (AccessReview, error)
 	PortForward(context.Context, PortForwardRequest, func(PortForwardBinding)) error
 }
@@ -248,6 +249,24 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(eventsErr)
 		}
 		return result, nil
+	case "metrics.list":
+		params, err := decodeMetricsQuery(request.Params)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		result, metricsErr := s.cluster.Metrics(ctx, params)
+		if metricsErr != nil {
+			var unavailable *MetricsUnavailableError
+			if errors.As(metricsErr, &unavailable) {
+				return nil, &operationError{code: "metrics_unavailable", err: metricsErr}
+			}
+			return nil, kubeError(metricsErr)
+		}
+		return map[string]any{
+			"apiVersion": "metrics.k8s.io/" + params.Version,
+			"resource":   params.Resource,
+			"items":      result,
+		}, nil
 	case "rbac.check":
 		params, err := decodeAccessCheckParams(request.Params)
 		if err != nil {
@@ -733,6 +752,42 @@ func (p *patchParams) validate() error {
 type scaleParams struct {
 	resourceParams
 	Replicas int32 `json:"replicas"`
+}
+
+type metricsParams struct {
+	Version   string `json:"version"`
+	Resource  string `json:"resource"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
+func decodeMetricsQuery(raw json.RawMessage) (MetricsQuery, error) {
+	var params metricsParams
+	if err := decodeParams(raw, &params); err != nil {
+		return MetricsQuery{}, err
+	}
+	params.Version = strings.TrimSpace(params.Version)
+	if params.Version == "" {
+		params.Version = "v1beta1"
+	}
+	if params.Version != "v1beta1" {
+		return MetricsQuery{}, fmt.Errorf("unsupported metrics version %q (supported: v1beta1)", params.Version)
+	}
+	params.Resource = strings.TrimSpace(strings.ToLower(params.Resource))
+	switch params.Resource {
+	case "pods":
+		// Namespace is optional: empty intentionally means all namespaces.
+	case "nodes":
+		if strings.TrimSpace(params.Namespace) != "" {
+			return MetricsQuery{}, errors.New("namespace is not valid for node metrics")
+		}
+	default:
+		return MetricsQuery{}, errors.New("resource must be pods or nodes")
+	}
+	return MetricsQuery{
+		Version: params.Version, Resource: params.Resource,
+		Namespace: strings.TrimSpace(params.Namespace), Name: strings.TrimSpace(params.Name),
+	}, nil
 }
 
 type accessCheckParams struct {

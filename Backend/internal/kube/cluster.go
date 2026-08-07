@@ -13,7 +13,7 @@ import (
 	"github.com/k9k-app/k9k/backend/internal/api"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -26,6 +26,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
+	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
+	metricsclient "k8s.io/metrics/pkg/client/clientset/versioned/typed/metrics/v1beta1"
 )
 
 // Cluster centralizes client-go semantics; Swift never parses kubeconfig or speaks to the API server.
@@ -38,6 +40,7 @@ type Cluster struct {
 	dynamic   dynamic.Interface
 	typed     kubernetes.Interface
 	discovery discovery.DiscoveryInterface
+	metrics   metricsclient.MetricsV1beta1Interface
 }
 
 func New() (*Cluster, error) {
@@ -68,7 +71,11 @@ func (c *Cluster) reload(selected string) error {
 	if err != nil {
 		return err
 	}
-	c.rest, c.dynamic, c.typed, c.discovery = restConfig, dyn, typed, disc
+	metricClient, err := metricsclient.NewForConfig(restConfig)
+	if err != nil {
+		return err
+	}
+	c.rest, c.dynamic, c.typed, c.discovery, c.metrics = restConfig, dyn, typed, disc, metricClient
 	return nil
 }
 
@@ -325,6 +332,99 @@ func (c *Cluster) Events(ctx context.Context, namespace, involvedUID string) ([]
 	return items, nil
 }
 
+// Metrics reads the standard metrics.k8s.io/v1beta1 API through client-go.
+// Metrics Server is optional in Kubernetes installations, so an absent API is
+// identified explicitly for the GUI rather than being mistaken for zero usage.
+func (c *Cluster) Metrics(ctx context.Context, query api.MetricsQuery) ([]api.ResourceMetrics, error) {
+	c.mu.RLock()
+	client := c.metrics
+	c.mu.RUnlock()
+	if client == nil {
+		return nil, fmt.Errorf("no usable Kubernetes context is selected")
+	}
+
+	switch query.Resource {
+	case "pods":
+		if query.Name != "" {
+			item, err := client.PodMetricses(query.Namespace).Get(ctx, query.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, normalizeMetricsError(err)
+			}
+			return []api.ResourceMetrics{summarizePodMetrics(item)}, nil
+		}
+		list, err := client.PodMetricses(query.Namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, normalizeMetricsError(err)
+		}
+		result := make([]api.ResourceMetrics, 0, len(list.Items))
+		for i := range list.Items {
+			result = append(result, summarizePodMetrics(&list.Items[i]))
+		}
+		return result, nil
+	case "nodes":
+		if query.Name != "" {
+			item, err := client.NodeMetricses().Get(ctx, query.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, normalizeMetricsError(err)
+			}
+			return []api.ResourceMetrics{summarizeNodeMetrics(item)}, nil
+		}
+		list, err := client.NodeMetricses().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, normalizeMetricsError(err)
+		}
+		result := make([]api.ResourceMetrics, 0, len(list.Items))
+		for i := range list.Items {
+			result = append(result, summarizeNodeMetrics(&list.Items[i]))
+		}
+		return result, nil
+	default:
+		return nil, fmt.Errorf("unsupported metrics resource %q", query.Resource)
+	}
+}
+
+func normalizeMetricsError(err error) error {
+	if apierrors.IsNotFound(err) || apierrors.IsServiceUnavailable(err) || apierrors.IsMethodNotSupported(err) {
+		return &api.MetricsUnavailableError{Err: err}
+	}
+	return err
+}
+
+func summarizePodMetrics(item *metricsv1beta1.PodMetrics) api.ResourceMetrics {
+	containers := make([]api.ContainerMetrics, 0, len(item.Containers))
+	total := corev1.ResourceList{}
+	for _, container := range item.Containers {
+		containers = append(containers, api.ContainerMetrics{Name: container.Name, Usage: usageStrings(container.Usage)})
+		for resource, quantity := range container.Usage {
+			if prior, exists := total[resource]; exists {
+				prior.Add(quantity)
+				total[resource] = prior
+			} else {
+				total[resource] = quantity.DeepCopy()
+			}
+		}
+	}
+	return api.ResourceMetrics{
+		APIVersion: "metrics.k8s.io/v1beta1", Resource: "pods", Namespace: item.Namespace, Name: item.Name,
+		Timestamp: item.Timestamp.Time, Window: item.Window.Duration.String(), Usage: usageStrings(total), Containers: containers,
+	}
+}
+
+func summarizeNodeMetrics(item *metricsv1beta1.NodeMetrics) api.ResourceMetrics {
+	return api.ResourceMetrics{
+		APIVersion: "metrics.k8s.io/v1beta1", Resource: "nodes", Name: item.Name,
+		Timestamp: item.Timestamp.Time, Window: item.Window.Duration.String(), Usage: usageStrings(item.Usage), Containers: []api.ContainerMetrics{},
+	}
+}
+
+func usageStrings(usage corev1.ResourceList) map[string]string {
+	result := make(map[string]string, len(usage))
+	for resource, quantity := range usage {
+		result[string(resource)] = quantity.String()
+	}
+	return result
+}
+
 // CheckAccess asks the selected API server whether the active kubeconfig
 // identity may perform one resource action. This is a read-only authorization
 // review; it never impersonates or evaluates an arbitrary subject.
@@ -358,7 +458,7 @@ func (c *Cluster) CheckAccess(ctx context.Context, check api.AccessCheck) (api.A
 		EvaluationError: review.Status.EvaluationError,
 	}, nil
 }
-func IsNotFound(err error) bool { return errors.IsNotFound(err) }
+func IsNotFound(err error) bool { return apierrors.IsNotFound(err) }
 
 func Summarize(item *unstructured.Unstructured) api.ResourceSummary {
 	status, _, _ := unstructured.NestedString(item.Object, "status", "phase")

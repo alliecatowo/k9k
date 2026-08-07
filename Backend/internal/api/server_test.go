@@ -36,15 +36,18 @@ type fakeCluster struct {
 	contextsErr, selectErr, namespacesErr, discoveryErr error
 	listErr, getErr, watchErr, deleteErr, patchErr      error
 	accessErr, portForwardErr                           error
+	metricsErr                                          error
 
-	selected []string
-	lists    []resourceCall
-	gets     []resourceCall
-	watches  []resourceCall
-	deletes  []resourceCall
-	patches  []patchCall
-	accesses []AccessCheck
-	forwards []PortForwardRequest
+	selected    []string
+	lists       []resourceCall
+	gets        []resourceCall
+	watches     []resourceCall
+	deletes     []resourceCall
+	patches     []patchCall
+	accesses    []AccessCheck
+	forwards    []PortForwardRequest
+	metrics     []MetricsQuery
+	metricItems []ResourceMetrics
 }
 
 type resourceCall struct {
@@ -138,6 +141,16 @@ func (f *fakeCluster) PodLogs(context.Context, string, string, string, bool, boo
 
 func (f *fakeCluster) Events(context.Context, string, string) ([]ClusterEvent, error) {
 	return nil, nil
+}
+
+func (f *fakeCluster) Metrics(_ context.Context, query MetricsQuery) ([]ResourceMetrics, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.metrics = append(f.metrics, query)
+	if f.metricsErr != nil {
+		return nil, f.metricsErr
+	}
+	return append([]ResourceMetrics(nil), f.metricItems...), nil
 }
 
 func (f *fakeCluster) CheckAccess(_ context.Context, check AccessCheck) (AccessReview, error) {
@@ -488,6 +501,67 @@ func TestServerRBACCheckPropagatesKubernetesErrors(t *testing.T) {
 	response := envelopeByID(t, runRequests(t, client, request("check", "rbac.check", map[string]any{"verb": "get", "resource": "pods"})), "check")
 	if response.Error == nil || response.Error.Code != "kubernetes_error" {
 		t.Errorf("error = %#v", response.Error)
+	}
+}
+
+func TestServerMetricsListUsesVersionedPodAndNodeQueries(t *testing.T) {
+	client := &fakeCluster{metricItems: []ResourceMetrics{{
+		APIVersion: "metrics.k8s.io/v1beta1", Resource: "pods", Namespace: "demo", Name: "api",
+		Usage: map[string]string{"cpu": "12m", "memory": "128Mi"}, Containers: []ContainerMetrics{{Name: "app", Usage: map[string]string{"cpu": "12m"}}},
+	}}}
+	responses := runRequests(t, client,
+		request("pods", "metrics.list", map[string]any{"resource": "pods", "namespace": "demo", "name": "api"}),
+		request("nodes", "metrics.list", map[string]any{"version": "v1beta1", "resource": "nodes", "name": "worker"}),
+	)
+	for _, id := range []string{"pods", "nodes"} {
+		response := envelopeByID(t, responses, id)
+		if response.Error != nil {
+			t.Fatalf("%s error = %#v", id, response.Error)
+		}
+		result := mustObject(t, response.Result)
+		if result["apiVersion"] != "metrics.k8s.io/v1beta1" {
+			t.Errorf("%s apiVersion = %#v", id, result["apiVersion"])
+		}
+		if got := decodeResult[[]ResourceMetrics](t, result["items"]); len(got) != 1 || got[0].Usage["cpu"] != "12m" {
+			t.Errorf("%s items = %#v", id, got)
+		}
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	want := []MetricsQuery{
+		{Version: "v1beta1", Resource: "pods", Namespace: "demo", Name: "api"},
+		{Version: "v1beta1", Resource: "nodes", Name: "worker"},
+	}
+	if len(client.metrics) != len(want) {
+		t.Fatalf("metrics calls = %#v", client.metrics)
+	}
+	for i := range want {
+		if client.metrics[i] != want[i] {
+			t.Errorf("metrics call %d = %#v, want %#v", i, client.metrics[i], want[i])
+		}
+	}
+}
+
+func TestServerMetricsDistinguishesUnavailableFromInvalidAndKubernetesErrors(t *testing.T) {
+	unavailable := &MetricsUnavailableError{Err: os.ErrNotExist}
+	responses := runRequests(t, &fakeCluster{metricsErr: unavailable},
+		request("unavailable", "metrics.list", map[string]any{"resource": "pods"}),
+		request("bad-resource", "metrics.list", map[string]any{"resource": "deployments"}),
+		request("bad-version", "metrics.list", map[string]any{"resource": "nodes", "version": "v1"}),
+		request("node-namespace", "metrics.list", map[string]any{"resource": "nodes", "namespace": "default"}),
+	)
+	if got := envelopeByID(t, responses, "unavailable").Error; got == nil || got.Code != "metrics_unavailable" {
+		t.Errorf("unavailable = %#v", got)
+	}
+	for _, id := range []string{"bad-resource", "bad-version", "node-namespace"} {
+		if got := envelopeByID(t, responses, id).Error; got == nil || got.Code != "invalid_params" {
+			t.Errorf("%s = %#v", id, got)
+		}
+	}
+
+	response := envelopeByID(t, runRequests(t, &fakeCluster{metricsErr: os.ErrPermission}, request("forbidden", "metrics.list", map[string]any{"resource": "pods"})), "forbidden")
+	if response.Error == nil || response.Error.Code != "kubernetes_error" {
+		t.Errorf("ordinary metrics error = %#v", response.Error)
 	}
 }
 
