@@ -13,12 +13,27 @@ struct K9sPluginRunnerView: View {
     @State private var exitDescription: String?
     @State private var process: Process?
 
+    /// K9s accepts either a complete shell command or a command plus `args`.
+    /// Keep the command as authored (it may intentionally use shell syntax),
+    /// but quote each separate argument before passing the resulting string to
+    /// zsh. This gives placeholders in args the same behaviour as placeholders
+    /// in command without letting a resource name change shell syntax.
     private var command: String {
-        plugin.command
+        ([expanded(plugin.command)] + plugin.args.map { shellQuote(expanded($0)) })
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    private func expanded(_ value: String) -> String {
+        value
             .replacing("$NAME", with: resource.name)
             .replacing("$NAMESPACE", with: resource.namespace ?? "")
             .replacing("$RESOURCE_NAME", with: resource.name)
             .replacing("$RESOURCE", with: resource.kind.lowercased())
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacing("'", with: "'\\\"'\\\"'") + "'"
     }
 
     var body: some View {
