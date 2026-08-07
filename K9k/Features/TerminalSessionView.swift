@@ -12,6 +12,7 @@ struct TerminalSessionView: View {
     let initialMode: PodTerminalMode
     @State private var isStarting = false
     @State private var selectedContainer = ""
+    @AppStorage("terminal.preferredShell") private var preferredShell = "/bin/sh"
 
     private var containers: [String] {
         let spec = resource.raw?.objectValue?["spec"]?.objectValue
@@ -48,7 +49,9 @@ struct TerminalSessionView: View {
 
             Divider()
             HStack(spacing: 10) {
-                Text("ANSI/VT terminal · copy/paste and keyboard input are sent directly to the selected Pod")
+                Text(initialMode == .attach
+                    ? "ANSI/VT terminal · attaches directly to the selected container process"
+                    : "ANSI/VT terminal · copy/paste and keyboard input are sent directly to the selected Pod")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -57,10 +60,25 @@ struct TerminalSessionView: View {
                         ForEach(containers, id: \.self) { Text($0).tag($0) }
                     }.frame(maxWidth: 180)
                 }
+                if initialMode == .shell && store.activeExecStreamID == nil {
+                    TextField("Shell program", text: $preferredShell)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 180)
+                        .accessibilityLabel("Shell program to execute in the Pod")
+                    Menu {
+                        Button("POSIX sh (/bin/sh)") { preferredShell = "/bin/sh" }
+                        Button("Bash (/bin/bash)") { preferredShell = "/bin/bash" }
+                        Button("Almquist shell (/bin/ash)") { preferredShell = "/bin/ash" }
+                        Button("Shell from PATH (sh)") { preferredShell = "sh" }
+                    } label: {
+                        Label("Shell Presets", systemImage: "chevron.down.circle")
+                    }
+                    .accessibilityLabel("Choose a common shell program")
+                }
                 if store.activeExecStreamID == nil {
                     Button(initialMode == .attach ? "Attach to Process" : "Start Shell") { startTerminal() }
                         .keyboardShortcut(.defaultAction)
-                        .disabled(isStarting)
+                        .disabled(isStarting || (initialMode == .shell && shellProgram == nil))
                 } else {
                     Button("Interrupt") { Task { await store.sendExecInput(Data([3])) } }
                     Button("Disconnect", role: .destructive) { Task { await store.closeExec() } }
@@ -82,10 +100,17 @@ struct TerminalSessionView: View {
         Task {
             if initialMode == .attach {
                 await store.openAttach(for: resource, container: selectedContainer)
-            } else {
-                await store.openExec(for: resource, command: ["/bin/sh"], container: selectedContainer)
+            } else if let shellProgram {
+                // Kubernetes receives an argv vector. Deliberately accept one
+                // executable here instead of parsing shell syntax locally.
+                await store.openExec(for: resource, command: [shellProgram], container: selectedContainer)
             }
             isStarting = false
         }
+    }
+
+    private var shellProgram: String? {
+        let program = preferredShell.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !program.isEmpty && !program.contains(where: { $0.isWhitespace }) ? program : nil
     }
 }
