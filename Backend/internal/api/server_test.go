@@ -36,6 +36,7 @@ type fakeCluster struct {
 	watcher    *contextWatch
 
 	contextsErr, selectErr, namespacesErr, discoveryErr error
+	updateContextErr                                    error
 	listErr, getErr, watchErr, deleteErr, patchErr      error
 	accessErr, portForwardErr                           error
 	metricsErr                                          error
@@ -44,6 +45,7 @@ type fakeCluster struct {
 	manifestErr, applyManifestErr                       error
 
 	selected       []string
+	contextUpdates []Context
 	lists          []resourceCall
 	gets           []resourceCall
 	watches        []resourceCall
@@ -84,6 +86,13 @@ func (f *fakeCluster) SelectContext(name string) error {
 	defer f.mu.Unlock()
 	f.selected = append(f.selected, name)
 	return f.selectErr
+}
+
+func (f *fakeCluster) UpdateContextNamespace(name, namespace string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.contextUpdates = append(f.contextUpdates, Context{Name: name, Namespace: namespace})
+	return f.updateContextErr
 }
 
 func (f *fakeCluster) Namespaces(context.Context) ([]string, error) {
@@ -610,6 +619,25 @@ func TestServerDrainRequiresExplicitSafetyFlagsAndConfirmation(t *testing.T) {
 	defer client.mu.Unlock()
 	if len(client.drains) != 1 || client.drains[0].Node != "worker" || !client.drains[0].DeleteEmptyDirData {
 		t.Errorf("drains = %#v", client.drains)
+	}
+}
+
+func TestServerContextUpdateRequiresConfirmation(t *testing.T) {
+	client := &fakeCluster{}
+	responses := runRequests(t, client,
+		request("unconfirmed", "context.update", map[string]any{"name": "stage", "namespace": "platform"}),
+		request("confirmed", "context.update", map[string]any{"name": "stage", "namespace": "platform", "confirm": true}),
+	)
+	if got := envelopeByID(t, responses, "unconfirmed").Error; got == nil || got.Code != "confirmation_required" {
+		t.Errorf("unconfirmed context update = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "confirmed").Error; got != nil {
+		t.Errorf("confirmed context update = %#v", got)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.contextUpdates) != 1 || client.contextUpdates[0].Name != "stage" || client.contextUpdates[0].Namespace != "platform" {
+		t.Errorf("context updates = %#v", client.contextUpdates)
 	}
 }
 

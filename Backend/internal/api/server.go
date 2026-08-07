@@ -38,6 +38,7 @@ const (
 type ClusterClient interface {
 	Contexts() ([]Context, error)
 	SelectContext(name string) error
+	UpdateContextNamespace(name, namespace string) error
 	Namespaces(context.Context) ([]string, error)
 	Discovery(context.Context) ([]ResourceType, error)
 	List(context.Context, schema.GroupVersionResource, string, bool, string) ([]ResourceSummary, error)
@@ -405,6 +406,27 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(err)
 		}
 		return map[string]any{"selected": params.Name}, nil
+	case "context.update":
+		var params struct {
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+			Confirm   bool   `json:"confirm"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		params.Name = strings.TrimSpace(params.Name)
+		params.Namespace = strings.TrimSpace(params.Namespace)
+		if params.Name == "" {
+			return nil, invalidParams(errors.New("context name is required"))
+		}
+		if !params.Confirm {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("kubeconfig context update requires confirm: true")}
+		}
+		if err := s.cluster.UpdateContextNamespace(params.Name, params.Namespace); err != nil {
+			return nil, kubeError(err)
+		}
+		return map[string]any{"name": params.Name, "namespace": params.Namespace, "updated": true}, nil
 	case "namespace.list":
 		result, err := s.cluster.Namespaces(ctx)
 		if err != nil {

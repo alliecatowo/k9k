@@ -149,17 +149,34 @@ struct SettingsView: View {
     @Environment(ClusterStore.self) private var store
     @State private var editorFile = "aliases"
     @State private var editorPresented = false
+    @State private var defaultNamespace = ""
+    @State private var namespaceConfirmation = false
     var body: some View {
         @Bindable var store = store
         Form {
             Toggle("Read-only Mode", isOn: $store.isReadOnly)
             LabeledContent("Kubeconfig") { Text(ProcessInfo.processInfo.environment["KUBECONFIG"] ?? "~/.kube/config") }
+            Section("Active kubectl context") {
+                if let context = store.selectedContext {
+                    LabeledContent("Context", value: context.name)
+                    LabeledContent("Cluster", value: context.cluster)
+                    Picker("Default namespace", selection: $defaultNamespace) {
+                        Text("Kubernetes default").tag("")
+                        ForEach(store.namespaces.filter { $0 != "All Namespaces" }, id: \.self) { Text($0).tag($0) }
+                    }
+                    Button("Save Default Namespace…") { namespaceConfirmation = true }
+                        .disabled(defaultNamespace == (context.namespace ?? ""))
+                    Text("This writes only the selected context's default namespace to kubeconfig. Cluster endpoints and credentials are never displayed or modified.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
             Section("Kubernetes Contexts") {
                 ForEach(store.contexts) { context in
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(context.name).fontWeight(context.active ? .semibold : .regular)
-                            Text("Cluster: \(context.cluster) · User: \(context.user)").font(.caption).foregroundStyle(.secondary)
+                            Text("Cluster: \(context.cluster) · User: \(context.user)\(context.namespace?.isEmpty == false ? " · Namespace: \(context.namespace!)" : "")").font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
                         if context.active { Text("Active").font(.caption).foregroundStyle(.green) }
@@ -190,5 +207,11 @@ struct SettingsView: View {
         .padding()
         .frame(width: 520)
         .sheet(isPresented: $editorPresented) { K9sConfigEditorView(name: editorFile) }
+        .task(id: store.selectedContext?.id) { defaultNamespace = store.selectedContext?.namespace ?? "" }
+        .confirmationDialog("Save default namespace?", isPresented: $namespaceConfirmation, titleVisibility: .visible) {
+            Button("Save to Kubeconfig") { Task { _ = await store.updateActiveContextNamespace(defaultNamespace) } }
+        } message: {
+            Text("K9k will update the default namespace for \(store.selectedContext?.name ?? "the active context") in your kubeconfig.")
+        }
     }
 }

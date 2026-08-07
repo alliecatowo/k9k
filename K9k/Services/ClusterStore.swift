@@ -93,7 +93,7 @@ final class ClusterStore {
         do {
             _ = try await client.request("context.select", parameters: .object(["name": .string(context.name)]))
             selectedContext = context
-            contexts = contexts.map { KubeContext(name: $0.name, cluster: $0.cluster, user: $0.user, active: $0.id == context.id) }
+            contexts = contexts.map { KubeContext(name: $0.name, cluster: $0.cluster, user: $0.user, namespace: $0.namespace, active: $0.id == context.id) }
             selectedNamespace = "All Namespaces"
             await loadNamespaces()
             await refreshDiscovery()
@@ -107,6 +107,23 @@ final class ClusterStore {
             ensureDefaultResourceSelection()
         }
         catch { errorMessage = error.localizedDescription }
+    }
+
+    func updateActiveContextNamespace(_ namespace: String) async -> Bool {
+        guard let context = selectedContext else { return false }
+        do {
+            _ = try await client.request("context.update", parameters: .object([
+                "name": .string(context.name), "namespace": .string(namespace), "confirm": .bool(true)
+            ]))
+            contexts = contexts.map {
+                KubeContext(name: $0.name, cluster: $0.cluster, user: $0.user, namespace: $0.id == context.id ? namespace : $0.namespace, active: $0.active)
+            }
+            selectedContext = contexts.first(where: { $0.id == context.id })
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
     }
 
     func loadNamespaces() async {

@@ -4,6 +4,7 @@ struct KubeContext: Codable, Identifiable, Hashable {
     let name: String
     let cluster: String
     let user: String
+    let namespace: String?
     let active: Bool
     var id: String { name }
 }

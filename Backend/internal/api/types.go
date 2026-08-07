@@ -16,10 +16,11 @@ import (
 var ErrManifestIdentityMismatch = errors.New("manifest identity no longer matches the selected resource")
 
 type Context struct {
-	Name    string `json:"name"`
-	Cluster string `json:"cluster"`
-	User    string `json:"user"`
-	Active  bool   `json:"active"`
+	Name      string `json:"name"`
+	Cluster   string `json:"cluster"`
+	User      string `json:"user"`
+	Namespace string `json:"namespace,omitempty"`
+	Active    bool   `json:"active"`
 }
 
 type ResourceType struct {

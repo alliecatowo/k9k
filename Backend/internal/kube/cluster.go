@@ -97,7 +97,7 @@ func (c *Cluster) Contexts() ([]api.Context, error) {
 	}
 	result := make([]api.Context, 0, len(raw.Contexts))
 	for name, value := range raw.Contexts {
-		result = append(result, api.Context{Name: name, Cluster: value.Cluster, User: value.AuthInfo, Active: name == active})
+		result = append(result, api.Context{Name: name, Cluster: value.Cluster, User: value.AuthInfo, Namespace: value.Namespace, Active: name == active})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result, nil
@@ -107,6 +107,39 @@ func (c *Cluster) SelectContext(name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.reload(name)
+}
+
+// UpdateContextNamespace modifies the persisted default namespace of one
+// kubeconfig context through client-go's writer. It deliberately leaves the
+// cluster and AuthInfo references untouched, so a graphical setting cannot
+// expose or replace credentials. clientcmd.ModifyConfig handles a normal
+// single-file config and KUBECONFIG loading rules atomically enough for its
+// established client-go semantics.
+func (c *Cluster) UpdateContextNamespace(name, namespace string) error {
+	c.mu.RLock()
+	config := c.config
+	rules := c.rules
+	active := c.context
+	c.mu.RUnlock()
+	raw, err := config.RawConfig()
+	if err != nil {
+		return err
+	}
+	contextValue, exists := raw.Contexts[name]
+	if !exists {
+		return fmt.Errorf("kubeconfig context %q does not exist", name)
+	}
+	contextValue.Namespace = namespace
+	raw.Contexts[name] = contextValue
+	if err := clientcmd.ModifyConfig(rules, raw, true); err != nil {
+		return err
+	}
+	if name == active {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.reload(active)
+	}
+	return nil
 }
 func (c *Cluster) Namespaces(ctx context.Context) ([]string, error) {
 	c.mu.RLock()
