@@ -79,6 +79,10 @@ final class ClusterStore {
     private var terminalColumns = 120
     private var terminalRows = 36
     private var watchReconnectAttempts = 0
+    // Resource switches can overlap while a cluster is under load. Every list
+    // and watch start carries this generation so a late Pod response can never
+    // replace the table after the user has already selected Deployments.
+    private var resourceLoadGeneration = 0
 
     private let client = CoreClient()
 
@@ -251,13 +255,19 @@ final class ClusterStore {
 
     func loadResources() async {
         guard let type = selectedResourceType else { return }
+        resourceLoadGeneration &+= 1
+        let generation = resourceLoadGeneration
         if selectorResourceTypeID != type.id {
             labelSelector = ""
             fieldSelector = ""
         }
-        if let activeStreamID { await client.cancel(streamID: activeStreamID) }
+        let previousStreamID = activeStreamID
+        activeStreamID = nil
+        if let previousStreamID { await client.cancel(streamID: previousStreamID) }
         isLoading = true
-        defer { isLoading = false }
+        defer {
+            if generation == resourceLoadGeneration { isLoading = false }
+        }
         do {
             let streamID = UUID().uuidString
             let namespace = selectedNamespace == "All Namespaces" ? "" : selectedNamespace
@@ -266,7 +276,9 @@ final class ClusterStore {
             params["selector"] = .string(labelSelector)
             params["fieldSelector"] = .string(fieldSelector)
             params["streamID"] = .string(streamID)
-            resources = try decodeArray((try await client.request("resource.list", parameters: .object(params))).result, as: ResourceSummary.self)
+            let list = try decodeArray((try await client.request("resource.list", parameters: .object(params))).result, as: ResourceSummary.self)
+            guard generation == resourceLoadGeneration, selectedResourceType?.id == type.id else { return }
+            resources = list
             watchReconnectAttempts = 0
             activeStreamID = streamID
             _ = try? await client.request("resource.watch", parameters: .object(params))
