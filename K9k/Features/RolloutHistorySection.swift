@@ -59,9 +59,12 @@ struct RolloutHistorySection: View {
             } else if let errorMessage {
                 LabeledContent("History", value: "Unavailable")
                 Text(errorMessage).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                Button("Try Again") { Task { await load() } }
+            } else {
+                Button("Load Revision History") { Task { await load() } }
+                    .accessibilityHint("Checks access, then loads bounded Kubernetes revision metadata")
             }
         }
-        .task(id: "\(resource.id)|\(resource.resourceVersion ?? \"")") { await load() }
         .onDisappear { client.stop() }
         .sheet(item: $selectedRevision) { revision in
             if let history {

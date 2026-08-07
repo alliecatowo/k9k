@@ -25,6 +25,8 @@ final class CoreClient {
 
     private var process: Process?
     private var input: FileHandle?
+    private var output: FileHandle?
+    private var diagnostics: FileHandle?
     private var buffer = Data()
     private var continuations: [String: CheckedContinuation<CoreEnvelope, Error>] = [:]
     var onEvent: ((CoreEnvelope) -> Void)?
@@ -52,6 +54,14 @@ final class CoreClient {
             guard let newProcess else { return }
             Task { @MainActor in self?.receive(data, from: newProcess) }
         }
+        // The helper keeps stderr out of the protocol by design, but client-go
+        // and auth providers may still write diagnostics there. Always drain
+        // it so a noisy child can never block on a full pipe and appear to
+        // hang the native app. User-facing failures remain structured stdout
+        // protocol errors, never arbitrary stderr text.
+        stderr.fileHandleForReading.readabilityHandler = { handle in
+            _ = handle.availableData
+        }
         newProcess.terminationHandler = { [weak self, weak newProcess] _ in
             guard let newProcess else { return }
             Task { @MainActor in
@@ -61,6 +71,8 @@ final class CoreClient {
         try newProcess.run()
         process = newProcess
         input = stdin.fileHandleForWriting
+        output = stdout.fileHandleForReading
+        diagnostics = stderr.fileHandleForReading
     }
 
     func stop() {
@@ -155,6 +167,12 @@ final class CoreClient {
     private func resetTransport() {
         input?.closeFile()
         input = nil
+        output?.readabilityHandler = nil
+        output?.closeFile()
+        output = nil
+        diagnostics?.readabilityHandler = nil
+        diagnostics?.closeFile()
+        diagnostics = nil
         process = nil
         buffer.removeAll(keepingCapacity: false)
     }

@@ -5,6 +5,8 @@ struct CommandPaletteView: View {
     @Binding var isPresented: Bool
     @State private var query = ""
     @State private var helpIsPresented = false
+    @State private var highlightedItemID: Item.ID?
+    @FocusState private var queryIsFocused: Bool
 
     private enum Destination: Hashable {
         case resource(ResourceType)
@@ -52,6 +54,9 @@ struct CommandPaletteView: View {
             TextField("Go to a resource or action", text: $query)
                 .textFieldStyle(.roundedBorder)
                 .font(.title3)
+                .focused($queryIsFocused)
+                .accessibilityLabel("Command Palette Search")
+                .accessibilityHint("Type to filter resources and commands. Use Up and Down Arrow to select a result, then Return to open it.")
             ScrollView {
                 LazyVStack(spacing: 2) {
                     ForEach(matches) { item in
@@ -69,16 +74,71 @@ struct CommandPaletteView: View {
                             .padding(.vertical, 8)
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("Open \(item.title)")
+                        .background {
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(highlightedItemID == item.id ? Color.accentColor.opacity(0.18) : .clear)
+                        }
+                        .accessibilityLabel(item.title)
+                        .accessibilityValue(item.detail)
+                        .accessibilityHint("Press Return to open")
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Command Palette Results")
             }
             .frame(height: 280)
+            HStack(spacing: 10) {
+                Text("↑↓ Select")
+                Text("↩ Open")
+                Text("Esc Close")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityHidden(true)
         }
         .padding()
         .frame(width: 520)
         .sheet(isPresented: $helpIsPresented) { NavigationHelpView(isPresented: $helpIsPresented) }
+        .onAppear {
+            queryIsFocused = true
+            selectFirstResult()
+        }
+        .onChange(of: query) { _, _ in selectFirstResult() }
+        .onChange(of: matches.map(\.id)) { _, ids in
+            if highlightedItemID == nil || !ids.contains(highlightedItemID ?? "") { highlightedItemID = ids.first }
+        }
+        .onKeyPress(.downArrow) {
+            moveHighlight(by: 1)
+            return .handled
+        }
+        .onKeyPress(.upArrow) {
+            moveHighlight(by: -1)
+            return .handled
+        }
+        .onKeyPress(.return) {
+            if let item = matches.first(where: { $0.id == highlightedItemID }) { choose(item) }
+            return .handled
+        }
+        .onKeyPress(.escape) {
+            isPresented = false
+            return .handled
+        }
+    }
+
+    private func selectFirstResult() {
+        highlightedItemID = matches.first?.id
+    }
+
+    private func moveHighlight(by offset: Int) {
+        let items = matches
+        guard !items.isEmpty else { return }
+        guard let current = highlightedItemID, let currentIndex = items.firstIndex(where: { $0.id == current }) else {
+            highlightedItemID = items.first?.id
+            return
+        }
+        let nextIndex = (currentIndex + offset + items.count) % items.count
+        highlightedItemID = items[nextIndex].id
     }
 
     private func choose(_ item: Item) {

@@ -59,9 +59,12 @@ struct HelmReleaseHistorySection: View {
             } else if let errorMessage {
                 LabeledContent("History", value: "Unavailable")
                 Text(errorMessage).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                Button("Try Again") { Task { await load() } }
+            } else {
+                Button("Load Helm History") { Task { await load() } }
+                    .accessibilityHint("Loads bounded Helm storage metadata for this release")
             }
         }
-        .task(id: "\(namespace)/\(release)") { await load() }
         .onDisappear { client.stop() }
         .sheet(item: $selectedRevision) { revision in
             HelmReleaseInspectionView(

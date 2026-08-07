@@ -6,8 +6,10 @@ struct ResourceInspectorView: View {
     let resource: ResourceSummary?
     let type: ResourceType?
     let events: [ClusterEvent]
+    let isPresented: Bool
     @State private var section: InspectorSection = .overview
     @State private var isLoadingEvents = false
+    @State private var areOverviewDetailsReady = false
 
     /// The raw-object viewer can be revisited many times while a watch is
     /// updating the resource list. Keep the expensive JSON serialization out
@@ -70,6 +72,20 @@ struct ResourceInspectorView: View {
                 await store.loadEvents(for: resource)
             }
         }
+        .task(id: "inspector-overview-\(resource?.id ?? "none")-\(isPresented)") {
+            guard isPresented, resource != nil else {
+                setOverviewDetailsReady(false)
+                return
+            }
+
+            setOverviewDetailsReady(false)
+            // The system owns this trailing inspector transition. Keep its
+            // first layout pass compact, then build the potentially large
+            // Kubernetes detail tree once the reveal has settled.
+            try? await Task.sleep(for: .milliseconds(260))
+            guard !Task.isCancelled, isPresented else { return }
+            setOverviewDetailsReady(true)
+        }
     }
 
     private func inspectorHeader(_ resource: ResourceSummary) -> some View {
@@ -126,43 +142,66 @@ struct ResourceInspectorView: View {
 
     @ViewBuilder private func overview(_ resource: ResourceSummary) -> some View {
         Form {
-            Section("Resource") {
-                LabeledContent("Kind", value: resource.kind)
-                LabeledContent("Name", value: resource.name)
-                LabeledContent("Namespace", value: resource.namespace ?? "Cluster-scoped")
-                LabeledContent("Status", value: resource.status)
-                LabeledContent("Age", value: resource.age)
-            }
-            schemaFreeDetails(resource, type: type)
-            if let access = store.deleteAccess {
-                Section("Access") {
-                    LabeledContent("Delete", value: access.allowed ? "Allowed" : "Not allowed")
-                    if let reason = access.reason, !reason.isEmpty {
-                        Text(reason).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            resourceSummary(resource)
+            if areOverviewDetailsReady {
+                schemaFreeDetails(resource, type: type)
+                if let access = store.deleteAccess {
+                    Section("Access") {
+                        LabeledContent("Delete", value: access.allowed ? "Allowed" : "Not allowed")
+                        if let reason = access.reason, !reason.isEmpty {
+                            Text(reason).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                        }
                     }
+                } else if store.isCheckingDeleteAccess {
+                    Section("Access") { LabeledContent("Delete") { ProgressView().controlSize(.small) } }
                 }
-            } else if store.isCheckingDeleteAccess {
-                Section("Access") { LabeledContent("Delete") { ProgressView().controlSize(.small) } }
-            }
-            metrics(resource)
-            podDetails(resource)
-            serviceDetails(resource)
-            nodeDetails(resource)
-            configurationDetails(resource)
-            rolloutDetails(resource)
-            if let type, ["deployments", "statefulsets", "daemonsets", "replicasets"].contains(type.resource), resource.namespace?.isEmpty == false {
-                RolloutHistorySection(resource: resource, type: type)
-            }
-            rbacDetails(resource)
-            if resource.labels?["owner"] == "helm", let release = helmReleaseName(resource), let namespace = resource.namespace, !namespace.isEmpty {
-                HelmReleaseHistorySection(release: release, namespace: namespace)
-            }
-            if let labels = resource.labels, !labels.isEmpty {
-                Section("Labels") { ForEach(labels.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in LabeledContent(key, value: value).textSelection(.enabled) } }
+                metrics(resource)
+                podDetails(resource)
+                serviceDetails(resource)
+                nodeDetails(resource)
+                configurationDetails(resource)
+                rolloutDetails(resource)
+                if let type, ["deployments", "statefulsets", "daemonsets", "replicasets"].contains(type.resource), resource.namespace?.isEmpty == false {
+                    RolloutHistorySection(resource: resource, type: type)
+                }
+                rbacDetails(resource)
+                if resource.labels?["owner"] == "helm", let release = helmReleaseName(resource), let namespace = resource.namespace, !namespace.isEmpty {
+                    HelmReleaseHistorySection(release: release, namespace: namespace)
+                }
+                if let labels = resource.labels, !labels.isEmpty {
+                    Section("Labels") { ForEach(labels.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in LabeledContent(key, value: value).textSelection(.enabled) } }
+                }
+            } else {
+                Section("Details") {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Preparing resource details…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityLabel("Preparing resource details")
+                }
             }
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
+    }
+
+    @ViewBuilder private func resourceSummary(_ resource: ResourceSummary) -> some View {
+        Section("Resource") {
+            LabeledContent("Kind", value: resource.kind)
+            LabeledContent("Name", value: resource.name)
+            LabeledContent("Namespace", value: resource.namespace ?? "Cluster-scoped")
+            LabeledContent("Status", value: resource.status)
+            LabeledContent("Age", value: resource.age)
+        }
+    }
+
+    private func setOverviewDetailsReady(_ value: Bool) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            areOverviewDetailsReady = value
+        }
     }
 
     @ViewBuilder private func metrics(_ resource: ResourceSummary) -> some View {

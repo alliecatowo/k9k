@@ -41,7 +41,16 @@ struct K9kRootView: View {
         .onChange(of: store.selectedResourceType) { _, newValue in if newValue != nil { Task { await store.loadResources() } } }
         .onChange(of: store.selectedNamespace) { _, _ in Task { await store.loadResources() } }
         .onChange(of: store.selectedResources) { _, selection in
+            let deferForInspectorPresentation = inspectorIsPresented
             Task {
+                // A selected object may need a full resource.get decode before
+                // its detailed inspector data can be shown. Let the native
+                // inspector finish its reveal first, then hydrate only if the
+                // selection is still current.
+                if deferForInspectorPresentation {
+                    try? await Task.sleep(for: .milliseconds(300))
+                    guard !Task.isCancelled, store.selectedResources == selection else { return }
+                }
                 await store.loadSelectedResourceSummary(for: selection.first)
             }
         }
@@ -103,7 +112,12 @@ struct K9kRootView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .inspector(isPresented: $inspectorIsPresented) {
-            ResourceInspectorView(resource: store.resource(for: store.selectedResources.first), type: store.selectedResourceType, events: store.events)
+            ResourceInspectorView(
+                resource: store.resource(for: store.selectedResources.first),
+                type: store.selectedResourceType,
+                events: store.events,
+                isPresented: inspectorIsPresented
+            )
                 // Inspector Forms include operationally important RBAC reasons,
                 // metrics diagnostics, and resource identities. A narrow
                 // column forces those values into unreadable fragments.
