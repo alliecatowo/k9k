@@ -41,6 +41,7 @@ type fakeCluster struct {
 	accessErr, portForwardErr                           error
 	metricsErr                                          error
 	drainErr                                            error
+	debugErr                                            error
 	execErr                                             error
 	manifestErr, applyManifestErr                       error
 
@@ -56,6 +57,7 @@ type fakeCluster struct {
 	metrics        []MetricsQuery
 	metricItems    []ResourceMetrics
 	drains         []NodeDrainRequest
+	debugs         []PodDebugRequest
 	execs          []PodExecRequest
 	execFn         func(context.Context, PodExecRequest, PodExecStreams) error
 	manifests      []resourceCall
@@ -203,6 +205,16 @@ func (f *fakeCluster) DrainNode(_ context.Context, request NodeDrainRequest) (No
 		return NodeDrainResult{}, f.drainErr
 	}
 	return NodeDrainResult{Node: request.Node, Evicted: []NodeDrainPod{}, Skipped: []NodeDrainPod{}, Blocked: []NodeDrainPod{}, Failures: []NodeDrainPod{}}, nil
+}
+
+func (f *fakeCluster) DebugPod(_ context.Context, request PodDebugRequest) (PodDebugResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.debugs = append(f.debugs, request)
+	if f.debugErr != nil {
+		return PodDebugResult{}, f.debugErr
+	}
+	return PodDebugResult{Namespace: request.Namespace, Pod: request.Pod, Container: "k9k-debug-test", Image: request.Image}, nil
 }
 
 func (f *fakeCluster) CheckAccess(_ context.Context, check AccessCheck) (AccessReview, error) {
@@ -638,6 +650,25 @@ func TestServerContextUpdateRequiresConfirmation(t *testing.T) {
 	defer client.mu.Unlock()
 	if len(client.contextUpdates) != 1 || client.contextUpdates[0].Name != "stage" || client.contextUpdates[0].Namespace != "platform" {
 		t.Errorf("context updates = %#v", client.contextUpdates)
+	}
+}
+
+func TestServerDebugRequiresConfirmationAndDefaultsShell(t *testing.T) {
+	client := &fakeCluster{}
+	responses := runRequests(t, client,
+		request("unconfirmed", "pod.debug", map[string]any{"namespace": "demo", "pod": "api", "image": "busybox:1.36"}),
+		request("debug", "pod.debug", map[string]any{"namespace": "demo", "pod": "api", "targetContainer": "app", "image": "busybox:1.36", "confirm": true}),
+	)
+	if got := envelopeByID(t, responses, "unconfirmed").Error; got == nil || got.Code != "confirmation_required" {
+		t.Errorf("unconfirmed debug = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "debug").Error; got != nil {
+		t.Errorf("debug response = %#v", got)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.debugs) != 1 || client.debugs[0].TargetContainer != "app" || len(client.debugs[0].Command) != 1 || client.debugs[0].Command[0] != "/bin/sh" {
+		t.Errorf("debugs = %#v", client.debugs)
 	}
 }
 

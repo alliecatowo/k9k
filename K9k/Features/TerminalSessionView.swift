@@ -14,7 +14,10 @@ struct TerminalSessionView: View {
     @State private var selectedContainer = ""
 
     private var containers: [String] {
-        resource.raw?.objectValue?["spec"]?.objectValue?["containers"]?.arrayValue?.compactMap { $0.objectValue?["name"]?.stringValue } ?? []
+        let spec = resource.raw?.objectValue?["spec"]?.objectValue
+        let regular = spec?["containers"]?.arrayValue?.compactMap { $0.objectValue?["name"]?.stringValue } ?? []
+        let ephemeral = spec?["ephemeralContainers"]?.arrayValue?.compactMap { $0.objectValue?["name"]?.stringValue } ?? []
+        return regular + ephemeral
     }
 
     var body: some View {

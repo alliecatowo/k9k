@@ -114,6 +114,13 @@ struct NodeDrainPod: Codable, Hashable, Identifiable {
     var id: String { "\(namespace)/\(name)/\(reason)" }
 }
 
+struct PodDebugResult: Codable, Hashable {
+    let namespace: String
+    let pod: String
+    let container: String
+    let image: String
+}
+
 struct RelationshipGraph: Codable, Hashable {
     let rootID: String
     let nodes: [RelationshipNode]

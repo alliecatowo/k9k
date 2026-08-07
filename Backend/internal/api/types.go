@@ -205,6 +205,24 @@ type NodeDrainPod struct {
 	Reason    string `json:"reason"`
 }
 
+// PodDebugRequest creates one ephemeral debugging container in an existing
+// Pod. It intentionally contains no privileged/host settings; Kubernetes
+// admission and the Pod's security policy remain authoritative.
+type PodDebugRequest struct {
+	Namespace       string   `json:"namespace"`
+	Pod             string   `json:"pod"`
+	TargetContainer string   `json:"targetContainer,omitempty"`
+	Image           string   `json:"image"`
+	Command         []string `json:"command"`
+}
+
+type PodDebugResult struct {
+	Namespace string `json:"namespace"`
+	Pod       string `json:"pod"`
+	Container string `json:"container"`
+	Image     string `json:"image"`
+}
+
 // PortForwardRequest describes one pod port-forward owned by the helper. The
 // local address is always loopback-only; K9k deliberately never turns a pod
 // port into a network-reachable listener without an explicit Kubernetes

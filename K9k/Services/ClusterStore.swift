@@ -31,6 +31,8 @@ final class ClusterStore {
     var activeExecStreamID: String?
     var execAccess: AccessReview?
     var attachAccess: AccessReview?
+    var debugAccess: AccessReview?
+    var debugResult: PodDebugResult?
     var isCheckingExecAccess = false
     var manifestAccess: AccessReview?
     var isCheckingManifestAccess = false
@@ -258,6 +260,8 @@ final class ClusterStore {
     var canOpenAttach: Bool {
         !isReadOnly && selectedPodResource != nil && attachAccess?.allowed == true
     }
+
+    var canDebugSelectedPod: Bool { !isReadOnly && selectedPodResource != nil && debugAccess?.allowed == true }
 
     var isSelectedResourcePod: Bool { selectedPodResource != nil }
 
@@ -497,6 +501,20 @@ final class ClusterStore {
         }
     }
 
+    func updateDebugAccess() async {
+        guard let type = selectedResourceType, let resource = selectedPodResource else { debugAccess = nil; return }
+        do {
+            debugAccess = try decode(
+                (try await client.request("rbac.check", parameters: operationParameters(type: type, resource: resource, additional: [
+                    "verb": .string("update"), "subresource": .string("ephemeralcontainers")
+                ]))).result,
+                as: AccessReview.self
+            )
+        } catch {
+            debugAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify ephemeral-container permission: \(error.localizedDescription)", evaluationError: nil)
+        }
+    }
+
     func openExec(for resource: ResourceSummary, command: [String], container: String? = nil) async {
         guard resource.kind == "Pod", let namespace = resource.namespace else { return }
         await updateExecAccess()
@@ -545,6 +563,22 @@ final class ClusterStore {
         catch { activeExecStreamID = nil; errorMessage = error.localizedDescription }
     }
 
+    func createDebugContainer(for resource: ResourceSummary, image: String, targetContainer: String) async {
+        guard resource.kind == "Pod", let namespace = resource.namespace else { return }
+        await updateDebugAccess()
+        guard canDebugSelectedPod else { errorMessage = debugAccess?.reason ?? "The active Kubernetes identity is not authorized to add an ephemeral container."; return }
+        do {
+            debugResult = try decode(
+                (try await client.request("pod.debug", parameters: .object([
+                    "namespace": .string(namespace), "pod": .string(resource.name), "targetContainer": .string(targetContainer),
+                    "image": .string(image), "confirm": .bool(true)
+                ]))).result,
+                as: PodDebugResult.self
+            )
+            await loadResources()
+        } catch { errorMessage = error.localizedDescription }
+    }
+
     func sendExecInput(_ input: String) async {
         await sendExecInput(Data(input.utf8))
     }
@@ -572,11 +606,7 @@ final class ClusterStore {
                 "columns": .number(Double(columns)),
                 "rows": .number(Double(rows))
             ]))
-        } catch {
-            // A resize can race normal session teardown. Surface all other
-            // errors but do not fabricate a live terminal after it closes.
-            if activeExecStreamID != nil { errorMessage = error.localizedDescription }
-        }
+        } catch { errorMessage = error.localizedDescription }
     }
 
     func setTerminalOutputSink(_ sink: @escaping (Data) -> Void) {

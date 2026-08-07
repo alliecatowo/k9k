@@ -15,6 +15,7 @@ struct K9kRootView: View {
     @State private var relationshipsPresented = false
     @State private var nodeCordonConfirmation = false
     @State private var nodeDrainPresented = false
+    @State private var debugPresented = false
 
     var body: some View {
         @Bindable var store = store
@@ -43,6 +44,7 @@ struct K9kRootView: View {
                 await store.updateRestartAccess()
                 await store.updateExecAccess()
                 await store.updateAttachAccess()
+                await store.updateDebugAccess()
                 await store.updateManifestAccess()
                 await store.updateNodePatchAccess()
                 await store.updateNodeDrainAccess()
@@ -80,6 +82,9 @@ struct K9kRootView: View {
         }
         .sheet(isPresented: $nodeDrainPresented) {
             if let node = store.selectedNodeResource { NodeDrainView(node: node, isPresented: $nodeDrainPresented) }
+        }
+        .sheet(isPresented: $debugPresented) {
+            if let resource = store.resource(for: store.selectedResources.first) { DebugContainerView(resource: resource, isPresented: $debugPresented) }
         }
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
@@ -122,6 +127,8 @@ struct K9kRootView: View {
                         .disabled(!store.canOpenExec)
                     Button("Attach…") { terminalMode = .attach; terminalPresented = true }
                         .disabled(!store.canOpenAttach)
+                    Button("Debug Container…") { debugPresented = true }
+                        .disabled(!store.canDebugSelectedPod)
                 }
                 if store.isSelectedResourceScalable {
                     Button("Scale…") { scalePresented = true }

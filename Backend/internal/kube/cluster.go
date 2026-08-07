@@ -562,6 +562,38 @@ func (c *Cluster) DrainNode(ctx context.Context, request api.NodeDrainRequest) (
 	return result, nil
 }
 
+// DebugPod appends a minimally-scoped ephemeral container through the typed
+// Kubernetes subresource. This is not a local Docker shell and it never
+// alters the Pod template; admission, image policy, and RBAC apply normally.
+func (c *Cluster) DebugPod(ctx context.Context, request api.PodDebugRequest) (api.PodDebugResult, error) {
+	c.mu.RLock()
+	typed := c.typed
+	c.mu.RUnlock()
+	if typed == nil {
+		return api.PodDebugResult{}, fmt.Errorf("no usable Kubernetes context is selected")
+	}
+	pod, err := typed.CoreV1().Pods(request.Namespace).Get(ctx, request.Pod, metav1.GetOptions{})
+	if err != nil {
+		return api.PodDebugResult{}, err
+	}
+	name := fmt.Sprintf("k9k-debug-%d", time.Now().UnixNano())
+	if len(name) > 63 {
+		name = name[:63]
+	}
+	container := corev1.EphemeralContainer{
+		EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+			Name: name, Image: request.Image, Command: append([]string(nil), request.Command...),
+			Stdin: true, TTY: true, ImagePullPolicy: corev1.PullIfNotPresent,
+		},
+		TargetContainerName: request.TargetContainer,
+	}
+	pod.Spec.EphemeralContainers = append(pod.Spec.EphemeralContainers, container)
+	if _, err := typed.CoreV1().Pods(request.Namespace).UpdateEphemeralContainers(ctx, request.Pod, pod, metav1.UpdateOptions{}); err != nil {
+		return api.PodDebugResult{}, err
+	}
+	return api.PodDebugResult{Namespace: request.Namespace, Pod: request.Pod, Container: name, Image: request.Image}, nil
+}
+
 func isDaemonSetPod(pod *corev1.Pod) bool {
 	for _, owner := range pod.OwnerReferences {
 		if owner.Kind == "DaemonSet" {

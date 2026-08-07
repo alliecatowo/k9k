@@ -52,6 +52,7 @@ type ClusterClient interface {
 	Events(context.Context, string, string) ([]ClusterEvent, error)
 	Metrics(context.Context, MetricsQuery) ([]ResourceMetrics, error)
 	DrainNode(context.Context, NodeDrainRequest) (NodeDrainResult, error)
+	DebugPod(context.Context, PodDebugRequest) (PodDebugResult, error)
 	CheckAccess(context.Context, AccessCheck) (AccessReview, error)
 	PortForward(context.Context, PortForwardRequest, func(PortForwardBinding)) error
 	PodExec(context.Context, PodExecRequest, PodExecStreams) error
@@ -566,6 +567,32 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 		result, drainErr := s.cluster.DrainNode(ctx, params.NodeDrainRequest)
 		if drainErr != nil {
 			return nil, kubeError(drainErr)
+		}
+		return result, nil
+	case "pod.debug":
+		var params struct {
+			PodDebugRequest
+			Confirm bool `json:"confirm"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		params.Namespace, params.Pod, params.Image = strings.TrimSpace(params.Namespace), strings.TrimSpace(params.Pod), strings.TrimSpace(params.Image)
+		if params.Namespace == "" || params.Pod == "" || params.Image == "" {
+			return nil, invalidParams(errors.New("namespace, pod, and image are required"))
+		}
+		if strings.ContainsAny(params.Image, " \t\r\n") {
+			return nil, invalidParams(errors.New("image must not contain whitespace"))
+		}
+		if len(params.Command) == 0 {
+			params.Command = []string{"/bin/sh"}
+		}
+		if !params.Confirm {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("ephemeral debug container requires confirm: true")}
+		}
+		result, debugErr := s.cluster.DebugPod(ctx, params.PodDebugRequest)
+		if debugErr != nil {
+			return nil, kubeError(debugErr)
 		}
 		return result, nil
 	case "rbac.check":
