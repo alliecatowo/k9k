@@ -237,9 +237,38 @@ struct ResourceInspectorView: View {
 
     @ViewBuilder private func metadata(_ resource: ResourceSummary) -> some View {
         Form {
-            LabeledContent("UID", value: resource.uid).textSelection(.enabled)
-            LabeledContent("API Version", value: resource.apiVersion)
-            LabeledContent("Created", value: resource.createdAt.formatted(date: .abbreviated, time: .shortened))
+            Section("Identity") {
+                LabeledContent("Kind", value: resource.kind)
+                LabeledContent("Name", value: resource.name).textSelection(.enabled)
+                LabeledContent("Namespace", value: resource.namespace ?? "Cluster-scoped")
+                LabeledContent("UID", value: resource.uid).textSelection(.enabled)
+                LabeledContent("API Version", value: resource.apiVersion)
+            }
+            Section("Lifecycle") {
+                LabeledContent("Created", value: resource.createdAt.formatted(date: .abbreviated, time: .shortened))
+                LabeledContent("Age", value: resource.age)
+            }
+            if let metadata = resource.raw?.objectValue?["metadata"]?.objectValue {
+                let annotations = metadata["annotations"]?.objectValue ?? [:]
+                if !annotations.isEmpty {
+                    Section("Annotations") {
+                        ForEach(annotations.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in
+                            LabeledContent(key, value: value.stringValue ?? "—").textSelection(.enabled)
+                        }
+                    }
+                }
+                let owners = metadata["ownerReferences"]?.arrayValue ?? []
+                if !owners.isEmpty {
+                    Section("Owners") {
+                        ForEach(Array(owners.enumerated()), id: \.offset) { _, owner in
+                            if let value = owner.objectValue {
+                                LabeledContent(value["kind"]?.stringValue ?? "Owner", value: value["name"]?.stringValue ?? "—")
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
     }
