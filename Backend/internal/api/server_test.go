@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -326,6 +328,34 @@ func TestServerContextAndReadOperations(t *testing.T) {
 	}
 	if len(client.gets) != 1 || client.gets[0].gvr != (schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}) || client.gets[0].name != "api" {
 		t.Errorf("get call = %#v", client.gets)
+	}
+}
+
+func TestServerConfigSummaryAcceptsMissingAndPartialK9sConfiguration(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "aliases.yaml"), []byte("aliases:\n  po: v1/pods\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "views.yaml"), []byte("views:\n  v1/pods:\n    sortColumn: NAME:asc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := runRequests(t, &fakeCluster{}, request("config", "config.summary", map[string]any{"directory": directory}))
+	response := envelopeByID(t, responses, "config")
+	if response.Error != nil {
+		t.Fatalf("config.summary error = %#v", response.Error)
+	}
+	result := mustObject(t, response.Result)
+	if result["directory"] != directory {
+		t.Errorf("directory = %#v, want %q", result["directory"], directory)
+	}
+	aliases := decodeResult[[]map[string]any](t, result["aliases"])
+	if len(aliases) != 1 || aliases[0]["name"] != "po" || aliases[0]["target"] != "v1/pods" {
+		t.Errorf("aliases = %#v", aliases)
+	}
+	files := decodeResult[map[string]map[string]any](t, result["files"])
+	if files["aliases"]["present"] != true || files["hotkeys"]["present"] != false || files["plugins"]["present"] != false {
+		t.Errorf("file statuses = %#v", files)
 	}
 }
 

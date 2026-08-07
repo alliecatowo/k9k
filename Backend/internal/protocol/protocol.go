@@ -28,11 +28,12 @@ type Error struct {
 	Details any    `json:"details,omitempty"`
 }
 
-func Response(id string, result any) Envelope { return Envelope{Version: Version, ID: id, Type: "response", Result: result} }
+func Response(id string, result any) Envelope {
+	return Envelope{Version: Version, ID: id, Type: "response", Result: result}
+}
 func Event(streamID, name string, result any) Envelope {
 	return Envelope{Version: Version, StreamID: streamID, Type: name, Result: result}
 }
 func Failure(id, code string, err error) Envelope {
 	return Envelope{Version: Version, ID: id, Type: "response", Error: &Error{Code: code, Message: err.Error()}}
 }
-

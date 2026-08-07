@@ -5,35 +5,35 @@ import "strings"
 // Alias is one K9s aliases.yaml entry. Target is K9s' GVR-or-alias string,
 // for example "apps/v1/deployments" or another configured alias.
 type Alias struct {
-	Name   string
-	Target string
+	Name   string `json:"name"`
+	Target string `json:"target"`
 }
 
 // Hotkey is one K9s hotKeys entry. Shortcut corresponds to K9s' shortCut
 // YAML spelling; the Go name is normalized for callers.
 type Hotkey struct {
-	Name        string
-	Shortcut    string
-	Override    bool
-	Description string
-	Command     string
-	KeepHistory bool
+	Name        string `json:"name"`
+	Shortcut    string `json:"shortcut"`
+	Override    bool   `json:"override"`
+	Description string `json:"description"`
+	Command     string `json:"command"`
+	KeepHistory bool   `json:"keepHistory"`
 }
 
 // Plugin is the native representation of a K9s plugin declaration. Confirm
 // remains a pointer because K9s distinguishes an omitted confirm value from
 // an explicit false value.
 type Plugin struct {
-	Name        string
-	Scopes      []string
-	Shortcut    string
-	Override    bool
-	Description string
-	Command     string
-	Args        []string
-	Background  bool
-	Confirm     *bool
-	Dangerous   bool
+	Name        string   `json:"name"`
+	Scopes      []string `json:"scopes"`
+	Shortcut    string   `json:"shortcut"`
+	Override    bool     `json:"override"`
+	Description string   `json:"description"`
+	Command     string   `json:"command"`
+	Args        []string `json:"args"`
+	Background  bool     `json:"background"`
+	Confirm     *bool    `json:"confirm,omitempty"`
+	Dangerous   bool     `json:"dangerous"`
 }
 
 // ShouldConfirm mirrors K9s' behaviour for the supported plugin subset. K9s
@@ -63,9 +63,9 @@ func (p Plugin) AppliesTo(aliases ...string) bool {
 // View is one K9s custom-view entry, keyed by its GVR (optionally followed by
 // @namespace or @namespace-regexp). Columns retain their declared order.
 type View struct {
-	Key        string
-	Columns    []string
-	SortColumn string
+	Key        string   `json:"key"`
+	Columns    []string `json:"columns"`
+	SortColumn string   `json:"sortColumn"`
 }
 
 // HasColumns reports whether the view overrides visible columns.

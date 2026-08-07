@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/k9k-app/k9k/backend/internal/config"
 	"github.com/k9k-app/k9k/backend/internal/protocol"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -158,6 +159,20 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 	switch request.Operation {
 	case "health", "health.ping", "ping":
 		return map[string]any{"status": "ok", "protocolVersion": protocol.Version}, nil
+	case "config.summary":
+		var params struct {
+			Directory string `json:"directory"`
+		}
+		if len(request.Params) != 0 && string(request.Params) != "null" {
+			if err := json.Unmarshal(request.Params, &params); err != nil {
+				return nil, invalidParams(fmt.Errorf("decode params: %w", err))
+			}
+		}
+		result, err := config.LoadSummary(params.Directory)
+		if err != nil {
+			return nil, &operationError{code: "config_error", err: err}
+		}
+		return result, nil
 	case "context.list":
 		result, err := s.cluster.Contexts()
 		if err != nil {
