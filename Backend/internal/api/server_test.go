@@ -360,6 +360,45 @@ func runRequests(t *testing.T, client *fakeCluster, requests ...protocol.Request
 	return decodeEnvelopes(t, output.String())
 }
 
+func TestServerReadOnlyPolicyRejectsProtectedOperationsBeforeKubernetes(t *testing.T) {
+	client := &fakeCluster{list: []ResourceSummary{{Name: "api", Kind: "Deployment"}}}
+	requests := []protocol.Request{
+		request("delete", "resource.delete", map[string]any{"gvr": "apps/v1/deployments", "namespace": "demo", "name": "api", "confirm": true}),
+		request("context", "context.select", map[string]any{"name": "production"}),
+		request("list", "resource.list", map[string]any{"gvr": "apps/v1/deployments", "namespaced": true, "namespace": "demo"}),
+	}
+	var input strings.Builder
+	for _, request := range requests {
+		encoded, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input.Write(encoded)
+		input.WriteByte('\n')
+	}
+	var output lockedBuffer
+	server := NewServer(client, strings.NewReader(input.String()), &output)
+	server.setReadOnly(true)
+	if err := server.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	responses := decodeEnvelopes(t, output.String())
+	for _, id := range []string{"delete", "context"} {
+		if got := envelopeByID(t, responses, id).Error; got == nil || got.Code != "read_only" {
+			t.Errorf("%s error = %#v, want read_only", id, got)
+		}
+	}
+	if got := envelopeByID(t, responses, "list").Error; got != nil {
+		t.Errorf("read-only list error = %#v", got)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.deletes) != 0 || len(client.selected) != 0 {
+		t.Errorf("protected calls reached cluster: deletes=%#v selected=%#v", client.deletes, client.selected)
+	}
+}
+
 func decodeEnvelopes(t *testing.T, output string) []protocol.Envelope {
 	t.Helper()
 	var result []protocol.Envelope

@@ -6,6 +6,10 @@ K9k is a macOS Tahoe 26+ Kubernetes manager built with SwiftUI and a bundled Go 
 
 > K9s defines the Kubernetes workflows. Apple’s native macOS design defines the interface.
 
+![K9k inspecting a live Deployment in a local Kind fixture cluster](Documentation/Media/k9k-workload-inspector.jpeg)
+
+<p align="center"><sub>Live fixture-cluster capture: resource browser, native inspector, rollout health, RBAC preflight, and Kubernetes metadata in one window.</sub></p>
+
 ## What it feels like
 
 Open a cluster, choose a namespace, and move through live resources in a dense native table. The sidebar, command palette, inspector, sheets, and toolbar are standard macOS controls; Kubernetes semantics stay in the bundled helper.
@@ -40,6 +44,17 @@ Cluster → Namespace → Deployment → Inspector → Rollout / Events / Raw JS
 1. Select a Pod, then choose **More → Open Terminal**.
 2. Pick the container and a shell program (`/bin/sh`, `/bin/bash`, `/bin/ash`, or `sh`).
 3. The terminal is a native SwiftTerm VT surface with resize, Unicode, ANSI color, scrollback, and copy/paste. Input goes directly to Kubernetes `pods/exec`; it never runs through a local shell.
+
+### Example: a safe production change without tab-hopping
+
+```text
+⌘K  →  Deployments  →  api  →  Overview
+                                  ├─ inspect rollout + recent Events
+                                  ├─ check “can I patch?” with active identity
+                                  └─ More → Scale → confirm
+```
+
+K9k keeps the cluster context, namespace scope, selected resource, and navigation history together. The action remains deliberately close to the evidence: its health, raw object, owners, RBAC answer, and live events are all immediately available in the inspector.
 
 ## Architecture
 

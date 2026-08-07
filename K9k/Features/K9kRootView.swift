@@ -36,19 +36,7 @@ struct K9kRootView: View {
         .onChange(of: store.selectedNamespace) { _, _ in Task { await store.loadResources() } }
         .onChange(of: store.selectedResources) { _, selection in
             Task {
-                await store.loadEvents(for: store.resource(for: selection.first))
-                await store.loadMetrics(for: store.resource(for: selection.first))
-                await store.updateDeleteAccess()
-                await store.updateScaleAccess()
-                await store.updateRestartAccess()
-                await store.updateRollbackAccess()
-                await store.updateCronJobTriggerAccess()
-                await store.updateExecAccess()
-                await store.updateAttachAccess()
-                await store.updateDebugAccess()
-                await store.updateManifestAccess()
-                await store.updateNodePatchAccess()
-                await store.updateNodeDrainAccess()
+                await store.loadSelectedResourceSummary(for: selection.first)
             }
         }
         .modifier(rootPresentations(
@@ -285,39 +273,39 @@ struct K9kRootView: View {
                     Button("View Logs") { logsPresented = true }
                     Button("Port Forward…") { portForwardPresented = true }
                     Button("Open Terminal…") { terminalMode = .shell; terminalPresented = true }
-                        .disabled(!store.canOpenExec)
+                        .disabled(store.isReadOnly)
                     Button("Attach…") { terminalMode = .attach; terminalPresented = true }
-                        .disabled(!store.canOpenAttach)
+                        .disabled(store.isReadOnly)
                     Button("Debug Container…") { debugPresented = true }
-                        .disabled(!store.canDebugSelectedPod)
+                        .disabled(store.isReadOnly)
                 }
                 if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Service" {
                     Button("Port Forward…") { portForwardPresented = true }
                 }
                 if store.selectedResourceType?.gvr == "batch/v1/cronjobs", !store.selectedResources.isEmpty {
                     Button("Trigger CronJob…", role: .destructive) { cronJobTriggerConfirmation = true }
-                        .disabled(!store.canTriggerSelectedCronJob)
+                        .disabled(store.isReadOnly)
                 }
                 if store.isSelectedResourceScalable {
                     Button("Scale…") { scalePresented = true }
-                        .disabled(!store.canScaleSelected)
+                        .disabled(store.isReadOnly)
                 }
                 if store.isSelectedResourceRestartable {
                     Button("Restart…", role: .destructive) { restartConfirmation = true }
-                        .disabled(!store.canRestartSelected)
+                        .disabled(store.isReadOnly)
                 }
                 if store.selectedRollbackDescription != nil {
                     Button("Roll Back to This Revision…", role: .destructive) { rollbackConfirmation = true }
-                        .disabled(!store.canRollbackSelected)
+                        .disabled(store.isReadOnly)
                 }
                 if let node = store.selectedNodeResource {
                     if node.raw?.objectValue?["spec"]?.objectValue?["unschedulable"]?.boolValue == true {
-                        Button("Uncordon") { Task { await store.setSelectedNodeUnschedulable(false) } }.disabled(!store.canPatchSelectedNode)
+                        Button("Uncordon") { Task { await store.setSelectedNodeUnschedulable(false) } }.disabled(store.isReadOnly)
                     } else {
-                        Button("Cordon…", role: .destructive) { nodeCordonConfirmation = true }.disabled(!store.canPatchSelectedNode)
+                        Button("Cordon…", role: .destructive) { nodeCordonConfirmation = true }.disabled(store.isReadOnly)
                     }
                     Button("Drain…") { nodeDrainPresented = true }
-                        .disabled(!store.canDrainSelectedNode || node.raw?.objectValue?["spec"]?.objectValue?["unschedulable"]?.boolValue != true)
+                        .disabled(store.isReadOnly || node.raw?.objectValue?["spec"]?.objectValue?["unschedulable"]?.boolValue != true)
                 }
                 Divider()
                 Button("Check Access…") { accessCheckPresented = true }

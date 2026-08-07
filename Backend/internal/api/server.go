@@ -77,6 +77,8 @@ type Server struct {
 	streams  map[string]context.CancelFunc
 	execMu   sync.Mutex
 	execs    map[string]*execSession
+	policyMu sync.RWMutex
+	readOnly bool
 	work     sync.WaitGroup
 }
 
@@ -165,6 +167,10 @@ func (s *Server) readRequests(ctx context.Context) error {
 }
 
 func (s *Server) dispatch(ctx context.Context, request protocol.Request) {
+	if s.isReadOnly() && protectedReadOnlyOperation(request.Operation) {
+		s.writeFailure(request.ID, "read_only", errors.New("K9k is in read-only mode; disable it explicitly before performing this operation"), nil)
+		return
+	}
 	if request.Operation == "resource.watch" {
 		s.startWatch(ctx, request)
 		return
@@ -192,6 +198,20 @@ func (s *Server) dispatch(ctx context.Context, request protocol.Request) {
 		return
 	}
 	s.write(protocol.Response(request.ID, result))
+}
+
+func (s *Server) isReadOnly() bool       { s.policyMu.RLock(); defer s.policyMu.RUnlock(); return s.readOnly }
+func (s *Server) setReadOnly(value bool) { s.policyMu.Lock(); s.readOnly = value; s.policyMu.Unlock() }
+
+func protectedReadOnlyOperation(operation string) bool {
+	switch operation {
+	case "context.select", "context.update", "context.rename", "context.copy", "context.delete", "config.write",
+		"resource.patch", "resource.delete", "resource.scale", "manifest.apply", "manifest.applyBatch",
+		"node.drain", "pod.debug", "cronjob.trigger", "deployment.rollback", "exec.open", "attach.open", "portforward.open":
+		return true
+	default:
+		return false
+	}
 }
 
 type operationError struct {
@@ -351,6 +371,15 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 	switch request.Operation {
 	case "health", "health.ping", "ping":
 		return map[string]any{"status": "ok", "protocolVersion": protocol.Version}, nil
+	case "policy.readOnly":
+		var params struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		s.setReadOnly(params.Enabled)
+		return map[string]any{"enabled": params.Enabled}, nil
 	case "config.summary":
 		var params struct {
 			Directory string `json:"directory"`

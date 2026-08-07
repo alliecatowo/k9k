@@ -53,6 +53,7 @@ struct NodeDrainView: View {
             }
         }
         .frame(minWidth: 540, minHeight: 470)
+        .task { await store.updateNodeDrainAccess() }
         .confirmationDialog("Drain \(node.name)?", isPresented: $confirmationPresented, titleVisibility: .visible) {
             Button("Evict Eligible Pods", role: .destructive) {
                 Task { await store.drainSelectedNode(deleteEmptyDirData: deleteEmptyDirData) }

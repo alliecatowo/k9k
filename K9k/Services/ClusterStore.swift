@@ -35,7 +35,12 @@ final class ClusterStore {
     private var selectorResourceTypeID: String?
     var errorMessage: String?
     var isLoading = false
-    var isReadOnly = UserDefaults.standard.bool(forKey: "k9k.readOnly") { didSet { UserDefaults.standard.set(isReadOnly, forKey: "k9k.readOnly") } }
+    var isReadOnly = UserDefaults.standard.bool(forKey: "k9k.readOnly") {
+        didSet {
+            UserDefaults.standard.set(isReadOnly, forKey: "k9k.readOnly")
+            Task { await synchronizeReadOnlyPolicy() }
+        }
+    }
     var activeStreamID: String?
     var k9sAliases: [K9sAlias] = []
     var k9sConfig: K9sConfigSummary?
@@ -80,6 +85,8 @@ final class ClusterStore {
     private var rollbackAccessGeneration = 0
     private var execAccessGeneration = 0
     private var manifestAccessGeneration = 0
+    private var eventsGeneration = 0
+    private var resourceMetricsGeneration = 0
     private var terminalOutputSink: ((Data) -> Void)?
     private var terminalColumns = 120
     private var terminalRows = 36
@@ -143,6 +150,7 @@ final class ClusterStore {
         isLoading = true
         defer { isLoading = false }
         do {
+            await synchronizeReadOnlyPolicy()
             async let contextsEnvelope = client.request("context.list")
             async let discoveryEnvelope = client.request("discovery.list")
             contexts = try decodeArray((try await contextsEnvelope).result, as: KubeContext.self)
@@ -153,6 +161,17 @@ final class ClusterStore {
             await loadNamespaces()
             await loadResources()
         } catch { errorMessage = error.localizedDescription }
+    }
+
+    /// UI disabling is useful feedback, but it is not a safety boundary. The
+    /// helper owns the authoritative policy for its lifetime and rejects
+    /// protected requests before they reach a Kubernetes client.
+    private func synchronizeReadOnlyPolicy() async {
+        do {
+            _ = try await client.request("policy.readOnly", parameters: .object(["enabled": .bool(isReadOnly)]))
+        } catch {
+            errorMessage = "K9k could not synchronize read-only safety: \(error.localizedDescription)"
+        }
     }
 
     func selectContext(_ context: KubeContext) async {
@@ -498,6 +517,42 @@ final class ClusterStore {
             relationshipGraph = nil
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Keeps selection changes lightweight enough for the system inspector's
+    /// show/hide animation. Historically every row click started ten-plus
+    /// independent access reviews and an event list request, even though the
+    /// inspector initially renders only its overview. Action-specific sheets
+    /// still review permission just before use; Events now starts its own
+    /// polling only when that tab is visible.
+    func loadSelectedResourceSummary(for selection: ResourceSummary.ID?) async {
+        events = []
+        resourceMetrics = nil
+        metricsUnavailableMessage = nil
+        isLoadingMetrics = false
+        scaleAccess = nil
+        restartAccess = nil
+        rollbackAccess = nil
+        cronJobTriggerAccess = nil
+        nodePatchAccess = nil
+        nodeDrainAccess = nil
+        execAccess = nil
+        attachAccess = nil
+        debugAccess = nil
+        manifestAccess = nil
+
+        guard let resource = resource(for: selection) else {
+            deleteAccess = nil
+            isCheckingDeleteAccess = false
+            return
+        }
+
+        // These are the only dynamic values present in the default Overview
+        // tab. Run them concurrently so inspector presentation is never held
+        // behind an unrelated action's authorization round trip.
+        async let deleteReview: Void = updateDeleteAccess()
+        async let metrics: Void = loadMetrics(for: resource)
+        _ = await (deleteReview, metrics)
     }
 
     func deleteSelected() async {
@@ -1085,13 +1140,23 @@ final class ClusterStore {
     }
 
     func loadEvents(for resource: ResourceSummary?) async {
-        guard let resource, let namespace = resource.namespace, !namespace.isEmpty else { events = []; return }
+        eventsGeneration &+= 1
+        let generation = eventsGeneration
+        guard let resource, let namespace = resource.namespace, !namespace.isEmpty else {
+            events = []
+            return
+        }
         do {
-            events = try decodeArray((try await client.request("resource.events", parameters: .object(["namespace": .string(namespace), "uid": .string(resource.uid)]))).result, as: ClusterEvent.self)
-        } catch { events = [] }
+            let loaded = try decodeArray((try await client.request("resource.events", parameters: .object(["namespace": .string(namespace), "uid": .string(resource.uid)]))).result, as: ClusterEvent.self)
+            if generation == eventsGeneration { events = loaded }
+        } catch {
+            if generation == eventsGeneration { events = [] }
+        }
     }
 
     func loadMetrics(for resource: ResourceSummary?) async {
+        resourceMetricsGeneration &+= 1
+        let generation = resourceMetricsGeneration
         resourceMetrics = nil
         metricsUnavailableMessage = nil
         guard let resource else { return }
@@ -1102,7 +1167,9 @@ final class ClusterStore {
         default: return
         }
         isLoadingMetrics = true
-        defer { isLoadingMetrics = false }
+        defer {
+            if generation == resourceMetricsGeneration { isLoadingMetrics = false }
+        }
         var parameters: [String: JSONValue] = [
             "resource": .string(metricResource),
             "name": .string(resource.name)
@@ -1112,11 +1179,11 @@ final class ClusterStore {
         }
         do {
             let response = try decode((try await client.request("metrics.list", parameters: .object(parameters))).result, as: MetricsListResponse.self)
-            resourceMetrics = response.items.first
+            if generation == resourceMetricsGeneration { resourceMetrics = response.items.first }
         } catch let error as CoreError where error.code == "metrics_unavailable" {
-            metricsUnavailableMessage = error.message
+            if generation == resourceMetricsGeneration { metricsUnavailableMessage = error.message }
         } catch {
-            metricsUnavailableMessage = "K9k could not load metrics: \(error.localizedDescription)"
+            if generation == resourceMetricsGeneration { metricsUnavailableMessage = "K9k could not load metrics: \(error.localizedDescription)" }
         }
     }
 
