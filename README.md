@@ -1,14 +1,66 @@
 # K9k
 
-K9k is a native macOS 26 Kubernetes cluster manager: K9s-style Kubernetes capability with an Apple Liquid Glass SwiftUI interface. The macOS app is backed by a bundled Go `client-go` helper, so normal resource operations do not require an installed `kubectl` or K9s.
+**K9s operational depth, designed as a native macOS app.**
+
+K9k is a macOS Tahoe 26+ Kubernetes manager built with SwiftUI and a bundled Go `client-go` helper. It speaks directly to the active kubeconfig context—there is no Electron shell, webview, embedded TUI, or required `kubectl` installation for normal cluster operations.
+
+> K9s defines the Kubernetes workflows. Apple’s native macOS design defines the interface.
+
+## What it feels like
+
+Open a cluster, choose a namespace, and move through live resources in a dense native table. The sidebar, command palette, inspector, sheets, and toolbar are standard macOS controls; Kubernetes semantics stay in the bundled helper.
+
+```text
+Cluster → Namespace → Deployment → Inspector → Rollout / Events / Raw JSON
+                                      ↘ Scale · Restart · Roll back · Edit manifest
+```
+
+## Production workflows
+
+- Browse built-in resources and CRDs through discovery, with live list/watch updates.
+- Filter, sort, select, export, and inspect resources without leaving the app.
+- Inspect syntax-highlighted raw JSON, metadata, owners, annotations, events, RBAC, rollout state, and available metrics.
+- Stream logs; open a real ANSI/VT Pod terminal; attach; add a confirmed ephemeral debug container.
+- Create loopback-only Pod or Service port-forwards, manage several at once, and benchmark a K9k-owned forward.
+- Scale, restart, roll back Deployments, trigger CronJobs, cordon/drain Nodes, and apply UID-protected manifests.
+- Import up to 100 same-resource manifests at once: every document dry-runs before a confirmed, explicitly non-atomic apply.
+- Manage kubeconfig context references graphically, including default namespace, duplicate, rename, delete, and switch.
+- See K9s aliases, custom views, jumps, hotkeys, and plugins; edit K9s-compatible configuration safely.
+- Browse metadata-only Helm release revisions, use native navigation history, and check access with a graphical `kubectl auth can-i` equivalent.
+
+### Example: inspect and safely change a rollout
+
+1. Select **Deployment** in the sidebar and choose a workload.
+2. Read readiness, revision, conditions, related events, and RBAC access in the inspector.
+3. Use **More → Scale**, **Restart**, or select an inactive ReplicaSet and **Roll Back**.
+4. Every mutating action is access-reviewed, read-only-aware, and confirmed.
+
+### Example: work inside a production Pod
+
+1. Select a Pod, then choose **More → Open Terminal**.
+2. Pick the container and a shell program (`/bin/sh`, `/bin/bash`, `/bin/ash`, or `sh`).
+3. The terminal is a native SwiftTerm VT surface with resize, Unicode, ANSI color, scrollback, and copy/paste. Input goes directly to Kubernetes `pods/exec`; it never runs through a local shell.
+
+## Architecture
+
+```text
+SwiftUI macOS app
+  ├─ NavigationSplitView · Table · Inspector · Sheets · Swift Charts
+  └─ versioned NDJSON IPC
+        └─ bundled Go helper
+              └─ client-go typed, dynamic, discovery, metrics, SPDY APIs
+                    └─ active kubeconfig context
+```
+
+The app never reads kubeconfig credentials into Swift. The helper owns Kubernetes authentication, applies direct API calls, and returns structured results and errors.
 
 ## Requirements
 
 - macOS Tahoe 26+
-- Xcode 26.0+ (Apple-managed; checked by bootstrap)
+- Xcode 26+
 - [mise](https://mise.jdx.dev/)
 
-## Development
+## Build and run
 
 ```sh
 mise install
@@ -18,10 +70,33 @@ mise run test
 mise run run
 ```
 
-`mise run build` compiles `k9k-core`, builds `K9k.app`, then bundles the helper at `K9k.app/Contents/Resources/k9k-core`. The developer-facing app is at `DerivedData/Build/Products/Debug/K9k.app`.
+The Debug app is built at `DerivedData/Build/Products/Debug/K9k.app`. `mise run build` compiles and bundles `k9k-core` into the app.
 
-For an isolated test cluster, use `mise run cluster:create`, `mise run cluster:seed`, and `mise run cluster:destroy`. These tasks target the disposable `k9k-test` Kind cluster. Kind makes `kind-k9k-test` the current kubeconfig context when it creates the cluster, so switch back to a production context before opening K9k against it.
+For an isolated Kind fixture cluster:
 
-## Current vertical slice
+```sh
+mise run cluster:create
+mise run cluster:seed
+mise run run
+```
 
-K9k currently provides direct kubeconfig/context handling, namespace selection, API discovery (including CRDs), generic dynamic resource list/get/watch, native sorting/filtering/table selection, resource metadata/raw-object/event inspection, streamed pod logs, command-palette resource navigation, destructive confirmation, and global read-only mode. The protocol foundation also supports generic patch/scale/delete operations and parses K9s aliases, hotkeys, views, and plugin declarations for migration work. See `Docs/K9S_PARITY.md` for candid parity status and `Docs/ARCHITECTURE.md` for design details.
+These tasks use the disposable `kind-k9k-test` context. Switch back to your production context before opening K9k against a real environment.
+
+## Safety model
+
+- Explicit confirmation for destructive and mutating operations.
+- Native read-only mode disables mutation paths.
+- Direct API client; no recurring `kubectl get` subprocesses.
+- Port forwards bind to loopback only.
+- Manifest edits dry-run before server-side apply, preserve UID identity, and never force field ownership.
+- Kubeconfig credentials and endpoints remain opaque to the Swift UI.
+
+## Parity status
+
+K9k is actively developed and deliberately candid about parity. It covers many high-value K9s workflows today, but it is not yet complete K9s parity. Notable remaining areas include file transfer, node shell/SSH, Helm chart actions, image scanning, full manifest-directory/diff workflows, deeper XRay topology, and more specialised views.
+
+See [K9S_PARITY.md](Docs/K9S_PARITY.md) for the source-pinned capability ledger, [ARCHITECTURE.md](Docs/ARCHITECTURE.md) for design, and [IPC_PROTOCOL.md](Docs/IPC_PROTOCOL.md) for the helper contract.
+
+## Provenance
+
+K9k was seeded from Apple’s official Liquid Glass Landmarks sample. The exact source and transformation record are in [APPLE_SAMPLE_PROVENANCE.md](Docs/APPLE_SAMPLE_PROVENANCE.md).
