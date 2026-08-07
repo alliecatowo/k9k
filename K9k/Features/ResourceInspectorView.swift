@@ -71,6 +71,7 @@ struct ResourceInspectorView: View {
                 Section("Access") { LabeledContent("Delete") { ProgressView().controlSize(.small) } }
             }
             metrics(resource)
+            rbacDetails(resource)
             if resource.kind == "Pod", let containers = resource.raw?.objectValue?["spec"]?.objectValue?["containers"]?.arrayValue, !containers.isEmpty {
                 Section("Containers") {
                     ForEach(Array(containers.enumerated()), id: \.offset) { _, container in
@@ -112,6 +113,66 @@ struct ResourceInspectorView: View {
         }
     }
 
+    @ViewBuilder private func rbacDetails(_ resource: ResourceSummary) -> some View {
+        if let raw = resource.raw?.objectValue {
+            switch resource.kind {
+        case "Role", "ClusterRole":
+            let rules = raw["rules"]?.arrayValue ?? []
+            if rules.isEmpty {
+                Section("RBAC Rules") { Text("This role has no rules.").foregroundStyle(.secondary) }
+            } else {
+                Section("RBAC Rules") {
+                    ForEach(Array(rules.enumerated()), id: \.offset) { index, rule in
+                        if let object = rule.objectValue {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(ruleSummary(object)).font(.callout).fontWeight(.medium)
+                                Text("API groups: \(list(object["apiGroups"], fallback: "core"))")
+                                Text("Resources: \(list(object["resources"], fallback: "non-resource URL"))")
+                                if let names = object["resourceNames"], !list(names).isEmpty { Text("Names: \(list(names))") }
+                            }
+                            .font(.caption)
+                            .textSelection(.enabled)
+                            if index < rules.count - 1 { Divider() }
+                        }
+                    }
+                }
+            }
+        case "RoleBinding", "ClusterRoleBinding":
+            Section("Role Reference") {
+                let roleRef = raw["roleRef"]?.objectValue ?? [:]
+                LabeledContent("Kind", value: roleRef["kind"]?.stringValue ?? "—")
+                LabeledContent("Name", value: roleRef["name"]?.stringValue ?? "—")
+                LabeledContent("API group", value: roleRef["apiGroup"]?.stringValue ?? "rbac.authorization.k8s.io")
+            }
+            let subjects = raw["subjects"]?.arrayValue ?? []
+            Section("Subjects") {
+                if subjects.isEmpty {
+                    Text("No subjects are bound.").foregroundStyle(.secondary)
+                } else {
+                    ForEach(Array(subjects.enumerated()), id: \.offset) { _, subject in
+                        if let object = subject.objectValue {
+                            HStack {
+                                Text(object["kind"]?.stringValue ?? "Subject").font(.caption).foregroundStyle(.secondary)
+                                Text(object["name"]?.stringValue ?? "—")
+                                if let namespace = object["namespace"]?.stringValue, !namespace.isEmpty { Text(namespace).font(.caption).foregroundStyle(.secondary) }
+                            }
+                            .textSelection(.enabled)
+                        }
+                    }
+                }
+            }
+        case "ServiceAccount":
+            Section("Service Account") {
+                LabeledContent("Automount token", value: raw["automountServiceAccountToken"]?.boolValue == false ? "Disabled" : "Default")
+                let pullSecrets = raw["imagePullSecrets"]?.arrayValue?.compactMap { $0.objectValue?["name"]?.stringValue } ?? []
+                if !pullSecrets.isEmpty { LabeledContent("Image pull secrets", value: pullSecrets.joined(separator: ", ")) }
+            }
+            default:
+                EmptyView()
+            }
+        }
+    }
+
     @ViewBuilder private func metadata(_ resource: ResourceSummary) -> some View {
         Form {
             LabeledContent("UID", value: resource.uid).textSelection(.enabled)
@@ -144,5 +205,16 @@ struct ResourceInspectorView: View {
     private func prettyJSON(_ raw: JSONValue?) -> String {
         guard let raw, let data = try? JSONEncoder().encode(raw), let value = try? JSONSerialization.jsonObject(with: data), let pretty = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys]) else { return "No raw object available." }
         return String(decoding: pretty, as: UTF8.self)
+    }
+
+    private func list(_ value: JSONValue?, fallback: String = "") -> String {
+        let values = value?.arrayValue?.compactMap(\.stringValue) ?? []
+        return values.isEmpty ? fallback : values.joined(separator: ", ")
+    }
+
+    private func ruleSummary(_ rule: [String: JSONValue]) -> String {
+        let verbs = list(rule["verbs"], fallback: "no verbs")
+        if let urls = rule["nonResourceURLs"], !list(urls).isEmpty { return "\(verbs) · \(list(urls))" }
+        return verbs
     }
 }
