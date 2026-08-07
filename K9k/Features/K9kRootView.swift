@@ -78,7 +78,10 @@ struct K9kRootView: View {
     @ViewBuilder private func navigationContent(selectedResourceType: Binding<ResourceType?>) -> some View {
         NavigationSplitView {
             SidebarView(selectedResourceType: selectedResourceType) { paletteIsPresented = true }
-                .navigationSplitViewColumnWidth(min: 290, ideal: 320, max: 420)
+                // Kubernetes names, namespaces, and custom resources are often
+                // long; a narrow Finder-like sidebar hides the operational
+                // context people need while scanning a cluster.
+                .navigationSplitViewColumnWidth(min: 340, ideal: 380, max: 480)
         } detail: {
             ResourceBrowserView(inspectorIsPresented: $inspectorIsPresented, destructiveConfirmation: $destructiveConfirmation)
         }
