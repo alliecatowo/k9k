@@ -1591,6 +1591,7 @@ type manifestApplyParams struct {
 	Kind        string `json:"kind"`
 	Manifest    string `json:"manifest"`
 	Confirm     bool   `json:"confirm"`
+	Create      bool   `json:"create"`
 }
 
 func decodeManifestApplyParams(raw json.RawMessage) (manifestApplyParams, error) {
@@ -1612,7 +1613,7 @@ func (p manifestApplyParams) identity() ManifestIdentity {
 }
 
 func (p manifestApplyParams) request(dryRun bool) ManifestApplyRequest {
-	return ManifestApplyRequest{Identity: p.identity(), Object: p.object(), DryRun: dryRun}
+	return ManifestApplyRequest{Identity: p.identity(), Object: p.object(), DryRun: dryRun, Create: p.Create}
 }
 
 func (p *manifestApplyParams) validate() error {
@@ -1622,8 +1623,14 @@ func (p *manifestApplyParams) validate() error {
 	p.ExpectedUID = strings.TrimSpace(p.ExpectedUID)
 	p.Kind = strings.TrimSpace(p.Kind)
 	p.Manifest = strings.TrimSpace(p.Manifest)
-	if p.Name == "" || p.ExpectedUID == "" || p.Kind == "" {
-		return errors.New("name, expectedUID, and kind are required")
+	if p.Name == "" || p.Kind == "" {
+		return errors.New("name and kind are required")
+	}
+	if p.Create && p.ExpectedUID != "" {
+		return errors.New("create manifest must not include expectedUID")
+	}
+	if !p.Create && p.ExpectedUID == "" {
+		return errors.New("expectedUID is required when updating an existing manifest")
 	}
 	if p.isNamespaced() && p.Namespace == "" {
 		return errors.New("namespace is required for a namespaced resource")

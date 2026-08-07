@@ -298,4 +298,5 @@ type ManifestApplyRequest struct {
 	Identity ManifestIdentity
 	Object   *unstructured.Unstructured
 	DryRun   bool
+	Create   bool
 }

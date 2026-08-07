@@ -342,12 +342,14 @@ func (c *Cluster) ApplyManifest(ctx context.Context, request api.ManifestApplyRe
 	if err != nil {
 		return nil, err
 	}
-	current, err := resource.Get(ctx, identity.Name, metav1.GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-	if string(current.GetUID()) != identity.UID || current.GetKind() != identity.Kind || current.GetAPIVersion() != gvr.GroupVersion().String() {
-		return nil, api.ErrManifestIdentityMismatch
+	if !request.Create {
+		current, err := resource.Get(ctx, identity.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		if string(current.GetUID()) != identity.UID || current.GetKind() != identity.Kind || current.GetAPIVersion() != gvr.GroupVersion().String() {
+			return nil, api.ErrManifestIdentityMismatch
+		}
 	}
 	options := metav1.ApplyOptions{FieldManager: "k9k"}
 	if request.DryRun {

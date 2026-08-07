@@ -554,6 +554,34 @@ func TestManifestApplyClassifiesIdentityAndServerValidationFailures(t *testing.T
 	}
 }
 
+func TestManifestCreateRequiresExplicitCreateModeAndDryRuns(t *testing.T) {
+	manifest := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: imported\n  namespace: demo\ndata:\n  mode: imported\n"
+	client := &fakeCluster{object: &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "imported", "namespace": "demo", "uid": "created"}, "data": map[string]any{"mode": "imported"},
+	}}}
+	responses := runRequests(t, client,
+		request("missing-create", "manifest.apply", map[string]any{"gvr": "v1/configmaps", "namespace": "demo", "name": "imported", "kind": "ConfigMap", "manifest": manifest}),
+		request("create", "manifest.apply", map[string]any{"gvr": "v1/configmaps", "namespace": "demo", "name": "imported", "kind": "ConfigMap", "manifest": manifest, "create": true, "confirm": true}),
+	)
+	if got := envelopeByID(t, responses, "missing-create").Error; got == nil || got.Code != "invalid_params" {
+		t.Errorf("missing create flag = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "create").Error; got != nil {
+		t.Errorf("create result = %#v", got)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	createDryRuns := 0
+	for _, apply := range client.applyManifests {
+		if apply.Create && apply.DryRun {
+			createDryRuns++
+		}
+	}
+	if len(client.applyManifests) != 2 || createDryRuns != 1 {
+		t.Errorf("create apply calls = %#v", client.applyManifests)
+	}
+}
+
 func TestResourceTypeSerializesMissingShortNamesAsArray(t *testing.T) {
 	encoded, err := json.Marshal(ResourceType{Version: "v1", Resource: "pods", Kind: "Pod"})
 	if err != nil {
