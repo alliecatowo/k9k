@@ -8,7 +8,7 @@ struct ResourceInspectorView: View {
     let events: [ClusterEvent]
     @State private var section: InspectorSection = .overview
 
-    enum InspectorSection: String, CaseIterable, Identifiable { case overview = "Overview", events = "Events", yaml = "YAML", metadata = "Metadata"; var id: String { rawValue } }
+    enum InspectorSection: String, CaseIterable, Identifiable { case overview = "Overview", events = "Events", raw = "Raw JSON", metadata = "Metadata"; var id: String { rawValue } }
 
     var body: some View {
         if let resource {
@@ -21,7 +21,7 @@ struct ResourceInspectorView: View {
                     switch section {
                     case .overview: overview(resource)
                     case .events: eventList
-                    case .yaml: yaml(resource)
+                    case .raw: rawJSON(resource)
                     case .metadata: metadata(resource)
                     }
                 }
@@ -121,19 +121,24 @@ struct ResourceInspectorView: View {
         .formStyle(.grouped)
     }
 
-    @ViewBuilder private func yaml(_ resource: ResourceSummary) -> some View {
-        VStack(alignment: .trailing, spacing: 0) {
-            Button("Copy JSON") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(prettyJSON(resource.raw), forType: .string)
+    @ViewBuilder private func rawJSON(_ resource: ResourceSummary) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Sorted, API-faithful object JSON")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Copy JSON") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(prettyJSON(resource.raw), forType: .string)
+                }
             }
-            .padding()
-            Text(prettyJSON(resource.raw))
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
+            .padding(.horizontal)
+            .padding(.vertical, 10)
+            Divider()
+            SyntaxHighlightedTextView(source: prettyJSON(resource.raw), language: .json)
         }
+        .frame(minHeight: 300)
     }
 
     private func prettyJSON(_ raw: JSONValue?) -> String {
