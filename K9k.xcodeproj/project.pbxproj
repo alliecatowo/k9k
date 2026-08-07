@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		A1B2C3D4E5F60718293A4B5C /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = A1B2C3D4E5F60718293A4B5B /* SwiftTerm */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		160180BB2FDC97A059640BD0 /* SampleCode.xcconfig */ = {isa = PBXFileReference; name = SampleCode.xcconfig; path = Configuration/SampleCode.xcconfig; sourceTree = "<group>"; };
 		160180BD2FDC97A059640BD0 /* APPLE_SAMPLE_LICENSE.txt */ = {isa = PBXFileReference; includeInIndex = 1; path = APPLE_SAMPLE_LICENSE.txt; sourceTree = "<group>"; };
@@ -26,6 +30,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A1B2C3D4E5F60718293A4B5C /* SwiftTerm in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -87,6 +92,9 @@
 				D82EA0F72D5692FD00493877 /* K9k */,
 			);
 			name = K9k;
+			packageProductDependencies = (
+				A1B2C3D4E5F60718293A4B5B /* SwiftTerm */,
+			);
 			productName = K9k;
 			productReference = D82EA0F52D5692FD00493877 /* K9k.app */;
 			productType = "com.apple.product-type.application";
@@ -119,6 +127,9 @@
 				th,
 			);
 			mainGroup = D82EA0EC2D5692FD00493877;
+			packageReferences = (
+				A1B2C3D4E5F60718293A4B5A /* XCRemoteSwiftPackageReference "SwiftTerm" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = D82EA0F62D5692FD00493877 /* Products */;
 			projectDirPath = "";
@@ -128,6 +139,25 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		A1B2C3D4E5F60718293A4B5A /* XCRemoteSwiftPackageReference "SwiftTerm" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/migueldeicaza/SwiftTerm.git";
+			requirement = {
+				kind = exactVersion;
+				version = 1.15.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A1B2C3D4E5F60718293A4B5B /* SwiftTerm */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A1B2C3D4E5F60718293A4B5A /* XCRemoteSwiftPackageReference "SwiftTerm" */;
+			productName = SwiftTerm;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin PBXResourcesBuildPhase section */
 		D82EA0F32D5692FD00493877 /* Resources */ = {

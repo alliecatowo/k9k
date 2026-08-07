@@ -27,7 +27,6 @@ final class ClusterStore {
     var activeLogStreamID: String?
     var activePortForward: PortForwardBinding?
     var activePortForwardStreamID: String?
-    var terminalOutput = ""
     var activeExecStreamID: String?
     var execAccess: AccessReview?
     var isCheckingExecAccess = false
@@ -47,7 +46,9 @@ final class ClusterStore {
     private var restartAccessGeneration = 0
     private var execAccessGeneration = 0
     private var manifestAccessGeneration = 0
-    private var rawTerminalOutput = ""
+    private var terminalOutputSink: ((Data) -> Void)?
+    private var terminalColumns = 120
+    private var terminalRows = 36
 
     private let client = CoreClient()
 
@@ -364,8 +365,6 @@ final class ClusterStore {
         }
         await closeExec()
         let streamID = UUID().uuidString
-        terminalOutput = ""
-        rawTerminalOutput = ""
         activeExecStreamID = streamID
         var parameters: [String: JSONValue] = [
             "streamID": .string(streamID),
@@ -374,8 +373,8 @@ final class ClusterStore {
             "command": .array(command.map(JSONValue.string)),
             "tty": .bool(true),
             "stdin": .bool(true),
-            "initialColumns": .number(120),
-            "initialRows": .number(36)
+            "initialColumns": .number(Double(terminalColumns)),
+            "initialRows": .number(Double(terminalRows))
         ]
         if let container, !container.isEmpty { parameters["container"] = .string(container) }
         do {
@@ -387,15 +386,45 @@ final class ClusterStore {
     }
 
     func sendExecInput(_ input: String) async {
-        guard let activeExecStreamID, !input.isEmpty else { return }
+        await sendExecInput(Data(input.utf8))
+    }
+
+    func sendExecInput(_ data: Data) async {
+        guard let activeExecStreamID, !data.isEmpty else { return }
         do {
             _ = try await client.request("exec.stdin", parameters: .object([
                 "streamID": .string(activeExecStreamID),
-                "data": .string(input)
+                "dataBase64": .string(data.base64EncodedString())
             ]))
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func resizeExec(columns: Int, rows: Int) async {
+        guard columns > 0, rows > 0 else { return }
+        terminalColumns = columns
+        terminalRows = rows
+        guard let activeExecStreamID else { return }
+        do {
+            _ = try await client.request("exec.resize", parameters: .object([
+                "streamID": .string(activeExecStreamID),
+                "columns": .number(Double(columns)),
+                "rows": .number(Double(rows))
+            ]))
+        } catch {
+            // A resize can race normal session teardown. Surface all other
+            // errors but do not fabricate a live terminal after it closes.
+            if activeExecStreamID != nil { errorMessage = error.localizedDescription }
+        }
+    }
+
+    func setTerminalOutputSink(_ sink: @escaping (Data) -> Void) {
+        terminalOutputSink = sink
+    }
+
+    func clearTerminalOutputSink() {
+        terminalOutputSink = nil
     }
 
     func closeExec() async {
@@ -611,9 +640,7 @@ final class ClusterStore {
             if ["exec.stdout", "exec.stderr"].contains(event.type),
                let encoded = event.result?.objectValue?["dataBase64"]?.stringValue,
                let data = Data(base64Encoded: encoded) {
-                rawTerminalOutput.append(String(decoding: data, as: UTF8.self))
-                if rawTerminalOutput.count > 200_000 { rawTerminalOutput.removeFirst(rawTerminalOutput.count - 200_000) }
-                terminalOutput = renderTerminalOutput(rawTerminalOutput)
+                terminalOutputSink?(data)
                 return
             }
             if event.type == "exec.closed" || event.type == "exec.error" {
@@ -645,15 +672,4 @@ final class ClusterStore {
     }
     private func decodeArray<T: Decodable>(_ value: JSONValue?, as type: T.Type) throws -> [T] { try decode(value, as: [T].self) }
 
-    /// K9k's first-party terminal surface intentionally presents a readable
-    /// transcript while the direct exec transport remains byte-exact. Strip
-    /// terminal-control responses such as cursor-position probes so they don't
-    /// leak into copyable output; a full VT grid is a later enhancement.
-    private func renderTerminalOutput(_ raw: String) -> String {
-        let pattern = "\u{001B}\\[[0-?]*[ -/]*[@-~]"
-        guard let expression = try? NSRegularExpression(pattern: pattern) else { return raw }
-        let range = NSRange(raw.startIndex..., in: raw)
-        return expression.stringByReplacingMatches(in: raw, range: range, withTemplate: "")
-            .replacingOccurrences(of: "\r", with: "\n")
-    }
 }

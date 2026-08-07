@@ -96,7 +96,7 @@ This follows K9s's `internal/client`, `dao`, `watch`, and `model` model. Focused
 | Confirmation modal | Native alert/sheet with selected resource and irreversible-effect wording. |
 | XRay tree | Native outline/graph and inspector. |
 | Log text view | Native streaming log view with filter, autoscroll, timestamp, wrap, copy, save. |
-| TUI suspension | Native terminal/editor surface; no process-wide suspension. |
+| TUI suspension | Native SwiftTerm-backed AppKit terminal and native YAML editor; no process-wide suspension. |
 
 Liquid Glass belongs to navigation, toolbars, inspectors, and transient controls where system materials improve orientation. Dense resource tables, logs, YAML, and errors prioritise contrast and legibility.
 

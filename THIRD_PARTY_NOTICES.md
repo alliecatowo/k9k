@@ -12,3 +12,6 @@ K9s is Copyright © Derailed, LLC and contributors, licensed under Apache Licens
 
 `k9k-core` uses `k8s.io/client-go`, `k8s.io/api`, and `k8s.io/apimachinery`, each under Apache License 2.0. Their resolved versions are in `Backend/go.mod` and `Backend/go.sum`.
 
+## SwiftTerm
+
+The native terminal surface uses [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) `1.15.0` (commit `dd2fb8ac5b861e7bf617c872895e338f38165648`), Copyright © Miguel de Icaza and contributors, under the MIT License. It is pinned in `K9k.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved` and isolated behind `K9k/Terminal/KubernetesTerminalView.swift`.
