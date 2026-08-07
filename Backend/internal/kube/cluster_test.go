@@ -210,6 +210,32 @@ func TestContextRenameAndDeleteModifyOnlyInactiveContextEntries(t *testing.T) {
 	}
 }
 
+func TestCopyContextPreservesReferencesAndChangesOnlyNamespace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	raw := clientcmdapi.Config{Contexts: map[string]*clientcmdapi.Context{
+		"production": {Cluster: "cluster-prod", AuthInfo: "user-prod", Namespace: "production"},
+	}}
+	if err := clientcmd.WriteToFile(raw, path); err != nil {
+		t.Fatal(err)
+	}
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	rules.ExplicitPath = path
+	cluster := &Cluster{rules: rules, config: clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})}
+	if err := cluster.CopyContext("production", "staging", "stage"); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := clientcmd.LoadFromFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := updated.Contexts["staging"], (&clientcmdapi.Context{Cluster: "cluster-prod", AuthInfo: "user-prod", Namespace: "stage"}); got == nil || got.Cluster != want.Cluster || got.AuthInfo != want.AuthInfo || got.Namespace != want.Namespace {
+		t.Errorf("copied context = %#v, want %#v", got, want)
+	}
+	if err := cluster.CopyContext("production", "staging", ""); err == nil {
+		t.Fatal("duplicate context name was accepted")
+	}
+}
+
 func TestMetricsUsesMetricsAPIAndPreservesPodContainerUsage(t *testing.T) {
 	timestamp := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
 	podMetric := metricsv1beta1.PodMetrics{

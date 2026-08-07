@@ -180,6 +180,23 @@ final class ClusterStore {
         }
     }
 
+    func copyKubeContext(_ context: KubeContext, to newName: String, namespace: String) async -> KubeContext? {
+        let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != context.name else { return nil }
+        do {
+            _ = try await client.request("context.copy", parameters: .object([
+                "source": .string(context.name), "newName": .string(name), "namespace": .string(namespace.trimmingCharacters(in: .whitespacesAndNewlines)), "confirm": .bool(true),
+            ]))
+            let copy = KubeContext(name: name, cluster: context.cluster, user: context.user, namespace: namespace.trimmingCharacters(in: .whitespacesAndNewlines), active: false)
+            contexts.append(copy)
+            contexts.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            return copy
+        } catch {
+            errorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
     func deleteKubeContext(_ context: KubeContext) async -> Bool {
         guard !context.active else {
             errorMessage = "Select a different context before deleting the active context."

@@ -184,6 +184,32 @@ func (c *Cluster) RenameContext(name, newName string) error {
 	return nil
 }
 
+// CopyContext creates a new context reference using an existing context's
+// cluster and AuthInfo references. It never reads or mutates endpoint or
+// credential material, which makes it suitable for a graphical stage/prod
+// variant workflow without expanding access.
+func (c *Cluster) CopyContext(source, newName, namespace string) error {
+	c.mu.RLock()
+	config := c.config
+	rules := c.rules
+	c.mu.RUnlock()
+	raw, err := config.RawConfig()
+	if err != nil {
+		return err
+	}
+	contextValue, exists := raw.Contexts[source]
+	if !exists {
+		return fmt.Errorf("kubeconfig context %q does not exist", source)
+	}
+	if _, exists := raw.Contexts[newName]; exists {
+		return fmt.Errorf("kubeconfig context %q already exists", newName)
+	}
+	copyOfContext := *contextValue.DeepCopy()
+	copyOfContext.Namespace = namespace
+	raw.Contexts[newName] = &copyOfContext
+	return clientcmd.ModifyConfig(rules, raw, true)
+}
+
 // DeleteContext removes only an inactive kubeconfig context entry. K9k refuses
 // to delete the selected or kubeconfig-current context so a settings action can
 // never strand the running application without a usable cluster client.

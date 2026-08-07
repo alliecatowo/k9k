@@ -38,6 +38,7 @@ type fakeCluster struct {
 	contextsErr, selectErr, namespacesErr, discoveryErr error
 	updateContextErr                                    error
 	renameContextErr                                    error
+	copyContextErr                                      error
 	deleteContextErr                                    error
 	listErr, getErr, watchErr, deleteErr, patchErr      error
 	accessErr, portForwardErr                           error
@@ -52,6 +53,7 @@ type fakeCluster struct {
 	selected        []string
 	contextUpdates  []Context
 	contextRenames  [][2]string
+	contextCopies   [][3]string
 	contextDeletes  []string
 	lists           []resourceCall
 	gets            []resourceCall
@@ -111,6 +113,13 @@ func (f *fakeCluster) RenameContext(name, newName string) error {
 	defer f.mu.Unlock()
 	f.contextRenames = append(f.contextRenames, [2]string{name, newName})
 	return f.renameContextErr
+}
+
+func (f *fakeCluster) CopyContext(source, newName, namespace string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.contextCopies = append(f.contextCopies, [3]string{source, newName, namespace})
+	return f.copyContextErr
 }
 
 func (f *fakeCluster) DeleteContext(name string) error {
@@ -748,6 +757,25 @@ func TestServerContextRenameAndDeleteRequireConfirmation(t *testing.T) {
 	}
 	if got := client.contextDeletes; len(got) != 1 || got[0] != "old" {
 		t.Errorf("context deletes = %#v", got)
+	}
+}
+
+func TestServerContextCopyRequiresConfirmation(t *testing.T) {
+	client := &fakeCluster{}
+	responses := runRequests(t, client,
+		request("missing", "context.copy", map[string]any{"source": "production", "newName": "staging", "namespace": "stage"}),
+		request("copy", "context.copy", map[string]any{"source": "production", "newName": "staging", "namespace": "stage", "confirm": true}),
+	)
+	if got := envelopeByID(t, responses, "missing").Error; got == nil || got.Code != "confirmation_required" {
+		t.Errorf("unconfirmed context copy = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "copy").Error; got != nil {
+		t.Errorf("confirmed context copy = %#v", got)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if got, want := client.contextCopies, [][3]string{{"production", "staging", "stage"}}; len(got) != 1 || got[0] != want[0] {
+		t.Errorf("context copies = %#v, want %#v", got, want)
 	}
 }
 

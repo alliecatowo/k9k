@@ -8,7 +8,10 @@ struct KubeconfigContextManagerView: View {
     @Binding var isPresented: Bool
     @State private var selectedContextID: KubeContext.ID?
     @State private var renamedContext = ""
+    @State private var copiedContextName = ""
+    @State private var copiedContextNamespace = ""
     @State private var confirmRename = false
+    @State private var confirmCopy = false
     @State private var confirmDelete = false
     @State private var isWorking = false
 
@@ -21,7 +24,7 @@ struct KubeconfigContextManagerView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Kubeconfig Contexts").font(.headline)
-                    Text("Rename or remove saved context references without exposing credentials.")
+                    Text("Duplicate, rename, or remove saved context references without exposing credentials.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -59,6 +62,18 @@ struct KubeconfigContextManagerView: View {
                                 Button("Rename…") { confirmRename = true }
                                     .disabled(isWorking || renamedContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || renamedContext == context.name || store.isReadOnly)
                             }
+                            Section("Duplicate") {
+                                TextField("New context name", text: $copiedContextName)
+                                Picker("Default namespace", selection: $copiedContextNamespace) {
+                                    Text("Kubernetes default").tag("")
+                                    ForEach(store.namespaces.filter { $0 != "All Namespaces" }, id: \.self) { Text($0).tag($0) }
+                                }
+                                Button("Duplicate Context…") { confirmCopy = true }
+                                    .disabled(isWorking || copiedContextName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || copiedContextName.trimmingCharacters(in: .whitespacesAndNewlines) == context.name || store.contexts.contains(where: { $0.name == copiedContextName.trimmingCharacters(in: .whitespacesAndNewlines) }) || store.isReadOnly)
+                                Text("The new context keeps this context's cluster and user references. Credentials and endpoint settings are not displayed or changed.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                             Section("Remove") {
                                 Button("Delete Inactive Context…", role: .destructive) { confirmDelete = true }
                                     .disabled(isWorking || context.active || store.isReadOnly)
@@ -79,11 +94,20 @@ struct KubeconfigContextManagerView: View {
         }
         .frame(minWidth: 740, minHeight: 500)
         .onAppear { selectInitialContext() }
-        .onChange(of: selectedContextID) { _, _ in renamedContext = selectedContext?.name ?? "" }
+        .onChange(of: selectedContextID) { _, _ in
+            renamedContext = selectedContext?.name ?? ""
+            copiedContextName = ""
+            copiedContextNamespace = selectedContext?.namespace ?? ""
+        }
         .confirmationDialog("Rename kubeconfig context?", isPresented: $confirmRename, titleVisibility: .visible) {
             Button("Rename") { rename() }
         } message: {
             Text("K9k will rename only the context reference in kubeconfig. Cluster endpoints and credentials are unchanged.")
+        }
+        .confirmationDialog("Duplicate kubeconfig context?", isPresented: $confirmCopy, titleVisibility: .visible) {
+            Button("Duplicate Context") { copy() }
+        } message: {
+            Text("K9k will create \(copiedContextName.trimmingCharacters(in: .whitespacesAndNewlines)) using \(selectedContext?.name ?? "the selected context")'s saved cluster and user references. Credentials and endpoint settings are unchanged.")
         }
         .confirmationDialog("Delete kubeconfig context?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete Context", role: .destructive) { delete() }
@@ -95,6 +119,7 @@ struct KubeconfigContextManagerView: View {
     private func selectInitialContext() {
         selectedContextID = store.selectedContext?.id ?? store.contexts.first?.id
         renamedContext = selectedContext?.name ?? ""
+        copiedContextNamespace = selectedContext?.namespace ?? ""
     }
 
     private func rename() {
@@ -115,6 +140,17 @@ struct KubeconfigContextManagerView: View {
             defer { isWorking = false }
             if await store.deleteKubeContext(context) {
                 selectedContextID = store.selectedContext?.id ?? store.contexts.first?.id
+            }
+        }
+    }
+
+    private func copy() {
+        guard let context = selectedContext else { return }
+        isWorking = true
+        Task {
+            defer { isWorking = false }
+            if let copy = await store.copyKubeContext(context, to: copiedContextName, namespace: copiedContextNamespace) {
+                selectedContextID = copy.id
             }
         }
     }

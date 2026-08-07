@@ -40,6 +40,7 @@ type ClusterClient interface {
 	SelectContext(name string) error
 	UpdateContextNamespace(name, namespace string) error
 	RenameContext(name, newName string) error
+	CopyContext(source, newName, namespace string) error
 	DeleteContext(name string) error
 	Namespaces(context.Context) ([]string, error)
 	Discovery(context.Context) ([]ResourceType, error)
@@ -460,6 +461,30 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(err)
 		}
 		return map[string]any{"name": params.Name, "newName": params.NewName, "renamed": true}, nil
+	case "context.copy":
+		var params struct {
+			Source    string `json:"source"`
+			NewName   string `json:"newName"`
+			Namespace string `json:"namespace"`
+			Confirm   bool   `json:"confirm"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		params.Source, params.NewName, params.Namespace = strings.TrimSpace(params.Source), strings.TrimSpace(params.NewName), strings.TrimSpace(params.Namespace)
+		if params.Source == "" || params.NewName == "" {
+			return nil, invalidParams(errors.New("source and newName are required"))
+		}
+		if params.Source == params.NewName {
+			return nil, invalidParams(errors.New("new context name must be different"))
+		}
+		if !params.Confirm {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("kubeconfig context copy requires confirm: true")}
+		}
+		if err := s.cluster.CopyContext(params.Source, params.NewName, params.Namespace); err != nil {
+			return nil, kubeError(err)
+		}
+		return map[string]any{"source": params.Source, "name": params.NewName, "namespace": params.Namespace, "copied": true}, nil
 	case "context.delete":
 		var params struct {
 			Name    string `json:"name"`
