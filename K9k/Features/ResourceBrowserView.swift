@@ -24,6 +24,13 @@ struct ResourceBrowserView: View {
                         .width(min: 54, ideal: 70)
                     TableColumn("Kind") { Text($0.kind).foregroundStyle(.secondary) }
                         .width(min: 110, ideal: 150)
+                    if let view = customView(for: type) {
+                        TableColumn("View") { resource in
+                            Text(view.columns.map { value(for: $0, in: resource.raw) }.filter { !$0.isEmpty }.joined(separator: " · "))
+                                .foregroundStyle(.secondary)
+                        }
+                        .width(min: 160, ideal: 260)
+                    }
                 }
                 .onChange(of: sortOrder) { _, newOrder in store.resources.sort(using: newOrder) }
                 .contextMenu(forSelectionType: ResourceSummary.ID.self) { selection in
@@ -63,5 +70,19 @@ struct ResourceBrowserView: View {
         case "pending", "terminating": .orange
         default: .secondary
         }
+    }
+
+    private func customView(for type: ResourceType) -> K9sCustomView? {
+        store.k9sConfig?.views.first { $0.key.lowercased() == type.gvr.lowercased() || $0.key.lowercased() == type.resource.lowercased() }
+    }
+
+    private func value(for column: String, in raw: JSONValue?) -> String {
+        let path = column.lowercased().split(separator: ".").map(String.init)
+        var current = raw
+        for component in path { current = current?.objectValue?[component] }
+        if let string = current?.stringValue { return string }
+        if let number = current?.intValue { return String(number) }
+        if let bool = current?.boolValue { return bool ? "true" : "false" }
+        return ""
     }
 }
