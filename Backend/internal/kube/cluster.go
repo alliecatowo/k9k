@@ -884,6 +884,9 @@ func Summarize(item *unstructured.Unstructured) api.ResourceSummary {
 		status, _, _ = unstructured.NestedString(item.Object, "status", "state")
 	}
 	if status == "" {
+		status = workloadStatus(item)
+	}
+	if status == "" {
 		status = "Unknown"
 	}
 	created := item.GetCreationTimestamp().Time
@@ -892,6 +895,40 @@ func Summarize(item *unstructured.Unstructured) api.ResourceSummary {
 		age = humanDuration(created)
 	}
 	return api.ResourceSummary{APIVersion: item.GetAPIVersion(), Kind: item.GetKind(), Namespace: item.GetNamespace(), Name: item.GetName(), UID: string(item.GetUID()), CreatedAt: created, Age: age, Status: status, Labels: item.GetLabels(), Raw: item.Object}
+}
+
+// workloadStatus keeps the high-frequency browser useful for controller
+// objects, which generally have no status.phase. The detailed inspector still
+// carries the full conditions and replica accounting.
+func workloadStatus(item *unstructured.Unstructured) string {
+	desired, _, _ := unstructured.NestedInt64(item.Object, "spec", "replicas")
+	ready, _, _ := unstructured.NestedInt64(item.Object, "status", "readyReplicas")
+	switch item.GetKind() {
+	case "Deployment", "StatefulSet", "ReplicaSet", "ReplicationController":
+		if desired == 0 {
+			return "Scaled to 0"
+		}
+		if ready >= desired {
+			return "Ready"
+		}
+		return "Progressing"
+	case "DaemonSet":
+		desired, _, _ = unstructured.NestedInt64(item.Object, "status", "desiredNumberScheduled")
+		available, _, _ := unstructured.NestedInt64(item.Object, "status", "numberAvailable")
+		if desired > 0 && available >= desired {
+			return "Ready"
+		}
+		return "Progressing"
+	case "Job":
+		if complete, _, _ := unstructured.NestedInt64(item.Object, "status", "succeeded"); complete > 0 {
+			return "Succeeded"
+		}
+		if failed, _, _ := unstructured.NestedInt64(item.Object, "status", "failed"); failed > 0 {
+			return "Failed"
+		}
+		return "Running"
+	}
+	return ""
 }
 func humanDuration(created time.Time) string {
 	d := time.Since(created)
