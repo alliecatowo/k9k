@@ -372,6 +372,28 @@ struct ManifestApplyResult: Codable, Hashable {
     let manifest: ManifestDocument
 }
 
+/// A read-only, server-side-apply preview of a selected live object. Both
+/// documents are editor-safe YAML; `changes` is semantic while `diff` is a
+/// copyable unified presentation of the same comparison.
+struct ManifestDiffResult: Codable, Hashable {
+    let identity: ManifestIdentity
+    let live: ManifestDocument
+    let preview: ManifestDocument
+    let diff: String
+    let changes: [ManifestDiffChange]
+    let changed: Bool
+    let truncated: Bool
+}
+
+struct ManifestDiffChange: Codable, Hashable, Identifiable {
+    let path: String
+    let operation: String
+    let live: String?
+    let preview: String?
+
+    var id: String { "\(path)|\(operation)|\(live ?? \"\")|\(preview ?? \"\")" }
+}
+
 /// Result of a multi-document manifest import. Each item was dry-run before
 /// any confirmed write starts; Kubernetes cannot make arbitrary object applies
 /// transactional, so callers must not present this as an all-or-nothing batch.

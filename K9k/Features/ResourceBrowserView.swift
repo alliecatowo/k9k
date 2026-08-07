@@ -11,26 +11,37 @@ struct ResourceBrowserView: View {
         @Bindable var store = store
         Group {
             if let type = store.selectedResourceType {
+                let configuredColumns = store.customColumns(for: type)
                 Table(store.visibleResources, selection: $store.selectedResources, sortOrder: $sortOrder) {
-                    TableColumn("Name", value: \.name) { resource in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(resource.name).fontWeight(.medium)
-                            if resource.namespace?.isEmpty == false { Text(resource.namespace!).font(.caption).foregroundStyle(.secondary) }
+                    if configuredColumns.isEmpty {
+                        TableColumn("Name", value: \.name) { resource in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(resource.name).fontWeight(.medium)
+                                if resource.namespace?.isEmpty == false { Text(resource.namespace!).font(.caption).foregroundStyle(.secondary) }
+                            }
                         }
-                    }
-                    .width(min: 220, ideal: 280)
-                    TableColumn("Status", value: \.status) { Text($0.status).foregroundStyle(statusColor($0.status)) }
-                        .width(min: 100, ideal: 140)
-                    TableColumn("Age", value: \.age) { Text($0.age).monospacedDigit() }
-                        .width(min: 54, ideal: 70)
-                    TableColumn("Kind") { Text($0.kind).foregroundStyle(.secondary) }
-                        .width(min: 110, ideal: 150)
-                    if let view = customView(for: type) {
-                        TableColumn("View") { resource in
-                            Text(view.columns.map { resource.columns?[$0] ?? value(for: $0, in: resource.raw) }.filter { !$0.isEmpty }.joined(separator: " · "))
-                                .foregroundStyle(.secondary)
+                        .width(min: 220, ideal: 280)
+                        TableColumn("Status", value: \.status) { Text($0.status).foregroundStyle(statusColor($0.status)) }
+                            .width(min: 100, ideal: 140)
+                        TableColumn("Age", value: \.age) { Text($0.age).monospacedDigit() }
+                            .width(min: 54, ideal: 70)
+                        TableColumn("Kind") { Text($0.kind).foregroundStyle(.secondary) }
+                            .width(min: 110, ideal: 150)
+                    } else {
+                        // A K9s view is a column layout, not a single opaque
+                        // text field. `customColumns` excludes unsupported
+                        // renderer-only definitions before this builder runs,
+                        // so every visible column has a real native source.
+                        ForEach(configuredColumns) { column in
+                            TableColumn(column.title) { resource in
+                                Text(column.value(for: resource))
+                                    .foregroundStyle(column.source == .status ? statusColor(resource.status) : .primary)
+                                    .monospacedDigit()
+                                    .multilineTextAlignment(column.rightAligned ? .trailing : .leading)
+                                    .frame(maxWidth: .infinity, alignment: column.rightAligned ? .trailing : .leading)
+                            }
+                            .width(min: column.title.count > 14 ? 140 : 84, ideal: column.title.count > 14 ? 190 : 120)
                         }
-                        .width(min: 160, ideal: 260)
                     }
                 }
                 .tableStyle(.inset)
@@ -95,20 +106,6 @@ struct ResourceBrowserView: View {
         case "pending", "terminating": .orange
         default: .secondary
         }
-    }
-
-    private func customView(for type: ResourceType) -> K9sCustomView? {
-        store.k9sConfig?.views.first { $0.key.lowercased() == type.gvr.lowercased() || $0.key.lowercased() == type.resource.lowercased() }
-    }
-
-    private func value(for column: String, in raw: JSONValue?) -> String {
-        let path = column.lowercased().split(separator: ".").map(String.init)
-        var current = raw
-        for component in path { current = current?.objectValue?[component] }
-        if let string = current?.stringValue { return string }
-        if let number = current?.intValue { return String(number) }
-        if let bool = current?.boolValue { return bool ? "true" : "false" }
-        return ""
     }
 
     private enum ExportFormat: String { case json, csv, tsv }

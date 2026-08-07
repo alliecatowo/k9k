@@ -14,6 +14,8 @@ struct ManifestEditorView: View {
     @State private var isWorking = false
     @State private var validationMessage: String?
     @State private var applyConfirmation = false
+    @State private var diffResult: ManifestDiffResult?
+    @State private var diffPresented = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -48,6 +50,8 @@ struct ManifestEditorView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Reload") { load() }.disabled(isLoading || isWorking)
+                Button("Compare with Live") { compareWithLive() }
+                    .disabled(document == nil || isWorking)
                 Button("Validate") { validate() }
                     .disabled(document == nil || isWorking)
                 Button("Apply…") { applyConfirmation = true }
@@ -58,6 +62,9 @@ struct ManifestEditorView: View {
         }
         .frame(minWidth: 820, minHeight: 620)
         .task { load() }
+        .sheet(isPresented: $diffPresented) {
+            if let diffResult { ManifestDiffView(result: diffResult) }
+        }
         .confirmationDialog("Apply this manifest?", isPresented: $applyConfirmation, titleVisibility: .visible) {
             Button("Apply", role: .destructive) { apply() }
         } message: {
@@ -91,6 +98,22 @@ struct ManifestEditorView: View {
                 validationMessage = "Validated by Kubernetes — no changes applied."
             } catch {
                 validationMessage = "Validation failed."
+                store.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func compareWithLive() {
+        guard let document else { return }
+        isWorking = true
+        validationMessage = nil
+        Task {
+            defer { isWorking = false }
+            do {
+                diffResult = try await store.diffManifest(type: type, document: document, source: source)
+                diffPresented = true
+            } catch {
+                validationMessage = "Comparison failed."
                 store.errorMessage = error.localizedDescription
             }
         }

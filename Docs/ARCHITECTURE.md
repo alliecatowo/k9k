@@ -37,7 +37,8 @@ Swift owns window lifecycle, navigation, tables, sheets, inspectors, searches, k
 2. `CoreClient.start()` launches `k9k-core serve` with pipes and retains the process/write handle.
 3. Requests/events share stdout as NDJSON. Stderr is diagnostics only and must not be parsed as protocol.
 4. On quit/deinitialization Swift terminates the child and closes stdin. The helper must cancel watches, exec/attach, logs, and port forwards on EOF or signal.
-5. Unexpected helper termination fails outstanding continuations with `helperExited`; the UI can offer controlled relaunch rather than stale cluster state.
+5. Unexpected helper termination first clears the stale process and pipes, then fails outstanding continuations with `helperExited`; the next request launches a fresh helper instead of writing to a dead pipe.
+6. Explicit shutdown, write failures, and cancellation resolve pending continuations rather than leaving work suspended. An incomplete NDJSON envelope is capped at 8 MiB; an invalid or runaway helper is terminated and reported as a `protocol` error rather than retaining unbounded main-actor memory.
 
 The Swift startup code implements steps 1–4. `Backend/internal/api.Server` is now the Go request dispatcher for the baseline context, discovery, generic-resource, scale, watch, and cancellation operations. Reconnect/relist policy remains implementation work.
 

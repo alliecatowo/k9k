@@ -225,10 +225,10 @@ func (f *fakeCluster) ApplyManifest(_ context.Context, request ManifestApplyRequ
 	if f.applyManifestErr != nil {
 		return nil, f.applyManifestErr
 	}
-	if f.object == nil {
-		return request.Object.DeepCopy(), nil
-	}
-	return f.object.DeepCopy(), nil
+	// A dry-run/apply response represents the submitted object after API
+	// server defaulting. The fake has no defaulting layer, so returning the
+	// request preserves the important protocol distinction from the live GET.
+	return request.Object.DeepCopy(), nil
 }
 
 func (f *fakeCluster) PodLogs(context.Context, string, string, string, bool, bool, bool, int64) (io.ReadCloser, error) {
@@ -678,6 +678,44 @@ func TestManifestApplyClassifiesIdentityAndServerValidationFailures(t *testing.T
 	validation := envelopeByID(t, runRequests(t, &fakeCluster{applyManifestErr: errors.New("admission denied")}, request("invalid", "manifest.apply", params)), "invalid")
 	if validation.Error == nil || validation.Error.Code != "manifest_validation_failed" {
 		t.Errorf("validation failure = %#v", validation.Error)
+	}
+}
+
+func TestManifestDiffPinsLiveUIDAndReturnsSemanticAndUnifiedPreview(t *testing.T) {
+	live := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap",
+		"metadata": map[string]any{"name": "settings", "namespace": "demo", "uid": "config-uid", "labels": map[string]any{"app": "web"}},
+		"data":     map[string]any{"theme": "light", "unchanged": "yes"},
+	}}
+	manifest := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: demo\n  labels:\n    app: web\ndata:\n  theme: dark\n  added: true\n"
+	client := &fakeCluster{object: live}
+	response := envelopeByID(t, runRequests(t, client, request("diff", "manifest.diff", map[string]any{
+		"gvr": "v1/configmaps", "namespace": "demo", "name": "settings", "expectedUID": "config-uid", "kind": "ConfigMap", "manifest": manifest,
+	})), "diff")
+	if response.Error != nil {
+		t.Fatalf("manifest diff error = %#v", response.Error)
+	}
+	diff := decodeResult[ManifestDiffResult](t, response.Result)
+	if !diff.Changed || diff.Identity.UID != "config-uid" || !strings.Contains(diff.Diff, "-  theme: light") || !strings.Contains(diff.Diff, "+  theme: dark") {
+		t.Fatalf("diff result = %#v", diff)
+	}
+	paths := make(map[string]ManifestDiffChange)
+	for _, change := range diff.Changes {
+		paths[change.Path] = change
+	}
+	if paths["$.data.theme"].Operation != "replace" || paths["$.data.added"].Operation != "add" || paths["$.data.unchanged"].Operation != "remove" {
+		t.Errorf("semantic changes = %#v", diff.Changes)
+	}
+	stale := envelopeByID(t, runRequests(t, client, request("stale", "manifest.diff", map[string]any{
+		"gvr": "v1/configmaps", "namespace": "demo", "name": "settings", "expectedUID": "old-uid", "kind": "ConfigMap", "manifest": manifest,
+	})), "stale")
+	if stale.Error == nil || stale.Error.Code != "identity_mismatch" {
+		t.Errorf("stale diff = %#v", stale.Error)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.manifests) != 2 || len(client.applyManifests) != 1 || !client.applyManifests[0].DryRun {
+		t.Errorf("manifest diff calls = reads %#v applies %#v", client.manifests, client.applyManifests)
 	}
 }
 

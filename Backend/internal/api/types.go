@@ -434,6 +434,29 @@ type ManifestDocument struct {
 	YAML     string           `json:"yaml"`
 }
 
+// ManifestDiffResult compares the currently selected live object with the
+// server-side-apply dry-run of an imported manifest.  Both documents are
+// canonical editable YAML, so volatile metadata and status cannot create
+// misleading changes.  The textual diff is deliberately accompanied by a
+// structured change list for native clients that want to filter or render
+// individual paths without parsing a patch format.
+type ManifestDiffResult struct {
+	Identity  ManifestIdentity     `json:"identity"`
+	Live      ManifestDocument     `json:"live"`
+	Preview   ManifestDocument     `json:"preview"`
+	Diff      string               `json:"diff"`
+	Changes   []ManifestDiffChange `json:"changes"`
+	Changed   bool                 `json:"changed"`
+	Truncated bool                 `json:"truncated"`
+}
+
+type ManifestDiffChange struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
+	Live      string `json:"live,omitempty"`
+	Preview   string `json:"preview,omitempty"`
+}
+
 // ManifestApplyRequest crosses into the direct client-go layer only after the
 // protocol has parsed YAML and checked identity. DryRun invokes Kubernetes
 // admission/defaulting without persisting anything.

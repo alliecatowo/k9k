@@ -110,12 +110,12 @@ These tasks use the disposable `kind-k9k-test` context. Switch back to your prod
 - Native read-only mode disables mutation paths.
 - Direct API client; no recurring `kubectl get` subprocesses.
 - Port forwards bind to loopback only.
-- Manifest edits dry-run before server-side apply, preserve UID identity, and never force field ownership.
+- Manifest edits can compare imported YAML with a UID-pinned live object through a server-side-apply dry run (unified or structured diff), then dry-run before apply; they preserve UID identity and never force field ownership.
 - Kubeconfig credentials and endpoints remain opaque to the Swift UI.
 
 ## Parity status
 
-K9k is actively developed and deliberately candid about parity. It covers many high-value K9s workflows today, but it is not yet complete K9s parity. Notable remaining areas include host SSH, Helm mutation actions, image scanning, full manifest-directory diff/follow workflows, and specialised K9s views. Node Shell is available through an explicitly configured, existing trusted DaemonSet rather than an automatically created privileged Pod.
+K9k is actively developed and deliberately candid about parity. It covers many high-value K9s workflows today, but it is not yet complete K9s parity. Notable remaining areas include host SSH, Helm mutation actions, image scanning, manifest-directory follow/delete workflows, and specialised K9s views. Node Shell is available through an explicitly configured, existing trusted DaemonSet rather than an automatically created privileged Pod.
 
 See [K9S_PARITY.md](Docs/K9S_PARITY.md) for the source-pinned capability ledger, [ARCHITECTURE.md](Docs/ARCHITECTURE.md) for design, and [IPC_PROTOCOL.md](Docs/IPC_PROTOCOL.md) for the helper contract.
 

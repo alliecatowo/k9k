@@ -14,7 +14,8 @@ struct PodFileTransferView: View {
 
     @State private var controller = PodFileTransferController()
     @State private var selectedContainer = ""
-    @State private var remotePath = "/tmp"
+    @State private var remoteUploadDirectory = "/tmp"
+    @State private var remoteDownloadPath = "/tmp"
     @State private var localURL: URL?
     @State private var downloadDirectory: URL?
     @State private var importing = false
@@ -67,7 +68,7 @@ struct PodFileTransferView: View {
                             Button("Choose…") { importing = true }.disabled(controller.isWorking)
                         }
                     }
-                    TextField("Existing remote directory", text: $remotePath)
+                    TextField("Existing remote directory", text: $remoteUploadDirectory)
                         .textFieldStyle(.roundedBorder)
                         .disabled(controller.isWorking)
                     Text("K9k creates a regular-file/directory tar archive locally and extracts it only into this existing absolute directory. Symlinks, special files, traversal paths, and archives over 1 GiB are refused.")
@@ -80,7 +81,7 @@ struct PodFileTransferView: View {
                 }
 
                 Section("Download from Pod") {
-                    TextField("Absolute remote file or directory", text: $remotePath)
+                    TextField("Absolute remote file or directory", text: $remoteDownloadPath)
                         .textFieldStyle(.roundedBorder)
                         .disabled(controller.isWorking)
                     LabeledContent("Local folder") {
@@ -147,11 +148,11 @@ struct PodFileTransferView: View {
     private var canTransfer: Bool { !store.isReadOnly && access?.allowed == true }
 
     private func upload(_ url: URL) async {
-        await controller.upload(localURL: url, to: remotePath, resource: resource, container: selectedContainer)
+        await controller.upload(localURL: url, to: remoteUploadDirectory, resource: resource, container: selectedContainer)
     }
 
     private func download(to directory: URL) async {
-        await controller.download(remotePath: remotePath, into: directory, resource: resource, container: selectedContainer)
+        await controller.download(remotePath: remoteDownloadPath, into: directory, resource: resource, container: selectedContainer)
     }
 
     private func chooseDownloadDirectory() {
@@ -485,6 +486,12 @@ private enum TarArchive {
     }
 
     private static func parseHeader(_ header: Data) throws -> (path: String, size: UInt64, kind: EntryKind) {
+        let storedChecksum = try parseOctal(header, offset: 148, length: 8)
+        var checksummed = header
+        for index in 148..<156 { checksummed[index] = 0x20 }
+        guard storedChecksum == UInt64(checksummed.reduce(0) { $0 + UInt($1) }) else {
+            throw PodTransferError("Remote archive has an invalid tar checksum.")
+        }
         let name = readString(header, offset: 0, length: 100)
         let prefix = readString(header, offset: 345, length: 155)
         let path = prefix.isEmpty ? name : prefix + "/" + name

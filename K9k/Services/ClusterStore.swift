@@ -344,6 +344,10 @@ final class ClusterStore {
             let config = try decode((try await client.request("config.summary")).result, as: K9sConfigSummary.self)
             k9sConfig = config
             k9sAliases = config.aliases
+            // A reloaded view may require different lean projection paths.
+            // Refresh the active collection so its new columns never render
+            // against a stale list snapshot without their values.
+            if selectedResourceType != nil { await loadResources() }
         } catch {
             // K9s configuration is optional compatibility metadata. It must
             // never prevent access to the selected Kubernetes context.
@@ -406,6 +410,7 @@ final class ClusterStore {
                 continuation = page.continue
             } while continuation?.isEmpty == false
             guard generation == resourceLoadGeneration, selectedResourceType?.id == type.id else { return }
+            applyK9sViewSort(for: type)
             watchReconnectAttempts = 0
             activeStreamID = streamID
             params.removeValue(forKey: "continue")
@@ -416,9 +421,34 @@ final class ClusterStore {
         } catch { errorMessage = error.localizedDescription }
     }
 
+    /// Resolves the active K9s `views.yaml` definition once for both the
+    /// browser layout and the lean backend projection. Keeping this in the
+    /// store prevents the table from rendering columns that the list/watch
+    /// request forgot to hydrate.
+    func customColumns(for type: ResourceType) -> [K9sViewColumn] {
+        guard let view = k9sConfig?.view(for: type, namespace: selectedNamespace) else { return [] }
+        return view.columns.compactMap { K9sViewColumn.parse($0, for: type) }
+    }
+
     private func customColumnPaths(for type: ResourceType) -> [String] {
-        guard let view = k9sConfig?.views.first(where: { $0.key.lowercased() == type.gvr.lowercased() || $0.key.lowercased() == type.resource.lowercased() }) else { return [] }
-        return Array(Set(view.columns.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
+        Array(Set(customColumns(for: type).flatMap(\.projectionPaths))).sorted()
+    }
+
+    @discardableResult
+    private func applyK9sViewSort(for type: ResourceType) -> Bool {
+        guard let view = k9sConfig?.view(for: type, namespace: selectedNamespace) else { return false }
+        let pieces = view.sortColumn.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard pieces.count == 2,
+              let column = customColumns(for: type).first(where: { $0.matchesSortHeader(pieces[0]) })
+        else { return false }
+        let ascending = pieces[1].lowercased() == "asc"
+        resources.sort {
+            let result = column.compare($0, $1)
+            return ascending ? result == .orderedAscending : result == .orderedDescending
+        }
+        resourceIndexByID = Dictionary(uniqueKeysWithValues: resources.enumerated().map { ($0.element.id, $0.offset) })
+        recomputeVisibleResources()
+        return true
     }
 
     private func installResources(_ values: [ResourceSummary]) {
@@ -1398,6 +1428,20 @@ final class ClusterStore {
         try await submitManifest(type: type, document: document, source: source, confirm: false)
     }
 
+    /// Compares the current editor text to a fresh live read of the selected
+    /// UID. The core performs a non-mutating SSA dry run, so defaulting and
+    /// ownership conflicts are visible without a kubectl subprocess or write.
+    func diffManifest(type: ResourceType, document: ManifestDocument, source: String) async throws -> ManifestDiffResult {
+        var parameters = type.requestParameters.objectValue ?? [:]
+        let identity = document.identity
+        parameters["namespace"] = .string(identity.namespace ?? "")
+        parameters["name"] = .string(identity.name)
+        parameters["expectedUID"] = .string(identity.uid)
+        parameters["kind"] = .string(identity.kind)
+        parameters["manifest"] = .string(source)
+        return try decode((try await client.request("manifest.diff", parameters: .object(parameters))).result, as: ManifestDiffResult.self)
+    }
+
     func applyManifest(type: ResourceType, document: ManifestDocument, source: String) async throws -> ManifestApplyResult {
         try await submitManifest(type: type, document: document, source: source, confirm: true)
     }
@@ -1775,7 +1819,11 @@ final class ClusterStore {
                 resourceIndexByID[summary.id] = resources.count
                 resources.append(summary)
             }
-            recomputeVisibleResources()
+            if let type = selectedResourceType {
+                if !applyK9sViewSort(for: type) { recomputeVisibleResources() }
+            } else {
+                recomputeVisibleResources()
+            }
             if selectedResources.contains(summary.id) { Task { _ = await self.hydrateResourceIfNeeded(summary) } }
         }
     }

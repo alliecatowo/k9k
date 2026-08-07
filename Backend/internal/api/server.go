@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -632,6 +634,19 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(manifestErr)
 		}
 		return result, nil
+	case "manifest.diff":
+		params, err := decodeManifestApplyParams(request.Params)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		if params.Create {
+			return nil, invalidParams(errors.New("manifest diff requires an existing selected resource"))
+		}
+		result, diffErr := s.diffManifest(ctx, params)
+		if diffErr != nil {
+			return nil, diffErr
+		}
+		return result, nil
 	case "manifest.apply":
 		params, err := decodeManifestApplyParams(request.Params)
 		if err != nil {
@@ -1233,9 +1248,7 @@ func (s *Server) startExec(ctx context.Context, request protocol.Request) {
 	}
 
 	streamContext, cancel := context.WithCancel(ctx)
-	if !s.registerStream(streamID, cancel) {
-		cancel()
-		s.writeFailure(request.ID, "stream_exists", fmt.Errorf("stream %q already exists", streamID), nil)
+	if s.registerStreamFailure(request.ID, streamID, cancel) {
 		return
 	}
 	input := newExecInput()
@@ -1326,9 +1339,7 @@ func (s *Server) startAttach(ctx context.Context, request protocol.Request) {
 		return
 	}
 	streamContext, cancel := context.WithCancel(ctx)
-	if !s.registerStream(streamID, cancel) {
-		cancel()
-		s.writeFailure(request.ID, "stream_exists", fmt.Errorf("stream %q already exists", streamID), nil)
+	if s.registerStreamFailure(request.ID, streamID, cancel) {
 		return
 	}
 	input := newExecInput()
@@ -1451,9 +1462,7 @@ func (s *Server) startPortForward(ctx context.Context, request protocol.Request)
 	}
 
 	streamContext, cancel := context.WithCancel(ctx)
-	if !s.registerStream(streamID, cancel) {
-		cancel()
-		s.writeFailure(request.ID, "stream_exists", fmt.Errorf("stream %q already exists", streamID), nil)
+	if s.registerStreamFailure(request.ID, streamID, cancel) {
 		return
 	}
 	defer s.unregisterStream(streamID)
@@ -1538,9 +1547,7 @@ func (s *Server) startLogs(ctx context.Context, request protocol.Request) {
 		return
 	}
 	streamContext, cancel := context.WithCancel(ctx)
-	if !s.registerStream(streamID, cancel) {
-		cancel()
-		s.writeFailure(request.ID, "stream_exists", fmt.Errorf("stream %q already exists", streamID), nil)
+	if s.registerStreamFailure(request.ID, streamID, cancel) {
 		return
 	}
 	stream, err := s.cluster.PodLogs(streamContext, params.Namespace, params.Pod, params.Container, params.Previous, params.Follow, params.Timestamps, params.TailLines)
@@ -1590,9 +1597,7 @@ func (s *Server) startWatch(ctx context.Context, request protocol.Request) {
 	}
 
 	watchContext, cancel := context.WithCancel(ctx)
-	if !s.registerStream(streamID, cancel) {
-		cancel()
-		s.writeFailure(request.ID, "stream_exists", fmt.Errorf("stream %q already exists", streamID), nil)
+	if s.registerStreamFailure(request.ID, streamID, cancel) {
 		return
 	}
 
@@ -1638,16 +1643,6 @@ func (s *Server) startWatch(ctx context.Context, request protocol.Request) {
 		}
 		s.write(protocol.Event(streamID, "resource.watch.closed", map[string]any{"reason": reason}))
 	}()
-}
-
-func (s *Server) registerStream(id string, cancel context.CancelFunc) bool {
-	s.streamMu.Lock()
-	defer s.streamMu.Unlock()
-	if _, exists := s.streams[id]; exists {
-		return false
-	}
-	s.streams[id] = cancel
-	return true
 }
 
 func (s *Server) unregisterStream(id string) {
@@ -2061,6 +2056,172 @@ func (s *Server) applyManifestBatch(ctx context.Context, items []manifestApplyPa
 		appliedDocuments = append(appliedDocuments, document)
 	}
 	return map[string]any{"validated": true, "applied": true, "items": appliedDocuments}, nil
+}
+
+// diffManifest intentionally uses the same non-forced SSA dry-run as Apply.
+// That makes a comparison reflect admission/defaulting and ownership rules
+// without persisting anything.  A separate live read pins the comparison to
+// the UID the editor opened, so a name that was deleted and recreated cannot
+// be presented as a safe update target.
+func (s *Server) diffManifest(ctx context.Context, params manifestApplyParams) (ManifestDiffResult, *operationError) {
+	live, manifestErr := s.cluster.Manifest(ctx, params.gvr(), params.Namespace, params.Name, params.isNamespaced())
+	if manifestErr != nil {
+		return ManifestDiffResult{}, kubeError(manifestErr)
+	}
+	if live.Identity.UID == "" || live.Identity.UID != params.ExpectedUID {
+		return ManifestDiffResult{}, manifestOperationError(ErrManifestIdentityMismatch, "manifest identity changed before comparison")
+	}
+	previewObject, applyErr := s.cluster.ApplyManifest(ctx, params.request(true))
+	if applyErr != nil {
+		return ManifestDiffResult{}, manifestOperationError(applyErr, "manifest diff preview failed")
+	}
+	preview, documentErr := NewManifestDocument(previewObject, params.identity())
+	if documentErr != nil {
+		return ManifestDiffResult{}, kubeError(documentErr)
+	}
+	changes, truncated := manifestDocumentChanges(live.YAML, preview.YAML)
+	return ManifestDiffResult{
+		Identity: live.Identity,
+		Live:     live, Preview: preview,
+		Diff:    unifiedManifestDiff(live.YAML, preview.YAML),
+		Changes: changes, Changed: len(changes) > 0, Truncated: truncated,
+	}, nil
+}
+
+const maxManifestDiffChanges = 1_000
+
+// manifestDocumentChanges creates a deterministic, semantic summary rather
+// than treating YAML formatting as a configuration change.  Arrays are
+// intentionally replaced as a unit: Kubernetes list merge semantics vary by
+// schema, and claiming a per-index merge would be misleading for CRDs.
+func manifestDocumentChanges(liveYAML, previewYAML string) ([]ManifestDiffChange, bool) {
+	live, liveErr := parseManifestYAML(liveYAML)
+	preview, previewErr := parseManifestYAML(previewYAML)
+	if liveErr != nil || previewErr != nil {
+		return []ManifestDiffChange{{Path: "$", Operation: "replace", Live: liveYAML, Preview: previewYAML}}, false
+	}
+	changes := make([]ManifestDiffChange, 0)
+	truncated := false
+	var visit func(string, any, bool, any, bool)
+	appendChange := func(change ManifestDiffChange) {
+		if len(changes) >= maxManifestDiffChanges {
+			truncated = true
+			return
+		}
+		changes = append(changes, change)
+	}
+	visit = func(path string, before any, beforeOK bool, after any, afterOK bool) {
+		if truncated {
+			return
+		}
+		if !beforeOK {
+			appendChange(ManifestDiffChange{Path: path, Operation: "add", Preview: manifestDiffValue(after)})
+			return
+		}
+		if !afterOK {
+			appendChange(ManifestDiffChange{Path: path, Operation: "remove", Live: manifestDiffValue(before)})
+			return
+		}
+		beforeMap, beforeIsMap := before.(map[string]any)
+		afterMap, afterIsMap := after.(map[string]any)
+		if beforeIsMap && afterIsMap {
+			keys := make(map[string]struct{}, len(beforeMap)+len(afterMap))
+			for key := range beforeMap {
+				keys[key] = struct{}{}
+			}
+			for key := range afterMap {
+				keys[key] = struct{}{}
+			}
+			ordered := make([]string, 0, len(keys))
+			for key := range keys {
+				ordered = append(ordered, key)
+			}
+			sort.Strings(ordered)
+			for _, key := range ordered {
+				child := path + "." + key
+				visit(child, beforeMap[key], mapContains(beforeMap, key), afterMap[key], mapContains(afterMap, key))
+			}
+			return
+		}
+		if !reflect.DeepEqual(before, after) {
+			appendChange(ManifestDiffChange{Path: path, Operation: "replace", Live: manifestDiffValue(before), Preview: manifestDiffValue(after)})
+		}
+	}
+	visit("$", live.Object, true, preview.Object, true)
+	return changes, truncated
+}
+
+func mapContains(values map[string]any, key string) bool { _, ok := values[key]; return ok }
+
+func manifestDiffValue(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprint(value)
+	}
+	return string(encoded)
+}
+
+// unifiedManifestDiff is bounded and dependency-free.  It reports a complete
+// single hunk (rather than trying to infer misleading line numbers) and keeps
+// equal lines as context, which makes it useful for copy/paste and support
+// traces. Very large manifests retain the structured diff instead of risking
+// quadratic UI/server work.
+func unifiedManifestDiff(liveYAML, previewYAML string) string {
+	if liveYAML == previewYAML {
+		return ""
+	}
+	before := manifestLines(liveYAML)
+	after := manifestLines(previewYAML)
+	if len(before)*len(after) > 4_000_000 {
+		return "--- Live\n+++ Server-side apply preview\n@@ manifest differs; see structured changes @@\n"
+	}
+	result := []string{"--- Live", "+++ Server-side apply preview", fmt.Sprintf("@@ -1,%d +1,%d @@", len(before), len(after))}
+	for _, line := range lcsUnifiedLines(before, after) {
+		result = append(result, line)
+	}
+	return strings.Join(result, "\n") + "\n"
+}
+
+func manifestLines(value string) []string {
+	trimmed := strings.TrimSuffix(value, "\n")
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "\n")
+}
+
+func lcsUnifiedLines(before, after []string) []string {
+	dp := make([][]int, len(before)+1)
+	for index := range dp {
+		dp[index] = make([]int, len(after)+1)
+	}
+	for left := len(before) - 1; left >= 0; left-- {
+		for right := len(after) - 1; right >= 0; right-- {
+			if before[left] == after[right] {
+				dp[left][right] = dp[left+1][right+1] + 1
+			} else if dp[left+1][right] >= dp[left][right+1] {
+				dp[left][right] = dp[left+1][right]
+			} else {
+				dp[left][right] = dp[left][right+1]
+			}
+		}
+	}
+	result := make([]string, 0, len(before)+len(after))
+	for left, right := 0, 0; left < len(before) || right < len(after); {
+		switch {
+		case left < len(before) && right < len(after) && before[left] == after[right]:
+			result = append(result, " "+before[left])
+			left++
+			right++
+		case right < len(after) && (left == len(before) || dp[left][right+1] > dp[left+1][right]):
+			result = append(result, "+"+after[right])
+			right++
+		default:
+			result = append(result, "-"+before[left])
+			left++
+		}
+	}
+	return result
 }
 
 func decodeManifestApplyParams(raw json.RawMessage) (manifestApplyParams, error) {

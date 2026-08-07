@@ -17,6 +17,12 @@ struct CoreError: Codable, Error, LocalizedError {
 
 @MainActor
 final class CoreClient {
+    /// One protocol envelope must fit comfortably below macOS pipe pressure.
+    /// The Go helper independently bounds all potentially large responses; this
+    /// is the client-side guard against a malformed or runaway child process
+    /// retaining an unbounded partial NDJSON line on the main actor.
+    private static let maximumBufferedEnvelopeBytes = 8 * 1024 * 1024
+
     private var process: Process?
     private var input: FileHandle?
     private var buffer = Data()
@@ -24,7 +30,14 @@ final class CoreClient {
     var onEvent: ((CoreEnvelope) -> Void)?
 
     func start() throws {
-        guard process == nil else { return }
+        if let process, process.isRunning { return }
+        // Process termination is delivered asynchronously. If a new request
+        // arrives after a child has exited but before its handler reaches the
+        // main actor, discard the stale pipe and launch a fresh helper.
+        if process != nil {
+            resetTransport()
+            failOutstanding(CoreError(code: "helperExited", message: "The K9k Kubernetes helper stopped unexpectedly. Retry to relaunch it."))
+        }
         guard let executable = helperURL() else { throw CoreError(code: "helperMissing", message: "K9k’s bundled helper is missing. Run `mise run build` to bundle k9k-core.") }
         let newProcess = Process()
         newProcess.executableURL = executable
@@ -33,13 +46,17 @@ final class CoreClient {
         newProcess.standardInput = stdin
         newProcess.standardOutput = stdout
         newProcess.standardError = stderr
-        stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        stdout.fileHandleForReading.readabilityHandler = { [weak self, weak newProcess] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
-            Task { @MainActor in self?.receive(data) }
+            guard let newProcess else { return }
+            Task { @MainActor in self?.receive(data, from: newProcess) }
         }
-        newProcess.terminationHandler = { [weak self] _ in
-            Task { @MainActor in self?.failOutstanding(CoreError(code: "helperExited", message: "The K9k Kubernetes helper stopped unexpectedly.")) }
+        newProcess.terminationHandler = { [weak self, weak newProcess] _ in
+            guard let newProcess else { return }
+            Task { @MainActor in
+                self?.helperDidExit(newProcess)
+            }
         }
         try newProcess.run()
         process = newProcess
@@ -47,10 +64,10 @@ final class CoreClient {
     }
 
     func stop() {
-        process?.terminate()
-        process = nil
-        input?.closeFile()
-        input = nil
+        let current = process
+        resetTransport()
+        if current?.isRunning == true { current?.terminate() }
+        failOutstanding(CoreError(code: "helperStopped", message: "The K9k Kubernetes helper was stopped."))
     }
 
     func request(_ operation: String, parameters: JSONValue = .object([:])) async throws -> CoreEnvelope {
@@ -59,16 +76,40 @@ final class CoreClient {
         let request = CoreRequest(version: 1, id: id, operation: operation, streamID: nil, params: parameters)
         let data = try JSONEncoder().encode(request) + Data([0x0A])
         guard let input else { throw CoreError(code: "transport", message: "K9k could not write to its helper.") }
-        return try await withCheckedThrowingContinuation { continuation in
-            continuations[id] = continuation
-            input.write(data)
-        }
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                // Cancellation may have occurred while this request was
+                // queued for the main actor. Do not leave a continuation that
+                // only a future helper response could clear.
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                continuations[id] = continuation
+                do {
+                    try input.write(contentsOf: data)
+                } catch {
+                    continuations.removeValue(forKey: id)
+                    continuation.resume(throwing: CoreError(code: "transport", message: "K9k could not write to its helper."))
+                    handleBrokenTransport()
+                }
+            }
+        }, onCancel: { [weak self] in
+            Task { @MainActor in self?.cancelPendingRequest(id) }
+        })
     }
 
     func cancel(streamID: String) async { _ = try? await request("stream.cancel", parameters: .object(["streamID": .string(streamID)])) }
 
-    private func receive(_ data: Data) {
+    private func receive(_ data: Data, from sourceProcess: Process) {
+        // A buffered read from an exited helper can arrive after a successful
+        // relaunch. Never let an old child's NDJSON corrupt the new session.
+        guard process === sourceProcess else { return }
         buffer.append(data)
+        guard buffer.count <= Self.maximumBufferedEnvelopeBytes else {
+            handleProtocolViolation("The K9k Kubernetes helper sent an oversized or incomplete protocol message.")
+            return
+        }
         while let newline = buffer.firstIndex(of: 0x0A) {
             let line = buffer.prefix(upTo: newline)
             buffer.removeSubrange(...newline)
@@ -83,6 +124,39 @@ final class CoreClient {
         let pending = continuations
         continuations.removeAll()
         pending.values.forEach { $0.resume(throwing: error) }
+    }
+
+    private func cancelPendingRequest(_ id: String) {
+        continuations.removeValue(forKey: id)?.resume(throwing: CancellationError())
+    }
+
+    private func helperDidExit(_ exitedProcess: Process) {
+        // An old termination handler must never tear down a newer helper that
+        // was relaunched after a transient crash.
+        guard process === exitedProcess else { return }
+        resetTransport()
+        failOutstanding(CoreError(code: "helperExited", message: "The K9k Kubernetes helper stopped unexpectedly. Retry to relaunch it."))
+    }
+
+    private func handleBrokenTransport() {
+        let current = process
+        resetTransport()
+        if current?.isRunning == true { current?.terminate() }
+        failOutstanding(CoreError(code: "transport", message: "K9k lost its connection to the Kubernetes helper. Retry to relaunch it."))
+    }
+
+    private func handleProtocolViolation(_ message: String) {
+        let current = process
+        resetTransport()
+        if current?.isRunning == true { current?.terminate() }
+        failOutstanding(CoreError(code: "protocol", message: message))
+    }
+
+    private func resetTransport() {
+        input?.closeFile()
+        input = nil
+        process = nil
+        buffer.removeAll(keepingCapacity: false)
     }
 
     private func helperURL() -> URL? {
