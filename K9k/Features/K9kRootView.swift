@@ -18,7 +18,7 @@ struct K9kRootView: View {
         @Bindable var store = store
         NavigationSplitView {
             SidebarView(selectedResourceType: $store.selectedResourceType) { paletteIsPresented = true }
-                .navigationSplitViewColumnWidth(min: 240, ideal: 260, max: 340)
+                .navigationSplitViewColumnWidth(min: 290, ideal: 320, max: 420)
         } detail: {
             ResourceBrowserView(inspectorIsPresented: $inspectorIsPresented, destructiveConfirmation: $destructiveConfirmation)
         }

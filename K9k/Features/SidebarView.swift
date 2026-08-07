@@ -10,10 +10,24 @@ struct SidebarView: View {
             Section("Cluster") {
                 Label(store.selectedContext?.name ?? "Connecting…", systemImage: "server.rack")
                     .font(.headline)
-                resourceRows(["pods", "services", "nodes", "namespaces", "events"])
+                resourceRows(["pods", "nodes", "namespaces", "events"])
             }
-            Section("Favorites") {
-                resourceRows(["deployments", "configmaps", "secrets", "persistentvolumeclaims"])
+            Section("Workloads") {
+                resourceRows(["deployments", "statefulsets", "daemonsets", "replicasets", "jobs", "cronjobs"])
+            }
+            Section("Networking") {
+                resourceRows(["services", "ingresses", "networkpolicies", "endpointslices"])
+            }
+            Section("Configuration") {
+                resourceRows(["configmaps", "secrets", "serviceaccounts"])
+            }
+            Section("Storage") {
+                resourceRows(["persistentvolumeclaims", "persistentvolumes", "storageclasses"])
+            }
+            Section("Access") {
+                resourceRows(["roles", "rolebindings", "clusterroles", "clusterrolebindings"])
+            }
+            Section {
                 Button(action: browseResources) {
                     Label("Browse All Resources…", systemImage: "square.grid.2x2")
                 }
@@ -54,6 +68,8 @@ struct SidebarView: View {
         case "deployments", "daemonsets", "statefulsets", "replicasets": "cube.box"
         case "services", "ingresses", "endpoints": "point.3.connected.trianglepath.dotted"
         case "configmaps", "secrets": "doc.text"
+        case "persistentvolumeclaims", "persistentvolumes", "storageclasses": "externaldrive"
+        case "roles", "rolebindings", "clusterroles", "clusterrolebindings", "serviceaccounts": "lock.shield"
         case "nodes": "server.rack"
         default: "cube"
         }
