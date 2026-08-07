@@ -11,24 +11,33 @@ struct ResourceInspectorView: View {
     enum InspectorSection: String, CaseIterable, Identifiable { case overview = "Overview", events = "Events", raw = "Raw JSON", metadata = "Metadata"; var id: String { rawValue } }
 
     var body: some View {
-        if let resource {
-            VStack(spacing: 0) {
-                Picker("Inspector section", selection: $section) { ForEach(InspectorSection.allCases) { Text($0.rawValue).tag($0) } }
-                    .pickerStyle(.segmented)
-                    .padding()
-                Divider()
-                ScrollView {
-                    switch section {
-                    case .overview: overview(resource)
-                    case .events: eventList
-                    case .raw: rawJSON(resource)
-                    case .metadata: metadata(resource)
+        Group {
+            if let resource {
+                VStack(spacing: 0) {
+                    Picker("Inspector section", selection: $section) { ForEach(InspectorSection.allCases) { Text($0.rawValue).tag($0) } }
+                        .pickerStyle(.segmented)
+                        .padding()
+                    Divider()
+                    ScrollView {
+                        switch section {
+                        case .overview: overview(resource)
+                        case .events: eventList
+                        case .raw: rawJSON(resource)
+                        case .metadata: metadata(resource)
+                        }
                     }
                 }
+                .navigationTitle(resource.name)
+            } else {
+                ContentUnavailableView("No Selection", systemImage: "sidebar.right", description: Text("Select a \(type?.kind ?? "resource") to inspect its status, metadata, and raw Kubernetes object."))
             }
-            .navigationTitle(resource.name)
-        } else {
-            ContentUnavailableView("No Selection", systemImage: "sidebar.right", description: Text("Select a \(type?.kind ?? "resource") to inspect its status, metadata, and raw Kubernetes object."))
+        }
+        .task(id: resource?.id) {
+            guard let resource else { return }
+            while !Task.isCancelled {
+                await store.loadEvents(for: resource)
+                try? await Task.sleep(for: .seconds(5))
+            }
         }
     }
 
