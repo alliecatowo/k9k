@@ -32,10 +32,12 @@ struct SyntaxHighlightedTextView: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView else { return }
+        // Inspector event polling and access refreshes can re-render this
+        // representable frequently. Avoid running every syntax regexp across a
+        // large manifest unless the source itself changed.
+        guard textView.string != source else { return }
         let highlighted = source.highlighted(as: language)
-        if textView.attributedString() != highlighted {
-            textView.textStorage?.setAttributedString(highlighted)
-        }
+        textView.textStorage?.setAttributedString(highlighted)
     }
 }
 
