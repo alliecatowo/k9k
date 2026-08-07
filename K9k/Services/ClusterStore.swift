@@ -9,7 +9,7 @@ final class ClusterStore {
     var namespaces: [String] = ["All Namespaces"]
     var discoveredResources: [ResourceType] = []
     var selectedContext: KubeContext?
-    var selectedNamespace = "All Namespaces"
+    var selectedNamespace = UserDefaults.standard.string(forKey: "k9k.selectedNamespace") ?? "All Namespaces" { didSet { UserDefaults.standard.set(selectedNamespace, forKey: "k9k.selectedNamespace") } }
     var selectedResourceType: ResourceType?
     var resources: [ResourceSummary] = []
     var selectedResources = Set<ResourceSummary.ID>()
@@ -17,7 +17,7 @@ final class ClusterStore {
     var labelSelector = ""
     var errorMessage: String?
     var isLoading = false
-    var isReadOnly = false
+    var isReadOnly = UserDefaults.standard.bool(forKey: "k9k.readOnly") { didSet { UserDefaults.standard.set(isReadOnly, forKey: "k9k.readOnly") } }
     var activeStreamID: String?
     var k9sAliases: [K9sAlias] = []
     var k9sConfig: K9sConfigSummary?
@@ -107,7 +107,10 @@ final class ClusterStore {
     }
 
     func loadNamespaces() async {
-        do { namespaces = ["All Namespaces"] + (try decodeArray((try await client.request("namespace.list")).result, as: String.self)) }
+        do {
+            namespaces = ["All Namespaces"] + (try decodeArray((try await client.request("namespace.list")).result, as: String.self))
+            if !namespaces.contains(selectedNamespace) { selectedNamespace = "All Namespaces" }
+        }
         catch { errorMessage = error.localizedDescription }
     }
 
