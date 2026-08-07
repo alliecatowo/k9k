@@ -27,12 +27,6 @@ struct SidebarView: View {
             Section("Access") {
                 resourceRows(["roles", "rolebindings", "clusterroles", "clusterrolebindings"])
             }
-            Section("Tools") {
-                Button { Task { await store.openHelmReleases() } } label: {
-                    Label("Helm Releases", systemImage: "shippingbox.and.arrow.backward")
-                }
-                .accessibilityHint("Show Helm release storage in the selected cluster")
-            }
             Section {
                 Button(action: browseResources) {
                     Label("Browse All Resources…", systemImage: "square.grid.2x2")

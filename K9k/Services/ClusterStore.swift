@@ -51,6 +51,10 @@ final class ClusterStore {
     var resourceMetrics: ResourceMetrics?
     var metricsUnavailableMessage: String?
     var isLoadingMetrics = false
+    var pulseNodeMetrics: [ResourceMetrics] = []
+    var pulsePodMetrics: [ResourceMetrics] = []
+    var pulseMetricsUnavailableMessage: String?
+    var isLoadingPulseMetrics = false
     var deleteAccess: AccessReview?
     var isCheckingDeleteAccess = false
     var scaleAccess: AccessReview?
@@ -921,6 +925,31 @@ final class ClusterStore {
             metricsUnavailableMessage = error.message
         } catch {
             metricsUnavailableMessage = "K9k could not load metrics: \(error.localizedDescription)"
+        }
+    }
+
+    /// Pulse samples the two cluster-wide metrics collections. It is kept
+    /// independent from selection metrics so switching a resource never
+    /// interrupts the operator's rolling cluster observation.
+    func loadPulseMetrics() async {
+        isLoadingPulseMetrics = true
+        defer { isLoadingPulseMetrics = false }
+        pulseMetricsUnavailableMessage = nil
+        do {
+            async let nodesEnvelope = client.request("metrics.list", parameters: .object(["resource": .string("nodes")]))
+            async let podsEnvelope = client.request("metrics.list", parameters: .object(["resource": .string("pods")]))
+            let nodes = try decode((try await nodesEnvelope).result, as: MetricsListResponse.self)
+            let pods = try decode((try await podsEnvelope).result, as: MetricsListResponse.self)
+            pulseNodeMetrics = nodes.items
+            pulsePodMetrics = pods.items
+        } catch let error as CoreError where error.code == "metrics_unavailable" {
+            pulseNodeMetrics = []
+            pulsePodMetrics = []
+            pulseMetricsUnavailableMessage = error.message
+        } catch {
+            pulseNodeMetrics = []
+            pulsePodMetrics = []
+            pulseMetricsUnavailableMessage = "K9k could not load cluster metrics: \(error.localizedDescription)"
         }
     }
 
