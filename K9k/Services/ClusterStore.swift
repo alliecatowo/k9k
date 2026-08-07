@@ -870,28 +870,78 @@ final class ClusterStore {
         activeLogStreamID = nil
     }
 
-    func openPortForward(for resource: ResourceSummary, remotePort: Int, localPort: Int = 0) async {
-        guard resource.kind == "Pod", let namespace = resource.namespace else { return }
+    func openPortForward(for resource: ResourceSummary, remotePort: Int, localPort: Int = 0) async -> PortForwardBinding? {
+        guard let namespace = resource.namespace else { return nil }
         guard (1...65535).contains(remotePort), (0...65535).contains(localPort) else {
             errorMessage = "Ports must be between 1 and 65535 (or use 0 for an automatic local port)."
-            return
+            return nil
+        }
+        let target: (pod: ResourceSummary, remotePort: Int)
+        do {
+            if resource.kind == "Service" { target = try await resolveServiceForward(resource, servicePort: remotePort) }
+            else if resource.kind == "Pod" { target = (resource, remotePort) }
+            else { return nil }
+        } catch {
+            errorMessage = error.localizedDescription
+            return nil
         }
         let streamID = UUID().uuidString
         do {
             let result = try await client.request("portforward.open", parameters: .object([
                 "streamID": .string(streamID),
                 "namespace": .string(namespace),
-                "pod": .string(resource.name),
-                "remotePort": .number(Double(remotePort)),
+                "pod": .string(target.pod.name),
+                "remotePort": .number(Double(target.remotePort)),
                 "localPort": .number(Double(localPort)),
                 "localAddress": .string("127.0.0.1")
             ]))
             let binding = try decode(result.result, as: PortForwardBinding.self)
             activePortForwards.removeAll { $0.streamID == streamID }
             activePortForwards.append(ActivePortForward(streamID: streamID, binding: binding))
+            return binding
         } catch {
             errorMessage = error.localizedDescription
+            return nil
         }
+    }
+
+    /// Kubernetes port-forward itself only targets Pods. For a Service, match
+    /// its selector against Pods locally through the helper and translate the
+    /// chosen Service port to a numeric target port before opening that same
+    /// direct SPDY tunnel. A selector-less or named-but-unresolvable Service is
+    /// surfaced instead of guessing an endpoint.
+    private func resolveServiceForward(_ service: ResourceSummary, servicePort: Int) async throws -> (pod: ResourceSummary, remotePort: Int) {
+        guard let namespace = service.namespace,
+              let spec = service.raw?.objectValue?["spec"]?.objectValue,
+              let selectorObject = spec["selector"]?.objectValue,
+              !selectorObject.isEmpty else {
+            throw NSError(domain: "K9k", code: 1, userInfo: [NSLocalizedDescriptionKey: "This Service has no Pod selector, so K9k cannot choose a port-forward target."])
+        }
+        let selector = selectorObject.compactMap { key, value in value.stringValue.map { "\(key)=\($0)" } }.sorted().joined(separator: ",")
+        let pods: [ResourceSummary] = try decodeArray(
+            (try await client.request("resource.list", parameters: .object([
+                "gvr": .string("v1/pods"), "namespaced": .bool(true), "namespace": .string(namespace), "selector": .string(selector),
+            ]))).result,
+            as: ResourceSummary.self
+        )
+        guard let pod = pods.sorted(by: { $0.name < $1.name }).first(where: { $0.status == "Running" }) ?? pods.sorted(by: { $0.name < $1.name }).first else {
+            throw NSError(domain: "K9k", code: 2, userInfo: [NSLocalizedDescriptionKey: "No Pods match this Service selector in \(namespace)."])
+        }
+        let ports = spec["ports"]?.arrayValue ?? []
+        guard let servicePortSpec = ports.first(where: { $0.objectValue?["port"]?.intValue == servicePort })?.objectValue else {
+            throw NSError(domain: "K9k", code: 3, userInfo: [NSLocalizedDescriptionKey: "Port \(servicePort) is not exposed by Service \(service.name)."])
+        }
+        if let targetPort = servicePortSpec["targetPort"]?.intValue { return (pod, targetPort) }
+        if let targetName = servicePortSpec["targetPort"]?.stringValue {
+            let containers = pod.raw?.objectValue?["spec"]?.objectValue?["containers"]?.arrayValue ?? []
+            for container in containers {
+                if let port = container.objectValue?["ports"]?.arrayValue?.first(where: { $0.objectValue?["name"]?.stringValue == targetName })?.objectValue?["containerPort"]?.intValue {
+                    return (pod, port)
+                }
+            }
+            throw NSError(domain: "K9k", code: 4, userInfo: [NSLocalizedDescriptionKey: "Service target port \"\(targetName)\" is not declared by Pod \(pod.name)."])
+        }
+        return (pod, servicePort)
     }
 
     func closePortForward(streamID: String) async {

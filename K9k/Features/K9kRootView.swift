@@ -252,6 +252,9 @@ struct K9kRootView: View {
                     Button("Debug Container…") { debugPresented = true }
                         .disabled(!store.canDebugSelectedPod)
                 }
+                if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Service" {
+                    Button("Port Forward…") { portForwardPresented = true }
+                }
                 if store.selectedResourceType?.gvr == "batch/v1/cronjobs", !store.selectedResources.isEmpty {
                     Button("Trigger CronJob…", role: .destructive) { cronJobTriggerConfirmation = true }
                         .disabled(!store.canTriggerSelectedCronJob)
