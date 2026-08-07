@@ -5,6 +5,11 @@ struct LogStreamView: View {
     let resource: ResourceSummary
     @Environment(\.dismiss) private var dismiss
     @State private var isFollowing = true
+    @State private var selectedContainer = ""
+    @State private var previous = false
+    @State private var timestamps = true
+
+    private var containers: [String] { resource.raw?.objectValue?["spec"]?.objectValue?["containers"]?.arrayValue?.compactMap { $0.objectValue?["name"]?.stringValue } ?? [] }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -14,7 +19,13 @@ struct LogStreamView: View {
                     Text("\(resource.namespace ?? "") · live pod logs").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+                if containers.count > 1 {
+                    Picker("Container", selection: $selectedContainer) { ForEach(containers, id: \.self) { Text($0).tag($0) } }.frame(maxWidth: 160)
+                }
+                Toggle("Previous", isOn: $previous).toggleStyle(.switch)
+                Toggle("Timestamps", isOn: $timestamps).toggleStyle(.switch)
                 Toggle("Follow", isOn: $isFollowing).toggleStyle(.switch)
+                Button("Reload") { Task { await store.openLogs(for: resource, container: selectedContainer, previous: previous, timestamps: timestamps) } }
                 Button("Close") { dismiss() }
             }
             .padding()
@@ -32,7 +43,7 @@ struct LogStreamView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 440)
-        .task { await store.openLogs(for: resource) }
+        .task { selectedContainer = containers.first ?? ""; await store.openLogs(for: resource, container: selectedContainer, previous: previous, timestamps: timestamps) }
         .onDisappear { Task { await store.closeLogs() } }
     }
 }

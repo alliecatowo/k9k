@@ -544,7 +544,7 @@ final class ClusterStore {
         }
     }
 
-    func openLogs(for resource: ResourceSummary) async {
+    func openLogs(for resource: ResourceSummary, container: String = "", previous: Bool = false, timestamps: Bool = true) async {
         guard resource.kind == "Pod", let namespace = resource.namespace else { return }
         if let activeLogStreamID { await client.cancel(streamID: activeLogStreamID) }
         let streamID = UUID().uuidString
@@ -552,7 +552,7 @@ final class ClusterStore {
         activeLogStreamID = streamID
         do {
             _ = try await client.request("logs.open", parameters: .object([
-                "streamID": .string(streamID), "namespace": .string(namespace), "pod": .string(resource.name), "follow": .bool(true), "timestamps": .bool(true), "tailLines": .number(500)
+                "streamID": .string(streamID), "namespace": .string(namespace), "pod": .string(resource.name), "container": .string(container), "previous": .bool(previous), "follow": .bool(true), "timestamps": .bool(timestamps), "tailLines": .number(500)
             ]))
         } catch { errorMessage = error.localizedDescription }
     }
