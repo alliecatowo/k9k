@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/k9k-app/k9k/backend/internal/api"
+	appsv1 "k8s.io/api/apps/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -112,6 +113,50 @@ func TestTriggerCronJobCreatesOwnedJobFromTemplate(t *testing.T) {
 	}
 	if len(job.Spec.Template.Spec.Containers) != 1 || job.Spec.Template.Spec.Containers[0].Image != "busybox:1.36" {
 		t.Errorf("job template = %#v", job.Spec.Template.Spec)
+	}
+}
+
+func TestRollbackDeploymentReplacesCompleteTemplateFromInactiveReplicaSet(t *testing.T) {
+	controller := true
+	replicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "web-old", Namespace: "demo", UID: types.UID("rs-uid"), OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "web", Controller: &controller}}},
+		Spec:       appsv1.ReplicaSetSpec{Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "web"}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "nginx:1.27"}}}}},
+		Status:     appsv1.ReplicaSetStatus{Replicas: 0},
+	}
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "demo"},
+		Spec:       appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "web"}, Annotations: map[string]string{"new": "annotation"}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "nginx:new"}}}}},
+	}
+	typed := fake.NewSimpleClientset(replicaSet, deployment)
+	cluster := &Cluster{typed: typed}
+	result, err := cluster.RollbackDeployment(context.Background(), api.DeploymentRollbackRequest{Namespace: "demo", ReplicaSet: "web-old", ExpectedRSUID: "rs-uid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := result, (api.DeploymentRollbackResult{Namespace: "demo", Deployment: "web", ReplicaSet: "web-old"}); got != want {
+		t.Errorf("result = %#v, want %#v", got, want)
+	}
+	updated, err := typed.AppsV1().Deployments("demo").Get(context.Background(), "web", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := updated.Spec.Template.Annotations; len(got) != 0 {
+		t.Errorf("rollback retained newer template annotations: %#v", got)
+	}
+	if got := updated.Spec.Template.Spec.Containers[0].Image; got != "nginx:1.27" {
+		t.Errorf("rollback image = %q", got)
+	}
+}
+
+func TestRollbackDeploymentRejectsActiveOrStaleReplicaSet(t *testing.T) {
+	controller := true
+	replicaSet := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "demo", UID: types.UID("rs-uid"), OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "web", Controller: &controller}}}, Status: appsv1.ReplicaSetStatus{Replicas: 1}}
+	cluster := &Cluster{typed: fake.NewSimpleClientset(replicaSet)}
+	if _, err := cluster.RollbackDeployment(context.Background(), api.DeploymentRollbackRequest{Namespace: "demo", ReplicaSet: "web", ExpectedRSUID: "wrong"}); err == nil {
+		t.Fatal("stale ReplicaSet UID was accepted")
+	}
+	if _, err := cluster.RollbackDeployment(context.Background(), api.DeploymentRollbackRequest{Namespace: "demo", ReplicaSet: "web", ExpectedRSUID: "rs-uid"}); err == nil {
+		t.Fatal("active ReplicaSet was accepted")
 	}
 }
 

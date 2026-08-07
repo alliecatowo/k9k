@@ -237,6 +237,21 @@ type CronJobTriggerResult struct {
 	Job       string `json:"job"`
 }
 
+// DeploymentRollbackRequest restores a Deployment's pod template from a
+// selected inactive ReplicaSet. The UID makes a stale row (deleted/recreated
+// at the same name) fail safely instead of rolling back an unrelated object.
+type DeploymentRollbackRequest struct {
+	Namespace     string `json:"namespace"`
+	ReplicaSet    string `json:"replicaSet"`
+	ExpectedRSUID string `json:"expectedRSUID"`
+}
+
+type DeploymentRollbackResult struct {
+	Namespace  string `json:"namespace"`
+	Deployment string `json:"deployment"`
+	ReplicaSet string `json:"replicaSet"`
+}
+
 // PortForwardRequest describes one pod port-forward owned by the helper. The
 // local address is always loopback-only; K9k deliberately never turns a pod
 // port into a network-reachable listener without an explicit Kubernetes

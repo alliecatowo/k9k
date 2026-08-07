@@ -45,6 +45,7 @@ type fakeCluster struct {
 	drainErr                                            error
 	debugErr                                            error
 	triggerCronJobErr                                   error
+	rollbackDeploymentErr                               error
 	execErr                                             error
 	manifestErr, applyManifestErr                       error
 
@@ -64,6 +65,7 @@ type fakeCluster struct {
 	drains          []NodeDrainRequest
 	debugs          []PodDebugRequest
 	cronJobTriggers []CronJobTriggerRequest
+	rollbacks       []DeploymentRollbackRequest
 	execs           []PodExecRequest
 	execFn          func(context.Context, PodExecRequest, PodExecStreams) error
 	manifests       []resourceCall
@@ -246,6 +248,13 @@ func (f *fakeCluster) TriggerCronJob(_ context.Context, request CronJobTriggerRe
 		return CronJobTriggerResult{}, f.triggerCronJobErr
 	}
 	return CronJobTriggerResult{Namespace: request.Namespace, CronJob: request.CronJob, Job: request.CronJob + "-manual-abc"}, nil
+}
+
+func (f *fakeCluster) RollbackDeployment(_ context.Context, request DeploymentRollbackRequest) (DeploymentRollbackResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rollbacks = append(f.rollbacks, request)
+	return DeploymentRollbackResult{Namespace: request.Namespace, Deployment: "web", ReplicaSet: request.ReplicaSet}, f.rollbackDeploymentErr
 }
 
 func (f *fakeCluster) CheckAccess(_ context.Context, check AccessCheck) (AccessReview, error) {
@@ -781,6 +790,27 @@ func TestServerCronJobTriggerRequiresConfirmation(t *testing.T) {
 	defer client.mu.Unlock()
 	if got := client.cronJobTriggers; len(got) != 1 || got[0] != (CronJobTriggerRequest{Namespace: "demo", CronJob: "nightly"}) {
 		t.Errorf("CronJob triggers = %#v", got)
+	}
+}
+
+func TestServerDeploymentRollbackRequiresConfirmationAndPinsRevision(t *testing.T) {
+	client := &fakeCluster{}
+	params := map[string]any{"namespace": "demo", "replicaSet": "web-old", "expectedRSUID": "rs-uid"}
+	confirmed := map[string]any{"namespace": "demo", "replicaSet": "web-old", "expectedRSUID": "rs-uid", "confirm": true}
+	responses := runRequests(t, client,
+		request("missing", "deployment.rollback", params),
+		request("confirmed", "deployment.rollback", confirmed),
+	)
+	if got := envelopeByID(t, responses, "missing").Error; got == nil || got.Code != "confirmation_required" {
+		t.Errorf("unconfirmed rollback = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "confirmed").Error; got != nil {
+		t.Errorf("confirmed rollback = %#v", got)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if got, want := client.rollbacks, []DeploymentRollbackRequest{{Namespace: "demo", ReplicaSet: "web-old", ExpectedRSUID: "rs-uid"}}; len(got) != 1 || got[0] != want[0] {
+		t.Errorf("rollbacks = %#v, want %#v", got, want)
 	}
 }
 

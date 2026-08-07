@@ -56,6 +56,7 @@ type ClusterClient interface {
 	DrainNode(context.Context, NodeDrainRequest) (NodeDrainResult, error)
 	DebugPod(context.Context, PodDebugRequest) (PodDebugResult, error)
 	TriggerCronJob(context.Context, CronJobTriggerRequest) (CronJobTriggerResult, error)
+	RollbackDeployment(context.Context, DeploymentRollbackRequest) (DeploymentRollbackResult, error)
 	CheckAccess(context.Context, AccessCheck) (AccessReview, error)
 	PortForward(context.Context, PortForwardRequest, func(PortForwardBinding)) error
 	PodExec(context.Context, PodExecRequest, PodExecStreams) error
@@ -659,6 +660,26 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 		result, triggerErr := s.cluster.TriggerCronJob(ctx, params.CronJobTriggerRequest)
 		if triggerErr != nil {
 			return nil, kubeError(triggerErr)
+		}
+		return result, nil
+	case "deployment.rollback":
+		var params struct {
+			DeploymentRollbackRequest
+			Confirm bool `json:"confirm"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		params.Namespace, params.ReplicaSet, params.ExpectedRSUID = strings.TrimSpace(params.Namespace), strings.TrimSpace(params.ReplicaSet), strings.TrimSpace(params.ExpectedRSUID)
+		if params.Namespace == "" || params.ReplicaSet == "" || params.ExpectedRSUID == "" {
+			return nil, invalidParams(errors.New("namespace, replicaSet, and expectedRSUID are required"))
+		}
+		if !params.Confirm {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("deployment rollback requires confirm: true")}
+		}
+		result, rollbackErr := s.cluster.RollbackDeployment(ctx, params.DeploymentRollbackRequest)
+		if rollbackErr != nil {
+			return nil, kubeError(rollbackErr)
 		}
 		return result, nil
 	case "rbac.check":

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/k9k-app/k9k/backend/internal/api"
+	appsv1 "k8s.io/api/apps/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -698,6 +699,51 @@ func (c *Cluster) TriggerCronJob(ctx context.Context, request api.CronJobTrigger
 		return api.CronJobTriggerResult{}, err
 	}
 	return api.CronJobTriggerResult{Namespace: request.Namespace, CronJob: cronJob.Name, Job: created.Name}, nil
+}
+
+// RollbackDeployment mirrors K9s' ReplicaSet rollback guard while using only
+// typed client-go operations. Updating the Deployment object (rather than a
+// merge patch) intentionally replaces the full PodTemplateSpec, including
+// removing template annotations that did not exist in the selected revision.
+func (c *Cluster) RollbackDeployment(ctx context.Context, request api.DeploymentRollbackRequest) (api.DeploymentRollbackResult, error) {
+	c.mu.RLock()
+	typed := c.typed
+	c.mu.RUnlock()
+	if typed == nil {
+		return api.DeploymentRollbackResult{}, fmt.Errorf("no usable Kubernetes context is selected")
+	}
+	replicaSet, err := typed.AppsV1().ReplicaSets(request.Namespace).Get(ctx, request.ReplicaSet, metav1.GetOptions{})
+	if err != nil {
+		return api.DeploymentRollbackResult{}, err
+	}
+	if string(replicaSet.UID) != request.ExpectedRSUID {
+		return api.DeploymentRollbackResult{}, fmt.Errorf("ReplicaSet %q no longer matches the selected revision", request.ReplicaSet)
+	}
+	if replicaSet.Status.Replicas != 0 {
+		return api.DeploymentRollbackResult{}, fmt.Errorf("cannot roll back active ReplicaSet %q", request.ReplicaSet)
+	}
+	deploymentName, err := deploymentOwner(replicaSet)
+	if err != nil {
+		return api.DeploymentRollbackResult{}, err
+	}
+	deployment, err := typed.AppsV1().Deployments(request.Namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+	if err != nil {
+		return api.DeploymentRollbackResult{}, err
+	}
+	deployment.Spec.Template = *replicaSet.Spec.Template.DeepCopy()
+	if _, err := typed.AppsV1().Deployments(request.Namespace).Update(ctx, deployment, metav1.UpdateOptions{}); err != nil {
+		return api.DeploymentRollbackResult{}, err
+	}
+	return api.DeploymentRollbackResult{Namespace: request.Namespace, Deployment: deploymentName, ReplicaSet: replicaSet.Name}, nil
+}
+
+func deploymentOwner(replicaSet *appsv1.ReplicaSet) (string, error) {
+	for _, owner := range replicaSet.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller && owner.APIVersion == "apps/v1" && owner.Kind == "Deployment" && owner.Name != "" {
+			return owner.Name, nil
+		}
+	}
+	return "", fmt.Errorf("ReplicaSet %q is not controlled by a Deployment", replicaSet.Name)
 }
 
 func cloneStringMap(values map[string]string) map[string]string {

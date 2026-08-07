@@ -2,6 +2,14 @@ import Foundation
 import Observation
 import AppKit
 
+private struct RollbackSource {
+    let replicaSet: ResourceSummary
+    let deploymentType: ResourceType
+    let namespace: String
+    let deployment: String
+    let revision: String?
+}
+
 @MainActor
 @Observable
 final class ClusterStore {
@@ -49,6 +57,8 @@ final class ClusterStore {
     var isCheckingScaleAccess = false
     var restartAccess: AccessReview?
     var isCheckingRestartAccess = false
+    var rollbackAccess: AccessReview?
+    var isCheckingRollbackAccess = false
     var cronJobTriggerAccess: AccessReview?
     var nodePatchAccess: AccessReview?
     var nodeDrainAccess: AccessReview?
@@ -58,6 +68,7 @@ final class ClusterStore {
     private var deleteAccessGeneration = 0
     private var scaleAccessGeneration = 0
     private var restartAccessGeneration = 0
+    private var rollbackAccessGeneration = 0
     private var execAccessGeneration = 0
     private var manifestAccessGeneration = 0
     private var terminalOutputSink: ((Data) -> Void)?
@@ -247,6 +258,7 @@ final class ClusterStore {
         deleteAccess = nil
         scaleAccess = nil
         restartAccess = nil
+        rollbackAccess = nil
         execAccess = nil
         manifestAccess = nil
         relationshipGraph = nil
@@ -343,6 +355,18 @@ final class ClusterStore {
     }
 
     var isSelectedResourceRestartable: Bool { selectedRestartableResource != nil }
+
+    /// K9s exposes rollback on an inactive ReplicaSet. The source revision must
+    /// be owned by a Deployment and have no live replicas, so this cannot
+    /// accidentally replace the active Deployment template with itself.
+    var canRollbackSelected: Bool {
+        !isReadOnly && selectedRollbackSource != nil && rollbackAccess?.allowed == true
+    }
+
+    var selectedRollbackDescription: String? {
+        guard let source = selectedRollbackSource else { return nil }
+        return "Deployment \(source.deployment) will receive the Pod template from inactive ReplicaSet \(source.replicaSet.name)\(source.revision.map { " (revision \($0))" } ?? "")."
+    }
 
     var selectedCronJobResource: ResourceSummary? {
         guard selectedResourceType?.gvr == "batch/v1/cronjobs",
@@ -510,6 +534,54 @@ final class ClusterStore {
         ])
         do {
             _ = try await client.request("resource.patch", parameters: operationParameters(type: type, resource: resource, additional: ["patch": patch]))
+            await loadResources()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func updateRollbackAccess() async {
+        rollbackAccessGeneration &+= 1
+        let generation = rollbackAccessGeneration
+        guard let source = selectedRollbackSource else {
+            rollbackAccess = nil
+            isCheckingRollbackAccess = false
+            return
+        }
+        isCheckingRollbackAccess = true
+        defer {
+            if generation == rollbackAccessGeneration { isCheckingRollbackAccess = false }
+        }
+        do {
+            let review = try decode(
+                (try await client.request("rbac.check", parameters: .object([
+                    "verb": .string("patch"), "gvr": .string(source.deploymentType.gvr),
+                    "namespace": .string(source.namespace), "name": .string(source.deployment),
+                ]))).result,
+                as: AccessReview.self
+            )
+            if generation == rollbackAccessGeneration { rollbackAccess = review }
+        } catch {
+            if generation == rollbackAccessGeneration {
+                rollbackAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify permission to roll back this Deployment: \(error.localizedDescription)", evaluationError: nil)
+            }
+        }
+    }
+
+    func rollbackSelected() async {
+        guard !isReadOnly, let source = selectedRollbackSource else { return }
+        await updateRollbackAccess()
+        guard canRollbackSelected else {
+            errorMessage = rollbackAccess?.reason ?? "The active Kubernetes identity is not authorized to roll back this Deployment."
+            return
+        }
+        do {
+            _ = try await client.request("deployment.rollback", parameters: .object([
+                "namespace": .string(source.namespace),
+                "replicaSet": .string(source.replicaSet.name),
+                "expectedRSUID": .string(source.replicaSet.uid),
+                "confirm": .bool(true),
+            ]))
             await loadResources()
         } catch {
             errorMessage = error.localizedDescription
@@ -965,6 +1037,29 @@ final class ClusterStore {
               selectedResources.count == 1,
               let id = selectedResources.first else { return nil }
         return resource(for: id)
+    }
+
+    private var selectedRollbackSource: RollbackSource? {
+        guard selectedResourceType?.gvr == "apps/v1/replicasets",
+              selectedResources.count == 1,
+              let resource = selectedSelectedResource,
+              let namespace = resource.namespace,
+              let raw = resource.raw?.objectValue,
+              (raw["status"]?.objectValue?["replicas"]?.intValue ?? 0) == 0,
+              raw["spec"]?.objectValue?["template"]?.objectValue != nil,
+              let deploymentType = resourceType(forGVR: "apps/v1/deployments")
+        else { return nil }
+        let owners = raw["metadata"]?.objectValue?["ownerReferences"]?.arrayValue ?? []
+        guard let owner = owners.first(where: { owner in
+            let value = owner.objectValue
+            return value?["controller"]?.boolValue == true &&
+                value?["apiVersion"]?.stringValue == "apps/v1" &&
+                value?["kind"]?.stringValue == "Deployment" &&
+                !(value?["name"]?.stringValue ?? "").isEmpty
+        })?.objectValue,
+        let deployment = owner["name"]?.stringValue else { return nil }
+        let revision = raw["metadata"]?.objectValue?["annotations"]?.objectValue?["deployment.kubernetes.io/revision"]?.stringValue
+        return RollbackSource(replicaSet: resource, deploymentType: deploymentType, namespace: namespace, deployment: deployment, revision: revision)
     }
 
     private var selectedPodResource: ResourceSummary? {

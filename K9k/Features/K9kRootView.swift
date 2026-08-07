@@ -9,6 +9,7 @@ struct K9kRootView: View {
     @State private var portForwardPresented = false
     @State private var scalePresented = false
     @State private var restartConfirmation = false
+    @State private var rollbackConfirmation = false
     @State private var cronJobTriggerConfirmation = false
     @State private var terminalPresented = false
     @State private var terminalMode: PodTerminalMode = .shell
@@ -37,6 +38,7 @@ struct K9kRootView: View {
                 await store.updateDeleteAccess()
                 await store.updateScaleAccess()
                 await store.updateRestartAccess()
+                await store.updateRollbackAccess()
                 await store.updateCronJobTriggerAccess()
                 await store.updateExecAccess()
                 await store.updateAttachAccess()
@@ -49,6 +51,7 @@ struct K9kRootView: View {
         .modifier(rootPresentations(
             destructiveConfirmation: $destructiveConfirmation,
             restartConfirmation: $restartConfirmation,
+            rollbackConfirmation: $rollbackConfirmation,
             cronJobTriggerConfirmation: $cronJobTriggerConfirmation,
             nodeCordonConfirmation: $nodeCordonConfirmation,
             paletteIsPresented: $paletteIsPresented,
@@ -83,14 +86,14 @@ struct K9kRootView: View {
     }
 
     private func rootPresentations(
-        destructiveConfirmation: Binding<Bool>, restartConfirmation: Binding<Bool>, cronJobTriggerConfirmation: Binding<Bool>, nodeCordonConfirmation: Binding<Bool>,
+        destructiveConfirmation: Binding<Bool>, restartConfirmation: Binding<Bool>, rollbackConfirmation: Binding<Bool>, cronJobTriggerConfirmation: Binding<Bool>, nodeCordonConfirmation: Binding<Bool>,
         paletteIsPresented: Binding<Bool>, logsPresented: Binding<Bool>, portForwardPresented: Binding<Bool>, portForwardListPresented: Binding<Bool>,
         scalePresented: Binding<Bool>, terminalPresented: Binding<Bool>, terminalMode: Binding<PodTerminalMode>, manifestEditorPresented: Binding<Bool>,
         relationshipsPresented: Binding<Bool>, nodeDrainPresented: Binding<Bool>, debugPresented: Binding<Bool>, resourceSelectorsPresented: Binding<Bool>,
         pluginToRun: Binding<K9sPlugin?>, manifestImportPresented: Binding<Bool>
     ) -> some ViewModifier {
         RootPresentations(
-            destructiveConfirmation: destructiveConfirmation, restartConfirmation: restartConfirmation, cronJobTriggerConfirmation: cronJobTriggerConfirmation,
+            destructiveConfirmation: destructiveConfirmation, restartConfirmation: restartConfirmation, rollbackConfirmation: rollbackConfirmation, cronJobTriggerConfirmation: cronJobTriggerConfirmation,
             nodeCordonConfirmation: nodeCordonConfirmation, paletteIsPresented: paletteIsPresented, logsPresented: logsPresented,
             portForwardPresented: portForwardPresented, portForwardListPresented: portForwardListPresented, scalePresented: scalePresented,
             terminalPresented: terminalPresented, terminalMode: terminalMode, manifestEditorPresented: manifestEditorPresented,
@@ -103,6 +106,7 @@ struct K9kRootView: View {
         @Environment(ClusterStore.self) private var store
         @Binding var destructiveConfirmation: Bool
         @Binding var restartConfirmation: Bool
+        @Binding var rollbackConfirmation: Bool
         @Binding var cronJobTriggerConfirmation: Bool
         @Binding var nodeCordonConfirmation: Bool
         @Binding var paletteIsPresented: Bool
@@ -128,6 +132,9 @@ struct K9kRootView: View {
         .confirmationDialog("Restart selected workload?", isPresented: $restartConfirmation, titleVisibility: .visible) {
             Button("Restart", role: .destructive) { Task { await store.restartSelected() } }
         } message: { Text("K9k updates the Pod template restart timestamp, which rolls this workload's Pods.") }
+        .confirmationDialog("Roll back selected Deployment?", isPresented: $rollbackConfirmation, titleVisibility: .visible) {
+            Button("Roll Back", role: .destructive) { Task { await store.rollbackSelected() } }
+        } message: { Text(store.selectedRollbackDescription ?? "K9k will replace this Deployment's Pod template with the selected inactive ReplicaSet revision.") }
         .confirmationDialog("Trigger selected CronJob?", isPresented: $cronJobTriggerConfirmation, titleVisibility: .visible) {
             Button("Create Job", role: .destructive) { Task { await store.triggerSelectedCronJob() } }
         } message: { Text("K9k will create one Job from the CronJob's current template in \(store.selectedContext?.name ?? "the active context").") }
@@ -266,6 +273,10 @@ struct K9kRootView: View {
                 if store.isSelectedResourceRestartable {
                     Button("Restart…", role: .destructive) { restartConfirmation = true }
                         .disabled(!store.canRestartSelected)
+                }
+                if store.selectedRollbackDescription != nil {
+                    Button("Roll Back to This Revision…", role: .destructive) { rollbackConfirmation = true }
+                        .disabled(!store.canRollbackSelected)
                 }
                 if let node = store.selectedNodeResource {
                     if node.raw?.objectValue?["spec"]?.objectValue?["unschedulable"]?.boolValue == true {
