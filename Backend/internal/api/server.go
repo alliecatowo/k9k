@@ -352,6 +352,38 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, &operationError{code: "config_error", err: err}
 		}
 		return result, nil
+	case "config.document":
+		var params struct {
+			Directory string `json:"directory"`
+			Name      string `json:"name"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		result, err := config.LoadDocument(params.Directory, params.Name)
+		if err != nil {
+			return nil, &operationError{code: "config_error", err: err}
+		}
+		return result, nil
+	case "config.write":
+		var params struct {
+			Directory      string `json:"directory"`
+			Name           string `json:"name"`
+			ExpectedSHA256 string `json:"expectedSHA256"`
+			Content        string `json:"content"`
+			Confirm        bool   `json:"confirm"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		if !params.Confirm {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("configuration write requires confirm: true")}
+		}
+		result, err := config.SaveDocument(params.Directory, params.Name, params.ExpectedSHA256, params.Content)
+		if err != nil {
+			return nil, &operationError{code: "config_error", err: err}
+		}
+		return result, nil
 	case "context.list":
 		result, err := s.cluster.Contexts()
 		if err != nil {

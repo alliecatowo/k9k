@@ -128,6 +128,8 @@ struct K9kRootView: View {
 
 struct SettingsView: View {
     @Environment(ClusterStore.self) private var store
+    @State private var editorFile = "aliases"
+    @State private var editorPresented = false
     var body: some View {
         @Bindable var store = store
         Form {
@@ -142,7 +144,7 @@ struct SettingsView: View {
                     LabeledContent("Plugin declarations", value: "\(config.plugins.count)")
                     ForEach(config.files.keys.sorted(), id: \.self) { key in
                         if let file = config.files[key] {
-                            LabeledContent(key.capitalized, value: file.present ? (file.error ?? "Loaded") : "Not present")
+                            HStack { LabeledContent(key.capitalized, value: file.present ? (file.error ?? "Loaded") : "Not present"); Spacer(); Button("Edit") { editorFile = key; editorPresented = true } }
                         }
                     }
                     Button("Reload K9s Configuration") { Task { await store.loadK9sConfig() } }
@@ -154,5 +156,6 @@ struct SettingsView: View {
         }
         .padding()
         .frame(width: 520)
+        .sheet(isPresented: $editorPresented) { K9sConfigEditorView(name: editorFile) }
     }
 }

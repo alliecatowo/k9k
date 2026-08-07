@@ -21,6 +21,7 @@ final class ClusterStore {
     var activeStreamID: String?
     var k9sAliases: [K9sAlias] = []
     var k9sConfig: K9sConfigSummary?
+    var k9sConfigDocument: K9sConfigDocument?
 
     var events: [ClusterEvent] = []
     var logLines: [String] = []
@@ -120,6 +121,20 @@ final class ClusterStore {
             k9sConfig = nil
             k9sAliases = []
         }
+    }
+
+    func loadK9sConfigDocument(named name: String) async {
+        do { k9sConfigDocument = try decode((try await client.request("config.document", parameters: .object(["name": .string(name)])).result), as: K9sConfigDocument.self) }
+        catch { k9sConfigDocument = nil; errorMessage = error.localizedDescription }
+    }
+
+    func saveK9sConfigDocument(_ document: K9sConfigDocument, content: String) async -> Bool {
+        do {
+            let result = try decode((try await client.request("config.write", parameters: .object(["name": .string(document.name), "expectedSHA256": .string(document.sha256), "content": .string(content), "confirm": .bool(true)])).result), as: K9sConfigDocument.self)
+            k9sConfigDocument = result
+            await loadK9sConfig()
+            return true
+        } catch { errorMessage = error.localizedDescription; return false }
     }
 
     func loadResources() async {

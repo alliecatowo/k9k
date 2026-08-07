@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +16,96 @@ const (
 	pluginsFile = "plugins.yaml"
 	viewsFile   = "views.yaml"
 )
+
+type Document struct {
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Exists  bool   `json:"exists"`
+	Content string `json:"content"`
+	SHA256  string `json:"sha256"`
+}
+
+func LoadDocument(directory, name string) (Document, error) {
+	if !validDocument(name) {
+		return Document{}, fmt.Errorf("unsupported K9s configuration file %q", name)
+	}
+	if strings.TrimSpace(directory) == "" {
+		var err error
+		directory, err = DefaultDirectory()
+		if err != nil {
+			return Document{}, err
+		}
+	}
+	path := filepath.Join(filepath.Clean(directory), name+".yaml")
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return document(name, path, false, nil), nil
+	}
+	if err != nil {
+		return Document{}, fmt.Errorf("read %q: %w", path, err)
+	}
+	return document(name, path, true, data), nil
+}
+
+func SaveDocument(directory, name, expectedSHA, content string) (Document, error) {
+	current, err := LoadDocument(directory, name)
+	if err != nil {
+		return Document{}, err
+	}
+	if expectedSHA == "" || expectedSHA != current.SHA256 {
+		return Document{}, fmt.Errorf("configuration changed on disk; reload before saving")
+	}
+	data := []byte(content)
+	if len(data) > 1<<20 {
+		return Document{}, errors.New("configuration content exceeds 1 MiB")
+	}
+	if err := validateDocument(name, data); err != nil {
+		return Document{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(current.Path), 0o700); err != nil {
+		return Document{}, err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(current.Path), ".k9k-config-")
+	if err != nil {
+		return Document{}, err
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	if _, err = temporary.Write(data); err == nil {
+		err = temporary.Chmod(0o600)
+	}
+	if closeErr := temporary.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return Document{}, err
+	}
+	if err := os.Rename(temporaryName, current.Path); err != nil {
+		return Document{}, err
+	}
+	return document(name, current.Path, true, data), nil
+}
+
+func document(name, path string, exists bool, data []byte) Document {
+	return Document{Name: name, Path: path, Exists: exists, Content: string(data), SHA256: fmt.Sprintf("%x", sha256.Sum256(data))}
+}
+func validDocument(name string) bool {
+	return name == "aliases" || name == "hotkeys" || name == "plugins" || name == "views"
+}
+func validateDocument(name string, data []byte) error {
+	var err error
+	switch name {
+	case "aliases":
+		_, err = ParseAliases(data)
+	case "hotkeys":
+		_, err = ParseHotkeys(data)
+	case "plugins":
+		_, err = ParsePlugins(data, "plugins.yaml")
+	case "views":
+		_, err = ParseViews(data)
+	}
+	return err
+}
 
 // FileStatus describes one optional K9s configuration file. A missing file is
 // normal: K9s treats every customization file as optional.

@@ -56,3 +56,21 @@ func writeConfigFile(t *testing.T, directory, name, contents string) {
 		t.Fatal(err)
 	}
 }
+
+func TestSaveDocumentValidatesAndGuardsConcurrentEdits(t *testing.T) {
+	directory := t.TempDir()
+	document, err := LoadDocument(directory, "aliases")
+	if err != nil || document.Exists {
+		t.Fatalf("initial document = %#v, %v", document, err)
+	}
+	saved, err := SaveDocument(directory, "aliases", document.SHA256, "aliases:\n  po: pods\n")
+	if err != nil || !saved.Exists {
+		t.Fatalf("save = %#v, %v", saved, err)
+	}
+	if _, err := SaveDocument(directory, "aliases", document.SHA256, "aliases:\n  svc: services\n"); err == nil {
+		t.Fatal("stale document save unexpectedly succeeded")
+	}
+	if _, err := SaveDocument(directory, "aliases", saved.SHA256, "aliases: [invalid"); err == nil {
+		t.Fatal("invalid YAML save unexpectedly succeeded")
+	}
+}

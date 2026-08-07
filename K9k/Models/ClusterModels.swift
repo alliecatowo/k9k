@@ -25,6 +25,14 @@ struct K9sConfigFile: Codable, Hashable {
     let error: String?
 }
 
+struct K9sConfigDocument: Codable, Hashable {
+    let name: String
+    let path: String
+    let exists: Bool
+    let content: String
+    let sha256: String
+}
+
 struct K9sAlias: Codable, Identifiable, Hashable {
     let name: String
     let target: String
