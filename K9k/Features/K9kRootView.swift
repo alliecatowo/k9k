@@ -7,6 +7,7 @@ struct K9kRootView: View {
     @State private var destructiveConfirmation = false
     @State private var logsPresented = false
     @State private var portForwardPresented = false
+    @State private var scalePresented = false
 
     var body: some View {
         @Bindable var store = store
@@ -30,6 +31,7 @@ struct K9kRootView: View {
             Task {
                 await store.loadEvents(for: store.resource(for: selection.first))
                 await store.updateDeleteAccess()
+                await store.updateScaleAccess()
             }
         }
         .confirmationDialog("Delete selected resources?", isPresented: $destructiveConfirmation, titleVisibility: .visible) {
@@ -42,6 +44,7 @@ struct K9kRootView: View {
         .sheet(isPresented: $portForwardPresented) {
             if let resource = store.resource(for: store.selectedResources.first) { PortForwardView(resource: resource, isPresented: $portForwardPresented) }
         }
+        .sheet(isPresented: $scalePresented) { ScaleWorkloadView(isPresented: $scalePresented) }
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
         } message: { Text(store.errorMessage ?? "") }
@@ -75,6 +78,10 @@ struct K9kRootView: View {
                 if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Pod" {
                     Button("View Logs") { logsPresented = true }
                     Button("Port Forward…") { portForwardPresented = true }
+                }
+                if store.isSelectedResourceScalable {
+                    Button("Scale…") { scalePresented = true }
+                        .disabled(!store.canScaleSelected)
                 }
                 Divider()
                 Toggle("Read-only Mode", isOn: Binding(get: { store.isReadOnly }, set: { store.isReadOnly = $0 }))

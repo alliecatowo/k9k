@@ -111,6 +111,10 @@ enum JSONValue: Codable, Hashable {
     }
 
     var stringValue: String? { if case .string(let value) = self { value } else { nil } }
+    var intValue: Int? {
+        if case .number(let value) = self, value.rounded() == value { return Int(value) }
+        return nil
+    }
     var objectValue: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
 }
 

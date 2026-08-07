@@ -28,7 +28,10 @@ final class ClusterStore {
     var activePortForwardStreamID: String?
     var deleteAccess: AccessReview?
     var isCheckingDeleteAccess = false
+    var scaleAccess: AccessReview?
+    var isCheckingScaleAccess = false
     private var deleteAccessGeneration = 0
+    private var scaleAccessGeneration = 0
 
     private let client = CoreClient()
 
@@ -111,6 +114,7 @@ final class ClusterStore {
         selectedResourceType = type
         selectedResources.removeAll()
         deleteAccess = nil
+        scaleAccess = nil
     }
 
     func deleteSelected() async {
@@ -131,6 +135,16 @@ final class ClusterStore {
 
     var canDeleteSelected: Bool {
         !isReadOnly && !selectedResources.isEmpty && deleteAccess?.allowed == true
+    }
+
+    var canScaleSelected: Bool {
+        !isReadOnly && selectedResources.count == 1 && selectedScalableResource != nil && scaleAccess?.allowed == true
+    }
+
+    var isSelectedResourceScalable: Bool { selectedScalableResource != nil }
+
+    var selectedReplicaCount: Int {
+        selectedScalableResource?.raw?.objectValue?["spec"]?.objectValue?["replicas"]?.intValue ?? 1
     }
 
     func updateDeleteAccess() async {
@@ -170,6 +184,50 @@ final class ClusterStore {
             if generation == deleteAccessGeneration {
                 deleteAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify delete permission: \(error.localizedDescription)", evaluationError: nil)
             }
+        }
+    }
+
+    func updateScaleAccess() async {
+        scaleAccessGeneration &+= 1
+        let generation = scaleAccessGeneration
+        guard let type = selectedResourceType, let resource = selectedScalableResource else {
+            scaleAccess = nil
+            isCheckingScaleAccess = false
+            return
+        }
+        isCheckingScaleAccess = true
+        defer {
+            if generation == scaleAccessGeneration { isCheckingScaleAccess = false }
+        }
+        do {
+            let review = try decode(
+                (try await client.request("rbac.check", parameters: operationParameters(type: type, resource: resource, additional: ["verb": .string("patch")]))).result,
+                as: AccessReview.self
+            )
+            if generation == scaleAccessGeneration { scaleAccess = review }
+        } catch {
+            if generation == scaleAccessGeneration {
+                scaleAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify scale permission: \(error.localizedDescription)", evaluationError: nil)
+            }
+        }
+    }
+
+    func scaleSelected(to replicas: Int) async {
+        guard !isReadOnly, let type = selectedResourceType, let resource = selectedScalableResource else { return }
+        guard replicas >= 0 else {
+            errorMessage = "Replica count cannot be negative."
+            return
+        }
+        await updateScaleAccess()
+        guard canScaleSelected else {
+            errorMessage = scaleAccess?.reason ?? "The active Kubernetes identity is not authorized to scale this workload."
+            return
+        }
+        do {
+            _ = try await client.request("resource.scale", parameters: operationParameters(type: type, resource: resource, additional: ["replicas": .number(Double(replicas))]))
+            await loadResources()
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -237,6 +295,14 @@ final class ClusterStore {
     }
 
     func resource(for id: ResourceSummary.ID?) -> ResourceSummary? { guard let id else { return nil }; return resources.first(where: { $0.id == id }) }
+
+    private var selectedScalableResource: ResourceSummary? {
+        guard let type = selectedResourceType,
+              ["deployments", "statefulsets", "replicasets", "replicationcontrollers"].contains(type.resource),
+              selectedResources.count == 1,
+              let id = selectedResources.first else { return nil }
+        return resource(for: id)
+    }
 
     func resourceType(forK9sAlias name: String) -> ResourceType? {
         var visited = Set<String>()
