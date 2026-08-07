@@ -65,6 +65,26 @@ struct ClusterEvent: Codable, Identifiable, Hashable {
     var id: String { "\(namespace)/\(reason)/\(message)/\(lastSeen.timeIntervalSince1970)" }
 }
 
+/// The active context's answer to a Kubernetes SelfSubjectAccessReview.
+/// K9k uses this for UI affordances, while the API server remains the final
+/// authority for every request.
+struct AccessReview: Codable, Hashable {
+    let allowed: Bool
+    let denied: Bool
+    let reason: String?
+    let evaluationError: String?
+}
+
+struct PortForwardBinding: Codable, Hashable {
+    let namespace: String
+    let pod: String
+    let localAddress: String
+    let localPort: Int
+    let remotePort: Int
+
+    var endpoint: String { "\(localAddress):\(localPort) → \(pod):\(remotePort)" }
+}
+
 enum JSONValue: Codable, Hashable {
     case string(String), number(Double), bool(Bool), object([String: JSONValue]), array([JSONValue]), null
 

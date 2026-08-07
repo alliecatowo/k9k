@@ -30,15 +30,36 @@ struct CommandPaletteView: View {
             TextField("Go to a resource or action", text: $query)
                 .textFieldStyle(.roundedBorder)
                 .font(.title3)
-            List(matches) { type in
-                Button { Task { await store.selectResourceType(type.type) }; isPresented = false } label: {
-                    HStack { Image(systemName: "cube"); Text(type.title); Spacer(); Text(type.detail).foregroundStyle(.secondary) }
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(matches) { item in
+                        Button {
+                            choose(item)
+                        } label: {
+                            HStack {
+                                Image(systemName: "cube")
+                                Text(item.title)
+                                Spacer()
+                                Text(item.detail).foregroundStyle(.secondary)
+                            }
+                            .contentShape(Rectangle())
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Open \(item.title)")
+                    }
                 }
-                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(height: 280)
         }
         .padding()
         .frame(width: 520)
+    }
+
+    private func choose(_ item: Item) {
+        Task { await store.selectResourceType(item.type) }
+        isPresented = false
     }
 }

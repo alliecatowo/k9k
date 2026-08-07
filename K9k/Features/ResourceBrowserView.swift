@@ -3,6 +3,7 @@ import SwiftUI
 struct ResourceBrowserView: View {
     @Environment(ClusterStore.self) private var store
     @Binding var inspectorIsPresented: Bool
+    @Binding var destructiveConfirmation: Bool
     @State private var sortOrder = [KeyPathComparator(\ResourceSummary.name)]
 
     var body: some View {
@@ -28,8 +29,8 @@ struct ResourceBrowserView: View {
                 .contextMenu(forSelectionType: ResourceSummary.ID.self) { selection in
                     Button("Copy Name") { store.copySelectedName() }
                     Divider()
-                    Button("Delete…", role: .destructive) { }
-                        .disabled(store.isReadOnly || selection.isEmpty)
+                    Button("Delete…", role: .destructive) { destructiveConfirmation = true }
+                        .disabled(!store.canDeleteSelected || selection.isEmpty)
                 } primaryAction: { _ in inspectorIsPresented = true }
                 .overlay { if store.isLoading { ProgressView().controlSize(.small) } }
                 .navigationTitle(type.kind)

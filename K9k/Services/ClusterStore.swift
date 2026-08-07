@@ -24,6 +24,11 @@ final class ClusterStore {
     var events: [ClusterEvent] = []
     var logLines: [String] = []
     var activeLogStreamID: String?
+    var activePortForward: PortForwardBinding?
+    var activePortForwardStreamID: String?
+    var deleteAccess: AccessReview?
+    var isCheckingDeleteAccess = false
+    private var deleteAccessGeneration = 0
 
     private let client = CoreClient()
 
@@ -105,11 +110,16 @@ final class ClusterStore {
     func selectResourceType(_ type: ResourceType) async {
         selectedResourceType = type
         selectedResources.removeAll()
-        await loadResources()
+        deleteAccess = nil
     }
 
     func deleteSelected() async {
         guard !isReadOnly, let type = selectedResourceType else { return }
+        await updateDeleteAccess()
+        guard canDeleteSelected else {
+            errorMessage = deleteAccess?.reason ?? "The active Kubernetes identity is not authorized to delete this resource."
+            return
+        }
         let selected = resources.filter { selectedResources.contains($0.id) }
         do {
             for resource in selected {
@@ -117,6 +127,50 @@ final class ClusterStore {
             }
             await loadResources()
         } catch { errorMessage = error.localizedDescription }
+    }
+
+    var canDeleteSelected: Bool {
+        !isReadOnly && !selectedResources.isEmpty && deleteAccess?.allowed == true
+    }
+
+    func updateDeleteAccess() async {
+        deleteAccessGeneration &+= 1
+        let generation = deleteAccessGeneration
+        guard let type = selectedResourceType else {
+            deleteAccess = nil
+            isCheckingDeleteAccess = false
+            return
+        }
+        let selected = resources.filter { selectedResources.contains($0.id) }
+        guard !selected.isEmpty else {
+            deleteAccess = nil
+            isCheckingDeleteAccess = false
+            return
+        }
+
+        isCheckingDeleteAccess = true
+        defer {
+            if generation == deleteAccessGeneration { isCheckingDeleteAccess = false }
+        }
+        do {
+            var finalReview: AccessReview?
+            for resource in selected {
+                let review = try decode(
+                    (try await client.request("rbac.check", parameters: operationParameters(type: type, resource: resource, additional: ["verb": .string("delete")]))).result,
+                    as: AccessReview.self
+                )
+                finalReview = review
+                if !review.allowed {
+                    if generation == deleteAccessGeneration { deleteAccess = review }
+                    return
+                }
+            }
+            if generation == deleteAccessGeneration { deleteAccess = finalReview }
+        } catch {
+            if generation == deleteAccessGeneration {
+                deleteAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify delete permission: \(error.localizedDescription)", evaluationError: nil)
+            }
+        }
     }
 
     func copySelectedName() {
@@ -148,6 +202,38 @@ final class ClusterStore {
     func closeLogs() async {
         if let activeLogStreamID { await client.cancel(streamID: activeLogStreamID) }
         activeLogStreamID = nil
+    }
+
+    func openPortForward(for resource: ResourceSummary, remotePort: Int, localPort: Int = 0) async {
+        guard resource.kind == "Pod", let namespace = resource.namespace else { return }
+        guard (1...65535).contains(remotePort), (0...65535).contains(localPort) else {
+            errorMessage = "Ports must be between 1 and 65535 (or use 0 for an automatic local port)."
+            return
+        }
+        await closePortForward()
+        let streamID = UUID().uuidString
+        do {
+            let result = try await client.request("portforward.open", parameters: .object([
+                "streamID": .string(streamID),
+                "namespace": .string(namespace),
+                "pod": .string(resource.name),
+                "remotePort": .number(Double(remotePort)),
+                "localPort": .number(Double(localPort)),
+                "localAddress": .string("127.0.0.1")
+            ]))
+            activePortForward = try decode(result.result, as: PortForwardBinding.self)
+            activePortForwardStreamID = streamID
+        } catch {
+            activePortForward = nil
+            activePortForwardStreamID = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func closePortForward() async {
+        if let activePortForwardStreamID { await client.cancel(streamID: activePortForwardStreamID) }
+        activePortForward = nil
+        activePortForwardStreamID = nil
     }
 
     func resource(for id: ResourceSummary.ID?) -> ResourceSummary? { guard let id else { return nil }; return resources.first(where: { $0.id == id }) }
@@ -186,6 +272,11 @@ final class ClusterStore {
         if event.streamID == activeLogStreamID, event.type == "logs.data", let line = event.result?.objectValue?["line"]?.stringValue {
             logLines.append(line)
             if logLines.count > 10_000 { logLines.removeFirst(logLines.count - 10_000) }
+            return
+        }
+        if event.streamID == activePortForwardStreamID, event.type == "portforward.closed" {
+            activePortForward = nil
+            activePortForwardStreamID = nil
             return
         }
         guard event.streamID == activeStreamID, let result = event.result else { return }

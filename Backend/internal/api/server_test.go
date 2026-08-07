@@ -35,6 +35,7 @@ type fakeCluster struct {
 
 	contextsErr, selectErr, namespacesErr, discoveryErr error
 	listErr, getErr, watchErr, deleteErr, patchErr      error
+	accessErr, portForwardErr                           error
 
 	selected []string
 	lists    []resourceCall
@@ -42,6 +43,8 @@ type fakeCluster struct {
 	watches  []resourceCall
 	deletes  []resourceCall
 	patches  []patchCall
+	accesses []AccessCheck
+	forwards []PortForwardRequest
 }
 
 type resourceCall struct {
@@ -135,6 +138,36 @@ func (f *fakeCluster) PodLogs(context.Context, string, string, string, bool, boo
 
 func (f *fakeCluster) Events(context.Context, string, string) ([]ClusterEvent, error) {
 	return nil, nil
+}
+
+func (f *fakeCluster) CheckAccess(_ context.Context, check AccessCheck) (AccessReview, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.accesses = append(f.accesses, check)
+	if f.accessErr != nil {
+		return AccessReview{}, f.accessErr
+	}
+	return AccessReview{Allowed: check.Verb == "get", Reason: "fake authorization decision"}, nil
+}
+
+func (f *fakeCluster) PortForward(ctx context.Context, request PortForwardRequest, onReady func(PortForwardBinding)) error {
+	f.mu.Lock()
+	f.forwards = append(f.forwards, request)
+	err := f.portForwardErr
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	localPort := request.LocalPort
+	if localPort == 0 {
+		localPort = 45123
+	}
+	onReady(PortForwardBinding{
+		Namespace: request.Namespace, Pod: request.Pod, LocalAddress: request.LocalAddress,
+		LocalPort: localPort, RemotePort: request.RemotePort,
+	})
+	<-ctx.Done()
+	return nil
 }
 
 type contextWatch struct {
@@ -407,6 +440,57 @@ func TestServerDeleteRequiresConfirmationAndScaleUsesMergePatch(t *testing.T) {
 	}
 }
 
+func TestServerRBACCheckValidatesAndReturnsAuthorizationDecision(t *testing.T) {
+	client := &fakeCluster{}
+	responses := runRequests(t, client,
+		request("allowed", "rbac.check", map[string]any{"verb": "get", "gvr": "apps/v1/deployments", "namespace": "demo", "name": "api", "subresource": "scale"}),
+		request("denied", "rbac.check", map[string]any{"verb": "delete", "resource": "pods", "namespace": "demo"}),
+		request("missing-verb", "rbac.check", map[string]any{"resource": "pods"}),
+		request("missing-resource", "rbac.check", map[string]any{"verb": "get"}),
+	)
+
+	allowed := decodeResult[AccessReview](t, envelopeByID(t, responses, "allowed").Result)
+	if !allowed.Allowed || allowed.Denied || allowed.Reason != "fake authorization decision" {
+		t.Errorf("allowed review = %#v", allowed)
+	}
+	denied := decodeResult[AccessReview](t, envelopeByID(t, responses, "denied").Result)
+	if denied.Allowed || denied.Denied || denied.Reason != "fake authorization decision" {
+		t.Errorf("denied review = %#v", denied)
+	}
+	for _, id := range []string{"missing-verb", "missing-resource"} {
+		if got := envelopeByID(t, responses, id).Error; got == nil || got.Code != "invalid_params" {
+			t.Errorf("%s error = %#v", id, got)
+		}
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.accesses) != 2 {
+		t.Fatalf("access checks = %#v", client.accesses)
+	}
+	expected := map[AccessCheck]bool{
+		{Verb: "get", Group: "apps", Version: "v1", Resource: "deployments", Subresource: "scale", Namespace: "demo", Name: "api"}: true,
+		{Verb: "delete", Version: "v1", Resource: "pods", Namespace: "demo"}:                                                       true,
+	}
+	for _, check := range client.accesses {
+		if !expected[check] {
+			t.Errorf("unexpected access check %#v", check)
+		}
+		delete(expected, check)
+	}
+	if len(expected) != 0 {
+		t.Errorf("missing access checks %#v", expected)
+	}
+}
+
+func TestServerRBACCheckPropagatesKubernetesErrors(t *testing.T) {
+	client := &fakeCluster{accessErr: os.ErrPermission}
+	response := envelopeByID(t, runRequests(t, client, request("check", "rbac.check", map[string]any{"verb": "get", "resource": "pods"})), "check")
+	if response.Error == nil || response.Error.Code != "kubernetes_error" {
+		t.Errorf("error = %#v", response.Error)
+	}
+}
+
 func TestServerWatchEmitsEventsAndCancellationClosesStream(t *testing.T) {
 	client := &fakeCluster{watcher: newContextWatch()}
 	inputReader, inputWriter := io.Pipe()
@@ -441,6 +525,83 @@ func TestServerWatchEmitsEventsAndCancellationClosesStream(t *testing.T) {
 		if value.Type == "resource.watch.closed" && mustObject(t, value.Result)["reason"] != "cancelled" {
 			t.Errorf("close result = %#v", value.Result)
 		}
+	}
+}
+
+func TestServerPortForwardReportsReadyAndCancellation(t *testing.T) {
+	client := &fakeCluster{}
+	inputReader, inputWriter := io.Pipe()
+	var output lockedBuffer
+	server := NewServer(client, inputReader, &output)
+	done := make(chan error, 1)
+	go func() { done <- server.Run(context.Background()) }()
+
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "forward", Operation: "portforward.open", StreamID: "web", Params: json.RawMessage(`{"namespace":"demo","pod":"api-0","remotePort":8080}`)})
+	waitFor(t, &output, func(values []protocol.Envelope) bool {
+		return hasEnvelope(values, "forward", "response") && hasEnvelope(values, "", "portforward.ready")
+	})
+	values := decodeEnvelopes(t, output.String())
+	response := mustObject(t, envelopeByID(t, values, "forward").Result)
+	if got, want := response["status"], "ready"; got != want {
+		t.Errorf("status = %#v, want %#v", got, want)
+	}
+	if got, want := response["localPort"], float64(45123); got != want {
+		t.Errorf("localPort = %#v, want %#v", got, want)
+	}
+	if got, want := response["localAddress"], "127.0.0.1"; got != want {
+		t.Errorf("localAddress = %#v, want %#v", got, want)
+	}
+	client.mu.Lock()
+	if got, want := client.forwards, []PortForwardRequest{{Namespace: "demo", Pod: "api-0", LocalPort: 0, RemotePort: 8080, LocalAddress: "127.0.0.1"}}; len(got) != 1 || got[0] != want[0] {
+		client.mu.Unlock()
+		t.Errorf("forwards = %#v, want %#v", got, want)
+	} else {
+		client.mu.Unlock()
+	}
+
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "cancel", Operation: "stream.cancel", StreamID: "web"})
+	waitFor(t, &output, func(values []protocol.Envelope) bool {
+		return hasEnvelope(values, "cancel", "response") && hasEnvelope(values, "", "portforward.closed")
+	})
+	if err := inputWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop after input closed")
+	}
+	for _, value := range decodeEnvelopes(t, output.String()) {
+		if value.Type == "portforward.closed" && mustObject(t, value.Result)["reason"] != "cancelled" {
+			t.Errorf("close result = %#v", value.Result)
+		}
+	}
+}
+
+func TestServerPortForwardValidationAndStartupError(t *testing.T) {
+	client := &fakeCluster{portForwardErr: os.ErrPermission}
+	responses := runRequests(t, client,
+		request("bad-address", "portforward.open", map[string]any{"streamID": "bad", "namespace": "demo", "pod": "api", "remotePort": 80, "localAddress": "0.0.0.0"}),
+		request("bad-port", "portforward.open", map[string]any{"streamID": "bad-port", "namespace": "demo", "pod": "api", "remotePort": 0}),
+		request("startup", "portforward.open", map[string]any{"streamID": "fail", "namespace": "demo", "pod": "api", "remotePort": 80}),
+	)
+	for _, id := range []string{"bad-address", "bad-port", "startup"} {
+		response := envelopeByID(t, responses, id)
+		if response.Error == nil {
+			t.Errorf("%s unexpectedly succeeded: %#v", id, response)
+		}
+	}
+	if got := envelopeByID(t, responses, "bad-address").Error.Code; got != "invalid_params" {
+		t.Errorf("bad-address code = %q", got)
+	}
+	if got := envelopeByID(t, responses, "bad-port").Error.Code; got != "invalid_params" {
+		t.Errorf("bad-port code = %q", got)
+	}
+	if got := envelopeByID(t, responses, "startup").Error.Code; got != "kubernetes_error" {
+		t.Errorf("startup code = %q", got)
 	}
 }
 

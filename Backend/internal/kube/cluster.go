@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/k9k-app/k9k/backend/internal/api"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,6 +24,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/portforward"
+	"k8s.io/client-go/transport/spdy"
 )
 
 // Cluster centralizes client-go semantics; Swift never parses kubeconfig or speaks to the API server.
@@ -223,6 +227,74 @@ func (c *Cluster) PodLogs(ctx context.Context, namespace, pod, container string,
 	return typed.CoreV1().Pods(namespace).GetLogs(pod, options).Stream(ctx)
 }
 
+// PortForward establishes a direct SPDY connection to the selected API server
+// and blocks for the lifetime of the local tunnel. It intentionally binds only
+// the loopback address validated by the API layer; no kubectl subprocess is
+// involved. onReady is invoked exactly once after client-go has opened the
+// local TCP listener and received the remote port-forward readiness signal.
+func (c *Cluster) PortForward(ctx context.Context, request api.PortForwardRequest, onReady func(api.PortForwardBinding)) error {
+	c.mu.RLock()
+	typed := c.typed
+	var restConfig *rest.Config
+	if c.rest != nil {
+		restConfig = rest.CopyConfig(c.rest)
+	}
+	c.mu.RUnlock()
+	if typed == nil || restConfig == nil {
+		return fmt.Errorf("no usable Kubernetes context is selected")
+	}
+
+	transport, upgrader, err := spdy.RoundTripperFor(restConfig)
+	if err != nil {
+		return fmt.Errorf("build port-forward transport: %w", err)
+	}
+	endpoint := typed.CoreV1().RESTClient().Post().
+		Namespace(request.Namespace).
+		Resource("pods").
+		Name(request.Pod).
+		SubResource("portforward").
+		URL()
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, endpoint)
+
+	stop := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		close(stop)
+	}()
+
+	ready := make(chan struct{})
+	portSpec := fmt.Sprintf("%d:%d", request.LocalPort, request.RemotePort)
+	forwarder, err := portforward.NewOnAddresses(dialer, []string{request.LocalAddress}, []string{portSpec}, stop, ready, io.Discard, io.Discard)
+	if err != nil {
+		return fmt.Errorf("create port forward: %w", err)
+	}
+
+	forwardDone := make(chan struct{})
+	readyOnce := sync.Once{}
+	go func() {
+		select {
+		case <-ready:
+			ports, portsErr := forwarder.GetPorts()
+			if portsErr != nil || len(ports) != 1 {
+				return
+			}
+			readyOnce.Do(func() {
+				onReady(api.PortForwardBinding{
+					Namespace: request.Namespace, Pod: request.Pod, LocalAddress: request.LocalAddress,
+					LocalPort: int(ports[0].Local), RemotePort: int(ports[0].Remote),
+				})
+			})
+		case <-forwardDone:
+			// A failed upgrade never closes ready. Avoid retaining a goroutine
+			// for each unsuccessful connection attempt.
+			return
+		}
+	}()
+	err = forwarder.ForwardPorts()
+	close(forwardDone)
+	return err
+}
+
 func (c *Cluster) Events(ctx context.Context, namespace, involvedUID string) ([]api.ClusterEvent, error) {
 	c.mu.RLock()
 	typed := c.typed
@@ -251,6 +323,40 @@ func (c *Cluster) Events(ctx context.Context, namespace, involvedUID string) ([]
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].LastSeen.After(items[j].LastSeen) })
 	return items, nil
+}
+
+// CheckAccess asks the selected API server whether the active kubeconfig
+// identity may perform one resource action. This is a read-only authorization
+// review; it never impersonates or evaluates an arbitrary subject.
+func (c *Cluster) CheckAccess(ctx context.Context, check api.AccessCheck) (api.AccessReview, error) {
+	c.mu.RLock()
+	typed := c.typed
+	c.mu.RUnlock()
+	if typed == nil {
+		return api.AccessReview{}, fmt.Errorf("no usable Kubernetes context is selected")
+	}
+	review, err := typed.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, &authorizationv1.SelfSubjectAccessReview{
+		Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+			ResourceAttributes: &authorizationv1.ResourceAttributes{
+				Verb:        check.Verb,
+				Group:       check.Group,
+				Version:     check.Version,
+				Resource:    check.Resource,
+				Subresource: check.Subresource,
+				Namespace:   check.Namespace,
+				Name:        check.Name,
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		return api.AccessReview{}, err
+	}
+	return api.AccessReview{
+		Allowed:         review.Status.Allowed,
+		Denied:          review.Status.Denied,
+		Reason:          review.Status.Reason,
+		EvaluationError: review.Status.EvaluationError,
+	}, nil
 }
 func IsNotFound(err error) bool { return errors.IsNotFound(err) }
 

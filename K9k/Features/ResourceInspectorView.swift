@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ResourceInspectorView: View {
+    @Environment(ClusterStore.self) private var store
     let resource: ResourceSummary?
     let type: ResourceType?
     let events: [ClusterEvent]
@@ -57,6 +58,16 @@ struct ResourceInspectorView: View {
                 LabeledContent("Namespace", value: resource.namespace ?? "Cluster-scoped")
                 LabeledContent("Status", value: resource.status)
                 LabeledContent("Age", value: resource.age)
+            }
+            if let access = store.deleteAccess {
+                Section("Access") {
+                    LabeledContent("Delete", value: access.allowed ? "Allowed" : "Not allowed")
+                    if let reason = access.reason, !reason.isEmpty {
+                        Text(reason).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }
+            } else if store.isCheckingDeleteAccess {
+                Section("Access") { LabeledContent("Delete") { ProgressView().controlSize(.small) } }
             }
             if let labels = resource.labels, !labels.isEmpty {
                 Section("Labels") { ForEach(labels.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in LabeledContent(key, value: value).textSelection(.enabled) } }

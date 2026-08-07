@@ -71,7 +71,7 @@ Preserve group, version, resource, kind when known, namespace, name, UID, and re
 
 | Client | Use |
 | --- | --- |
-| `kubernetes.Interface` | Typed APIs where semantics matter: namespaces, pod logs, events, access reviews, exec/attach setup, scale, port-forward prerequisites. |
+| `kubernetes.Interface` | Typed APIs where semantics matter: namespaces, pod logs, events, access reviews, exec/attach setup, scale, and direct port-forward setup. |
 | `dynamic.Interface` | Generic CRD/arbitrary GVR list/get/watch/patch/delete without a fixed resource list. |
 | `discovery.DiscoveryInterface` | Preferred discovery, scope/kind/short names, REST mapping input, feature detection. |
 

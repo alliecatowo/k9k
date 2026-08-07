@@ -2,24 +2,22 @@ import SwiftUI
 
 struct SidebarView: View {
     @Environment(ClusterStore.self) private var store
-    @Binding var selection: NavigationDestination?
+    @Binding var selectedResourceType: ResourceType?
+    let browseResources: () -> Void
 
     var body: some View {
-        List(selection: $selection) {
+        List(selection: $selectedResourceType) {
             Section("Cluster") {
                 Label(store.selectedContext?.name ?? "Connecting…", systemImage: "server.rack")
                     .font(.headline)
-                NavigationLink(value: NavigationDestination.overview) { Label("Overview", systemImage: "rectangle.3.group") }
-                NavigationLink(value: NavigationDestination.pulses) { Label("Pulses", systemImage: "waveform.path.ecg") }
-                NavigationLink(value: NavigationDestination.xray) { Label("XRay", systemImage: "scope") }
+                resourceRows(["pods", "services", "nodes", "namespaces", "events"])
             }
-            Section("Resources") {
-                ForEach([NavigationDestination.workloads, .networking, .configuration, .storage, .rbac, .cluster, .customResources]) { destination in
-                    NavigationLink(value: destination) { Label(destination.title, systemImage: destination.symbol) }
+            Section("Favorites") {
+                resourceRows(["deployments", "configmaps", "secrets", "persistentvolumeclaims"])
+                Button(action: browseResources) {
+                    Label("Browse All Resources…", systemImage: "square.grid.2x2")
                 }
-            }
-            Section("Operations") {
-                NavigationLink(value: NavigationDestination.portForwards) { Label("Port Forwards", systemImage: "arrow.left.arrow.right") }
+                .accessibilityHint("Open the resource picker")
             }
         }
         .listStyle(.sidebar)
@@ -36,4 +34,29 @@ struct SidebarView: View {
             .padding(.vertical, 8)
         }
     }
+
+    @ViewBuilder
+    private func resourceRows(_ names: [String]) -> some View {
+        ForEach(names.compactMap { preferredResource(named: $0) }) { type in
+            Label(type.kind, systemImage: icon(for: type))
+                .tag(type)
+        }
+    }
+
+    private func preferredResource(named name: String) -> ResourceType? {
+        let candidates = store.discoveredResources.filter { $0.resource == name }
+        return candidates.first(where: { $0.group.isEmpty }) ?? candidates.first
+    }
+
+    private func icon(for type: ResourceType) -> String {
+        switch type.resource {
+        case "pods": "shippingbox"
+        case "deployments", "daemonsets", "statefulsets", "replicasets": "cube.box"
+        case "services", "ingresses", "endpoints": "point.3.connected.trianglepath.dotted"
+        case "configmaps", "secrets": "doc.text"
+        case "nodes": "server.rack"
+        default: "cube"
+        }
+    }
+
 }

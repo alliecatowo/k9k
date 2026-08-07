@@ -2,20 +2,19 @@ import SwiftUI
 
 struct K9kRootView: View {
     @Environment(ClusterStore.self) private var store
-    @State private var sidebarSelection: NavigationDestination? = .workloads
     @State private var inspectorIsPresented = true
     @State private var paletteIsPresented = false
     @State private var destructiveConfirmation = false
     @State private var logsPresented = false
+    @State private var portForwardPresented = false
 
     var body: some View {
         @Bindable var store = store
         NavigationSplitView {
-            SidebarView(selection: $sidebarSelection)
-        } content: {
-            ResourceCatalogView(selection: $store.selectedResourceType)
+            SidebarView(selectedResourceType: $store.selectedResourceType) { paletteIsPresented = true }
+                .navigationSplitViewColumnWidth(min: 240, ideal: 260, max: 340)
         } detail: {
-            ResourceBrowserView(inspectorIsPresented: $inspectorIsPresented)
+            ResourceBrowserView(inspectorIsPresented: $inspectorIsPresented, destructiveConfirmation: $destructiveConfirmation)
         }
         .navigationSplitViewStyle(.balanced)
         .inspector(isPresented: $inspectorIsPresented) {
@@ -25,15 +24,23 @@ struct K9kRootView: View {
         .toolbar { toolbar }
         .task { await store.connect() }
         .onChange(of: store.discoveredResources) { _, _ in store.ensureDefaultResourceSelection() }
-        .onChange(of: store.selectedResourceType) { _, newValue in if let newValue { Task { await store.selectResourceType(newValue) } } }
+        .onChange(of: store.selectedResourceType) { _, newValue in if newValue != nil { Task { await store.loadResources() } } }
         .onChange(of: store.selectedNamespace) { _, _ in Task { await store.loadResources() } }
-        .onChange(of: store.selectedResources) { _, selection in Task { await store.loadEvents(for: store.resource(for: selection.first)) } }
+        .onChange(of: store.selectedResources) { _, selection in
+            Task {
+                await store.loadEvents(for: store.resource(for: selection.first))
+                await store.updateDeleteAccess()
+            }
+        }
         .confirmationDialog("Delete selected resources?", isPresented: $destructiveConfirmation, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { Task { await store.deleteSelected() } }
         } message: { Text("This changes resources in \(store.selectedContext?.name ?? "the active context").") }
         .sheet(isPresented: $paletteIsPresented) { CommandPaletteView(isPresented: $paletteIsPresented) }
         .sheet(isPresented: $logsPresented) {
             if let resource = store.resource(for: store.selectedResources.first) { LogStreamView(resource: resource) }
+        }
+        .sheet(isPresented: $portForwardPresented) {
+            if let resource = store.resource(for: store.selectedResources.first) { PortForwardView(resource: resource, isPresented: $portForwardPresented) }
         }
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
@@ -67,11 +74,12 @@ struct K9kRootView: View {
                 Button("Copy Name", action: store.copySelectedName).disabled(store.selectedResources.isEmpty)
                 if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Pod" {
                     Button("View Logs") { logsPresented = true }
+                    Button("Port Forward…") { portForwardPresented = true }
                 }
                 Divider()
                 Toggle("Read-only Mode", isOn: Binding(get: { store.isReadOnly }, set: { store.isReadOnly = $0 }))
                 Button("Delete…", role: .destructive) { destructiveConfirmation = true }
-                    .disabled(store.selectedResources.isEmpty || store.isReadOnly)
+                    .disabled(!store.canDeleteSelected)
             } label: { Label("Resource Actions", systemImage: "ellipsis.circle") }
         }
     }

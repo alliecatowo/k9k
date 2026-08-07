@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,8 @@ type ClusterClient interface {
 	Patch(context.Context, schema.GroupVersionResource, string, string, bool, []byte) (*unstructured.Unstructured, error)
 	PodLogs(context.Context, string, string, string, bool, bool, bool, int64) (io.ReadCloser, error)
 	Events(context.Context, string, string) ([]ClusterEvent, error)
+	CheckAccess(context.Context, AccessCheck) (AccessReview, error)
+	PortForward(context.Context, PortForwardRequest, func(PortForwardBinding)) error
 }
 
 // Server dispatches K9k's newline-delimited JSON protocol. Concurrent request
@@ -133,6 +136,10 @@ func (s *Server) dispatch(ctx context.Context, request protocol.Request) {
 	}
 	if request.Operation == "logs.open" {
 		s.startLogs(ctx, request)
+		return
+	}
+	if request.Operation == "portforward.open" {
+		s.startPortForward(ctx, request)
 		return
 	}
 
@@ -241,6 +248,16 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(eventsErr)
 		}
 		return result, nil
+	case "rbac.check":
+		params, err := decodeAccessCheckParams(request.Params)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		result, reviewErr := s.cluster.CheckAccess(ctx, params.accessCheck())
+		if reviewErr != nil {
+			return nil, kubeError(reviewErr)
+		}
+		return result, nil
 	case "resource.patch":
 		var params patchParams
 		if err := decodeParams(request.Params, &params); err != nil {
@@ -318,6 +335,122 @@ type logParams struct {
 	Follow     bool   `json:"follow"`
 	Timestamps bool   `json:"timestamps"`
 	TailLines  int64  `json:"tailLines"`
+}
+
+type portForwardParams struct {
+	StreamID     string `json:"streamID"`
+	Namespace    string `json:"namespace"`
+	Pod          string `json:"pod"`
+	LocalPort    int    `json:"localPort"`
+	RemotePort   int    `json:"remotePort"`
+	LocalAddress string `json:"localAddress"`
+}
+
+func (p *portForwardParams) validate() error {
+	if strings.TrimSpace(p.Namespace) == "" || strings.TrimSpace(p.Pod) == "" {
+		return errors.New("namespace and pod are required")
+	}
+	if p.RemotePort < 1 || p.RemotePort > 65535 {
+		return errors.New("remotePort must be between 1 and 65535")
+	}
+	if p.LocalPort < 0 || p.LocalPort > 65535 {
+		return errors.New("localPort must be between 0 and 65535")
+	}
+	p.LocalAddress = strings.TrimSpace(p.LocalAddress)
+	if p.LocalAddress == "" || strings.EqualFold(p.LocalAddress, "localhost") {
+		p.LocalAddress = "127.0.0.1"
+	}
+	ip := net.ParseIP(p.LocalAddress)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("localAddress must be a loopback IP address")
+	}
+	return nil
+}
+
+func (p portForwardParams) request() PortForwardRequest {
+	return PortForwardRequest{
+		Namespace: p.Namespace, Pod: p.Pod, LocalPort: p.LocalPort,
+		RemotePort: p.RemotePort, LocalAddress: p.LocalAddress,
+	}
+}
+
+// startPortForward waits to acknowledge the request until client-go confirms
+// both the API-server tunnel and local listener. This lets the GUI safely open
+// the returned endpoint immediately, including when localPort was zero.
+func (s *Server) startPortForward(ctx context.Context, request protocol.Request) {
+	var params portForwardParams
+	if err := decodeParams(request.Params, &params); err != nil {
+		s.writeFailure(request.ID, "invalid_params", err, nil)
+		return
+	}
+	if err := params.validate(); err != nil {
+		s.writeFailure(request.ID, "invalid_params", err, nil)
+		return
+	}
+	streamID := request.StreamID
+	if streamID == "" {
+		streamID = params.StreamID
+	}
+	if streamID == "" {
+		s.writeFailure(request.ID, "invalid_params", errors.New("streamID is required"), nil)
+		return
+	}
+
+	streamContext, cancel := context.WithCancel(ctx)
+	if !s.registerStream(streamID, cancel) {
+		cancel()
+		s.writeFailure(request.ID, "stream_exists", fmt.Errorf("stream %q already exists", streamID), nil)
+		return
+	}
+	defer s.unregisterStream(streamID)
+	defer cancel()
+
+	ready := make(chan PortForwardBinding, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- s.cluster.PortForward(streamContext, params.request(), func(binding PortForwardBinding) {
+			// The client must only signal one binding. Keep the callback
+			// non-blocking so a failing forward cannot strand a client-go goroutine.
+			select {
+			case ready <- binding:
+			default:
+			}
+		})
+	}()
+
+	var forwardErr error
+	select {
+	case binding := <-ready:
+		if streamContext.Err() != nil {
+			forwardErr = <-done
+			break
+		}
+		result := map[string]any{
+			"streamID": streamID, "status": "ready", "namespace": binding.Namespace,
+			"pod": binding.Pod, "localAddress": binding.LocalAddress,
+			"localPort": binding.LocalPort, "remotePort": binding.RemotePort,
+		}
+		s.write(protocol.Response(request.ID, result))
+		s.write(protocol.Event(streamID, "portforward.ready", result))
+		forwardErr = <-done
+	case forwardErr = <-done:
+		if streamContext.Err() == nil {
+			if forwardErr == nil {
+				forwardErr = errors.New("port forward ended before it was ready")
+			}
+			s.writeFailure(request.ID, "kubernetes_error", forwardErr, nil)
+			return
+		}
+	}
+
+	reason := "completed"
+	if streamContext.Err() != nil {
+		reason = "cancelled"
+	} else if forwardErr != nil {
+		reason = "error"
+		s.write(protocol.Event(streamID, "portforward.error", map[string]any{"message": forwardErr.Error()}))
+	}
+	s.write(protocol.Event(streamID, "portforward.closed", map[string]any{"reason": reason}))
 }
 
 func (p logParams) validate() error {
@@ -600,6 +733,39 @@ func (p *patchParams) validate() error {
 type scaleParams struct {
 	resourceParams
 	Replicas int32 `json:"replicas"`
+}
+
+type accessCheckParams struct {
+	resourceParams
+	Verb        string `json:"verb"`
+	Subresource string `json:"subresource"`
+}
+
+func decodeAccessCheckParams(raw json.RawMessage) (accessCheckParams, error) {
+	var params accessCheckParams
+	if err := decodeParams(raw, &params); err != nil {
+		return params, err
+	}
+	if err := params.validateResource(); err != nil {
+		return params, err
+	}
+	params.Verb = strings.TrimSpace(params.Verb)
+	if params.Verb == "" {
+		return params, errors.New("verb is required")
+	}
+	return params, nil
+}
+
+func (p accessCheckParams) accessCheck() AccessCheck {
+	return AccessCheck{
+		Verb:        p.Verb,
+		Group:       p.Group,
+		Version:     p.Version,
+		Resource:    p.Resource,
+		Subresource: p.Subresource,
+		Namespace:   p.Namespace,
+		Name:        p.Name,
+	}
 }
 
 func (p *scaleParams) validate() error {
