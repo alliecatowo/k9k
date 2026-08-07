@@ -87,6 +87,7 @@ type fakeCluster struct {
 	helmUninstalls    []HelmUninstallRequest
 	helmUpgradePlans  []HelmUpgradeRequest
 	helmUpgrades      []HelmUpgradeRequest
+	logs              []PodLogRequest
 	execs             []PodExecRequest
 	execFn            func(context.Context, PodExecRequest, PodExecStreams) error
 	manifests         []resourceCall
@@ -291,7 +292,10 @@ func (f *fakeCluster) ApplyManifest(_ context.Context, request ManifestApplyRequ
 	return request.Object.DeepCopy(), nil
 }
 
-func (f *fakeCluster) PodLogs(context.Context, string, string, string, bool, bool, bool, int64) (io.ReadCloser, error) {
+func (f *fakeCluster) PodLogs(_ context.Context, request PodLogRequest) (io.ReadCloser, error) {
+	f.mu.Lock()
+	f.logs = append(f.logs, request)
+	f.mu.Unlock()
 	return io.NopCloser(strings.NewReader("")), nil
 }
 
@@ -1539,6 +1543,41 @@ func TestServerMetricsDistinguishesUnavailableFromInvalidAndKubernetesErrors(t *
 	response := envelopeByID(t, runRequests(t, &fakeCluster{metricsErr: os.ErrPermission}, request("forbidden", "metrics.list", map[string]any{"resource": "pods"})), "forbidden")
 	if response.Error == nil || response.Error.Code != "kubernetes_error" {
 		t.Errorf("ordinary metrics error = %#v", response.Error)
+	}
+}
+
+func TestServerLogsApplyBoundedHistoryOptions(t *testing.T) {
+	client := &fakeCluster{}
+	responses := runRequests(t, client, request("logs", "logs.open", map[string]any{
+		"streamID": "pod-logs", "namespace": "demo", "pod": "api", "container": "web",
+		"follow": false, "timestamps": true, "tailLines": 2_000, "sinceSeconds": 900, "limitBytes": 1 << 20,
+	}))
+	if response := envelopeByID(t, responses, "logs"); response.Error != nil {
+		t.Fatalf("logs.open error = %#v", response.Error)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.logs) != 1 {
+		t.Fatalf("log calls = %#v", client.logs)
+	}
+	if got, want := client.logs[0], (PodLogRequest{
+		Namespace: "demo", Pod: "api", Container: "web", Follow: false, Timestamps: true,
+		TailLines: 2_000, SinceSeconds: 900, LimitBytes: 1 << 20,
+	}); got != want {
+		t.Errorf("log request = %#v, want %#v", got, want)
+	}
+}
+
+func TestServerLogsRejectUnboundedHistoryControls(t *testing.T) {
+	responses := runRequests(t, &fakeCluster{},
+		request("tail", "logs.open", map[string]any{"streamID": "tail", "namespace": "demo", "pod": "api", "tailLines": maxLogTailLines + 1}),
+		request("since", "logs.open", map[string]any{"streamID": "since", "namespace": "demo", "pod": "api", "sinceSeconds": maxLogSinceSeconds + 1}),
+		request("bytes", "logs.open", map[string]any{"streamID": "bytes", "namespace": "demo", "pod": "api", "limitBytes": maxLogLimitBytes + 1}),
+	)
+	for _, id := range []string{"tail", "since", "bytes"} {
+		if response := envelopeByID(t, responses, id); response.Error == nil || response.Error.Code != "invalid_params" {
+			t.Errorf("%s response = %#v, want invalid_params", id, response)
+		}
 	}
 }
 

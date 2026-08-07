@@ -61,7 +61,7 @@ type ClusterClient interface {
 	Patch(context.Context, schema.GroupVersionResource, string, string, bool, []byte) (*unstructured.Unstructured, error)
 	Manifest(context.Context, schema.GroupVersionResource, string, string, bool) (ManifestDocument, error)
 	ApplyManifest(context.Context, ManifestApplyRequest) (*unstructured.Unstructured, error)
-	PodLogs(context.Context, string, string, string, bool, bool, bool, int64) (io.ReadCloser, error)
+	PodLogs(context.Context, PodLogRequest) (io.ReadCloser, error)
 	Events(context.Context, string, string) ([]ClusterEvent, error)
 	Metrics(context.Context, MetricsQuery) ([]ResourceMetrics, error)
 	DrainNode(context.Context, NodeDrainRequest) (NodeDrainResult, error)
@@ -1179,14 +1179,16 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 }
 
 type logParams struct {
-	StreamID   string `json:"streamID"`
-	Namespace  string `json:"namespace"`
-	Pod        string `json:"pod"`
-	Container  string `json:"container"`
-	Previous   bool   `json:"previous"`
-	Follow     bool   `json:"follow"`
-	Timestamps bool   `json:"timestamps"`
-	TailLines  int64  `json:"tailLines"`
+	StreamID     string `json:"streamID"`
+	Namespace    string `json:"namespace"`
+	Pod          string `json:"pod"`
+	Container    string `json:"container"`
+	Previous     bool   `json:"previous"`
+	Follow       bool   `json:"follow"`
+	Timestamps   bool   `json:"timestamps"`
+	TailLines    int64  `json:"tailLines"`
+	SinceSeconds int64  `json:"sinceSeconds"`
+	LimitBytes   int64  `json:"limitBytes"`
 }
 
 type execParams struct {
@@ -1718,14 +1720,45 @@ func (s *Server) startPortForward(ctx context.Context, request protocol.Request)
 	s.write(protocol.Event(streamID, "portforward.closed", map[string]any{"reason": reason}))
 }
 
-func (p logParams) validate() error {
+const (
+	defaultLogTailLines  int64 = 500
+	maxLogTailLines      int64 = 10_000
+	maxLogSinceSeconds   int64 = 31 * 24 * 60 * 60
+	defaultLogLimitBytes int64 = 8 << 20
+	maxLogLimitBytes     int64 = 16 << 20
+)
+
+func (p *logParams) validate() error {
+	p.Namespace = strings.TrimSpace(p.Namespace)
+	p.Pod = strings.TrimSpace(p.Pod)
+	p.Container = strings.TrimSpace(p.Container)
 	if p.Namespace == "" || p.Pod == "" {
 		return errors.New("namespace and pod are required")
 	}
-	if p.TailLines < 0 {
-		return errors.New("tailLines cannot be negative")
+	if p.TailLines == 0 {
+		p.TailLines = defaultLogTailLines
+	}
+	if p.TailLines < 1 || p.TailLines > maxLogTailLines {
+		return fmt.Errorf("tailLines must be between 1 and %d", maxLogTailLines)
+	}
+	if p.SinceSeconds < 0 || p.SinceSeconds > maxLogSinceSeconds {
+		return fmt.Errorf("sinceSeconds must be between 0 and %d", maxLogSinceSeconds)
+	}
+	if p.LimitBytes == 0 {
+		p.LimitBytes = defaultLogLimitBytes
+	}
+	if p.LimitBytes < 1 || p.LimitBytes > maxLogLimitBytes {
+		return fmt.Errorf("limitBytes must be between 1 and %d", maxLogLimitBytes)
 	}
 	return nil
+}
+
+func (p logParams) request() PodLogRequest {
+	return PodLogRequest{
+		Namespace: p.Namespace, Pod: p.Pod, Container: p.Container,
+		Previous: p.Previous, Follow: p.Follow, Timestamps: p.Timestamps,
+		TailLines: p.TailLines, SinceSeconds: p.SinceSeconds, LimitBytes: p.LimitBytes,
+	}
 }
 
 // startLogs keeps log backpressure outside Swift and couples the stream to a
@@ -1752,7 +1785,7 @@ func (s *Server) startLogs(ctx context.Context, request protocol.Request) {
 	if s.registerStreamFailure(request.ID, streamID, cancel) {
 		return
 	}
-	stream, err := s.cluster.PodLogs(streamContext, params.Namespace, params.Pod, params.Container, params.Previous, params.Follow, params.Timestamps, params.TailLines)
+	stream, err := s.cluster.PodLogs(streamContext, params.request())
 	if err != nil {
 		s.unregisterStream(streamID)
 		cancel()
@@ -2980,6 +3013,84 @@ func summaryStatus(item *unstructured.Unstructured) string {
 				}
 				return "NotReady"
 			}
+		}
+	}
+	if status := schemaFreeConditionStatus(item); status != "" {
+		return status
+	}
+	return "Unknown"
+}
+
+// schemaFreeConditionStatus uses Kubernetes' conventional Condition shape
+// without assuming a CRD schema. It intentionally reads only scalar type and
+// status fields, keeping a dynamic-resource browser useful even when the API
+// server does not publish OpenAPI schemas for that resource.
+func schemaFreeConditionStatus(item *unstructured.Unstructured) string {
+	conditions, _, _ := unstructured.NestedSlice(item.Object, "status", "conditions")
+	if len(conditions) == 0 {
+		return ""
+	}
+	priority := []string{"Ready", "Healthy", "Available", "Established", "Succeeded"}
+	for _, expected := range priority {
+		for _, condition := range conditions {
+			value, ok := condition.(map[string]any)
+			if !ok || value["type"] != expected {
+				continue
+			}
+			return conditionDisplayStatus(expected, fmt.Sprint(value["status"]))
+		}
+	}
+	for _, condition := range conditions {
+		value, ok := condition.(map[string]any)
+		if !ok {
+			continue
+		}
+		typeName, status := fmt.Sprint(value["type"]), fmt.Sprint(value["status"])
+		if typeName != "" && status != "" && typeName != "<nil>" && status != "<nil>" {
+			return typeName + " " + status
+		}
+	}
+	return ""
+}
+
+func conditionDisplayStatus(conditionType, value string) string {
+	switch conditionType {
+	case "Ready":
+		switch value {
+		case "True":
+			return "Ready"
+		case "False":
+			return "NotReady"
+		default:
+			return "Unknown"
+		}
+	case "Healthy":
+		if value == "True" {
+			return "Healthy"
+		}
+		if value == "False" {
+			return "Unhealthy"
+		}
+	case "Available":
+		if value == "True" {
+			return "Available"
+		}
+		if value == "False" {
+			return "Unavailable"
+		}
+	case "Established":
+		if value == "True" {
+			return "Established"
+		}
+		if value == "False" {
+			return "NotEstablished"
+		}
+	case "Succeeded":
+		if value == "True" {
+			return "Succeeded"
+		}
+		if value == "False" {
+			return "Failed"
 		}
 	}
 	return "Unknown"

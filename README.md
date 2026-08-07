@@ -26,7 +26,7 @@ Cluster → Namespace → Deployment → Inspector → Rollout / Events / Raw JS
 - Inspect syntax-highlighted raw JSON, metadata, owners, annotations, events, RBAC, rollout state, and available metrics.
 - Stream logs; open a real ANSI/VT Pod terminal; attach; add a confirmed ephemeral debug container.
 - Transfer regular files or directories directly to and from a Pod through bounded, traversal-safe tar streams over `pods/exec`.
-- Create loopback-only Pod or Service port-forwards, manage several at once, and benchmark a K9k-owned forward.
+- Create loopback-only Pod or Service port-forwards, manage several at once, and benchmark a K9k-owned forward with a bounded session-only history, native rate chart, and explicit JSON export.
 - Scale, restart, roll back Deployments, trigger CronJobs, cordon/drain Nodes, and apply UID-protected manifests.
 - Import up to 100 mixed-resource manifests from pasted YAML, files, or a directory: live discovery resolves each GVR, every document dry-runs before a confirmed, explicitly non-atomic apply.
 - Manage kubeconfig context references graphically, including default namespace, duplicate, rename, delete, and switch.

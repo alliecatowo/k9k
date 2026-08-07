@@ -22,6 +22,7 @@ struct K9kRootView: View {
     @State private var nodeShellPresented = false
     @State private var debugPresented = false
     @State private var portForwardListPresented = false
+    @State private var benchmarkHistory = BenchmarkHistoryStore()
     @State private var resourceSelectorsPresented = false
     @State private var pluginToRun: K9sPlugin?
     @State private var manifestImportPresented = false
@@ -57,6 +58,7 @@ struct K9kRootView: View {
             logsPresented: $logsPresented,
             portForwardPresented: $portForwardPresented,
             portForwardListPresented: $portForwardListPresented,
+            benchmarkHistory: benchmarkHistory,
             scalePresented: $scalePresented,
             terminalPresented: $terminalPresented,
             terminalMode: $terminalMode,
@@ -139,6 +141,7 @@ struct K9kRootView: View {
         @Binding var logsPresented: Bool
         @Binding var portForwardPresented: Bool
         @Binding var portForwardListPresented: Bool
+        let benchmarkHistory: BenchmarkHistoryStore
         @Binding var scalePresented: Bool
         @Binding var terminalPresented: Bool
         @Binding var terminalMode: PodTerminalMode
@@ -180,7 +183,7 @@ struct K9kRootView: View {
         .sheet(isPresented: $portForwardPresented) {
             if let resource = store.resource(for: store.selectedResources.first) { PortForwardView(resource: resource, isPresented: $portForwardPresented) }
         }
-        .sheet(isPresented: $portForwardListPresented) { PortForwardListView(isPresented: $portForwardListPresented) }
+        .sheet(isPresented: $portForwardListPresented) { PortForwardListView(isPresented: $portForwardListPresented, benchmarkHistory: benchmarkHistory) }
         .sheet(isPresented: $scalePresented) { ScaleWorkloadView(isPresented: $scalePresented) }
         .sheet(isPresented: $terminalPresented) {
             if let resource = store.resource(for: store.selectedResources.first) { TerminalSessionView(resource: resource, initialMode: terminalMode) }

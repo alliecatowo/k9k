@@ -734,18 +734,21 @@ func (c *Cluster) ApplyManifest(ctx context.Context, request api.ManifestApplyRe
 	return resource.Apply(ctx, identity.Name, request.Object, options)
 }
 
-func (c *Cluster) PodLogs(ctx context.Context, namespace, pod, container string, previous, follow, timestamps bool, tailLines int64) (io.ReadCloser, error) {
+func (c *Cluster) PodLogs(ctx context.Context, request api.PodLogRequest) (io.ReadCloser, error) {
 	c.mu.RLock()
 	typed := c.typed
 	c.mu.RUnlock()
 	if typed == nil {
 		return nil, fmt.Errorf("no usable Kubernetes context is selected")
 	}
-	options := &corev1.PodLogOptions{Container: container, Previous: previous, Follow: follow, Timestamps: timestamps}
-	if tailLines > 0 {
-		options.TailLines = &tailLines
+	options := &corev1.PodLogOptions{
+		Container: request.Container, Previous: request.Previous, Follow: request.Follow, Timestamps: request.Timestamps,
+		TailLines: &request.TailLines, LimitBytes: &request.LimitBytes,
 	}
-	return typed.CoreV1().Pods(namespace).GetLogs(pod, options).Stream(ctx)
+	if request.SinceSeconds > 0 {
+		options.SinceSeconds = &request.SinceSeconds
+	}
+	return typed.CoreV1().Pods(request.Namespace).GetLogs(request.Pod, options).Stream(ctx)
 }
 
 // PodExec connects directly to Kubernetes' pods/exec or pods/attach SPDY
@@ -1390,7 +1393,78 @@ func workloadStatus(item *unstructured.Unstructured) string {
 			}
 		}
 	}
+	return schemaFreeConditionStatus(item)
+}
+
+func schemaFreeConditionStatus(item *unstructured.Unstructured) string {
+	conditions, _, _ := unstructured.NestedSlice(item.Object, "status", "conditions")
+	if len(conditions) == 0 {
+		return ""
+	}
+	priority := []string{"Ready", "Healthy", "Available", "Established", "Succeeded"}
+	for _, expected := range priority {
+		for _, condition := range conditions {
+			value, ok := condition.(map[string]any)
+			if !ok || value["type"] != expected {
+				continue
+			}
+			return conditionDisplayStatus(expected, fmt.Sprint(value["status"]))
+		}
+	}
+	for _, condition := range conditions {
+		value, ok := condition.(map[string]any)
+		if !ok {
+			continue
+		}
+		typeName, status := fmt.Sprint(value["type"]), fmt.Sprint(value["status"])
+		if typeName != "" && status != "" && typeName != "<nil>" && status != "<nil>" {
+			return typeName + " " + status
+		}
+	}
 	return ""
+}
+
+func conditionDisplayStatus(conditionType, value string) string {
+	switch conditionType {
+	case "Ready":
+		switch value {
+		case "True":
+			return "Ready"
+		case "False":
+			return "NotReady"
+		default:
+			return "Unknown"
+		}
+	case "Healthy":
+		if value == "True" {
+			return "Healthy"
+		}
+		if value == "False" {
+			return "Unhealthy"
+		}
+	case "Available":
+		if value == "True" {
+			return "Available"
+		}
+		if value == "False" {
+			return "Unavailable"
+		}
+	case "Established":
+		if value == "True" {
+			return "Established"
+		}
+		if value == "False" {
+			return "NotEstablished"
+		}
+	case "Succeeded":
+		if value == "True" {
+			return "Succeeded"
+		}
+		if value == "False" {
+			return "Failed"
+		}
+	}
+	return "Unknown"
 }
 func humanDuration(created time.Time) string {
 	d := time.Since(created)

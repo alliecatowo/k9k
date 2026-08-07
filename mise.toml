@@ -36,9 +36,13 @@ run = "cd Backend && go test ./..."
 description = "Build the app as a Swift smoke test"
 run = "xcodebuild -project K9k.xcodeproj -scheme K9k -configuration Debug -sdk macosx build CODE_SIGNING_ALLOWED=NO"
 
+[tasks.test-benchmark-history]
+description = "Test bounded, local-only benchmark history"
+run = "Scripts/test-benchmark-history.sh"
+
 [tasks.test]
 description = "Run K9k unit tests"
-run = "mise run test-go && mise run test-swift"
+run = "mise run test-go && mise run test-benchmark-history && mise run test-swift"
 
 [tasks.format]
 description = "Format Go sources"

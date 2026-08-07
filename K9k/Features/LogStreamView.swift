@@ -9,6 +9,8 @@ struct LogStreamView: View {
     @State private var selectedContainer = ""
     @State private var previous = false
     @State private var timestamps = true
+    @State private var tailLines = 500
+    @State private var sinceSeconds: Int?
     @State private var filter = ""
     @State private var wrapsLines = false
 
@@ -29,10 +31,33 @@ struct LogStreamView: View {
                 if containers.count > 1 {
                     Picker("Container", selection: $selectedContainer) { ForEach(containers, id: \.self) { Text($0).tag($0) } }.frame(maxWidth: 160)
                 }
+                Menu {
+                    Picker("Recent lines", selection: $tailLines) {
+                        Text("100 lines").tag(100)
+                        Text("500 lines").tag(500)
+                        Text("2,000 lines").tag(2_000)
+                        Text("5,000 lines").tag(5_000)
+                        Text("10,000 lines").tag(10_000)
+                    }
+                } label: {
+                    Label("\(tailLines) lines", systemImage: "text.line.first.and.arrowtriangle.forward")
+                }
+                Menu {
+                    Picker("Start time", selection: $sinceSeconds) {
+                        Text("Any available time").tag(Optional<Int>.none)
+                        Text("Last 5 minutes").tag(Optional(5 * 60))
+                        Text("Last 15 minutes").tag(Optional(15 * 60))
+                        Text("Last hour").tag(Optional(60 * 60))
+                        Text("Last 6 hours").tag(Optional(6 * 60 * 60))
+                        Text("Last day").tag(Optional(24 * 60 * 60))
+                    }
+                } label: {
+                    Label(sinceLabel, systemImage: "clock.arrow.circlepath")
+                }
                 Toggle("Previous", isOn: $previous).toggleStyle(.switch)
                 Toggle("Timestamps", isOn: $timestamps).toggleStyle(.switch)
                 Toggle("Follow", isOn: $isFollowing).toggleStyle(.switch)
-                Button("Reload") { Task { await store.openLogs(for: resource, container: selectedContainer, previous: previous, timestamps: timestamps) } }
+                Button("Reload") { reload() }
                 Toggle("Wrap", isOn: $wrapsLines).toggleStyle(.switch)
                 Button("Copy") { copyVisibleLines() }.disabled(visibleLines.isEmpty)
                 Button("Save…") { saveVisibleLines() }.disabled(visibleLines.isEmpty)
@@ -44,6 +69,13 @@ struct LogStreamView: View {
                 .textFieldStyle(.roundedBorder)
                 .padding(.horizontal)
                 .padding(.vertical, 8)
+            if store.droppedLogLineCount > 0 {
+                Text("K9k kept the newest 10,000 streamed lines; \(store.droppedLogLineCount) earlier line\(store.droppedLogLineCount == 1 ? "" : "s") were discarded from this view.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal)
+                    .padding(.bottom, 6)
+            }
             ScrollViewReader { proxy in
                 ScrollView([.vertical, .horizontal]) {
                     LazyVStack(alignment: .leading, spacing: 2) {
@@ -63,8 +95,30 @@ struct LogStreamView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 440)
-        .task { selectedContainer = containers.first ?? ""; await store.openLogs(for: resource, container: selectedContainer, previous: previous, timestamps: timestamps) }
+        .task { selectedContainer = containers.first ?? ""; await store.openLogs(for: resource, container: selectedContainer, previous: previous, timestamps: timestamps, follow: isFollowing, tailLines: tailLines, sinceSeconds: sinceSeconds) }
         .onDisappear { Task { await store.closeLogs() } }
+    }
+
+    private var sinceLabel: String {
+        switch sinceSeconds {
+        case .none: "Any time"
+        case .some(300): "Last 5m"
+        case .some(900): "Last 15m"
+        case .some(3_600): "Last hour"
+        case .some(21_600): "Last 6h"
+        case .some(86_400): "Last day"
+        default: "Recent"
+        }
+    }
+
+    private func reload() {
+        Task {
+            await store.openLogs(
+                for: resource, container: selectedContainer, previous: previous,
+                timestamps: timestamps, follow: isFollowing, tailLines: tailLines,
+                sinceSeconds: sinceSeconds
+            )
+        }
     }
 
     private func copyVisibleLines() {

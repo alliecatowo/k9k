@@ -637,6 +637,21 @@ type ManifestDocument struct {
 	YAML     string           `json:"yaml"`
 }
 
+// PodLogRequest is the bounded client-go log query used by the streaming
+// protocol. The API server validates every numeric limit before this reaches
+// a Kubernetes client.
+type PodLogRequest struct {
+	Namespace    string
+	Pod          string
+	Container    string
+	Previous     bool
+	Follow       bool
+	Timestamps   bool
+	TailLines    int64
+	SinceSeconds int64
+	LimitBytes   int64
+}
+
 // ManifestDiffResult compares the currently selected live object with the
 // server-side-apply dry-run of an imported manifest.  Both documents are
 // canonical editable YAML, so volatile metadata and status cannot create

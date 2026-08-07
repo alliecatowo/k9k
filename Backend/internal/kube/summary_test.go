@@ -18,6 +18,8 @@ func TestSummarizeDerivesControllerStatus(t *testing.T) {
 		{"job", map[string]any{"kind": "Job", "status": map[string]any{"succeeded": int64(1)}}, "Succeeded"},
 		{"cron job", map[string]any{"kind": "CronJob", "status": map[string]any{"lastScheduleTime": "2026-08-07T12:00:00Z"}}, "Scheduled"},
 		{"node", map[string]any{"kind": "Node", "status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": "True"}}}}, "Ready"},
+		{"schema free custom resource ready", map[string]any{"apiVersion": "widgets.example.io/v1", "kind": "Widget", "status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": "False"}}}}, "NotReady"},
+		{"schema free custom resource condition", map[string]any{"apiVersion": "widgets.example.io/v1", "kind": "Widget", "status": map[string]any{"conditions": []any{map[string]any{"type": "Reconciling", "status": "True"}}}}, "Reconciling True"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := Summarize(&unstructured.Unstructured{Object: test.object}).Status; got != test.want {

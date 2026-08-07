@@ -77,6 +77,7 @@ final class ClusterStore {
 
     var events: [ClusterEvent] = []
     var logLines: [String] = []
+    var droppedLogLineCount = 0
     var activeLogStreamID: String?
     var activePortForwards: [ActivePortForward] = []
     var activeExecStreamID: String?
@@ -143,6 +144,7 @@ final class ClusterStore {
     private var portForwardReconnectRequests: [ActivePortForward.ID: PortForwardReconnectRequest] = [:]
     private var portForwardReconnectTasks: [ActivePortForward.ID: Task<Void, Never>] = [:]
     private var portForwardFailureMessages: [String: String] = [:]
+    private let maximumLogLines = 10_000
 
     private let client = CoreClient()
 
@@ -1817,16 +1819,27 @@ final class ClusterStore {
         }
     }
 
-    func openLogs(for resource: ResourceSummary, container: String = "", previous: Bool = false, timestamps: Bool = true) async {
+    func openLogs(for resource: ResourceSummary, container: String = "", previous: Bool = false, timestamps: Bool = true, follow: Bool = true, tailLines: Int = 500, sinceSeconds: Int? = nil) async {
         guard resource.kind == "Pod", let namespace = resource.namespace else { return }
+        guard (1...10_000).contains(tailLines) else {
+            errorMessage = "Log history must be between 1 and 10,000 lines."
+            return
+        }
+        if let sinceSeconds, !(0...(31 * 24 * 60 * 60)).contains(sinceSeconds) {
+            errorMessage = "Log history can cover at most the last 31 days."
+            return
+        }
         if let activeLogStreamID { await client.cancel(streamID: activeLogStreamID) }
         let streamID = UUID().uuidString
         logLines = []
+        droppedLogLineCount = 0
         activeLogStreamID = streamID
         do {
-            _ = try await client.request("logs.open", parameters: .object([
-                "streamID": .string(streamID), "namespace": .string(namespace), "pod": .string(resource.name), "container": .string(container), "previous": .bool(previous), "follow": .bool(true), "timestamps": .bool(timestamps), "tailLines": .number(500)
-            ]))
+            var parameters: [String: JSONValue] = [
+                "streamID": .string(streamID), "namespace": .string(namespace), "pod": .string(resource.name), "container": .string(container), "previous": .bool(previous), "follow": .bool(follow), "timestamps": .bool(timestamps), "tailLines": .number(Double(tailLines)),
+            ]
+            if let sinceSeconds { parameters["sinceSeconds"] = .number(Double(sinceSeconds)) }
+            _ = try await client.request("logs.open", parameters: .object(parameters))
         } catch { errorMessage = error.localizedDescription }
     }
 
@@ -2139,7 +2152,19 @@ final class ClusterStore {
         }
         if event.streamID == activeLogStreamID, event.type == "logs.data", let line = event.result?.objectValue?["line"]?.stringValue {
             logLines.append(line)
-            if logLines.count > 10_000 { logLines.removeFirst(logLines.count - 10_000) }
+            if logLines.count > maximumLogLines {
+                let overflow = logLines.count - maximumLogLines
+                logLines.removeFirst(overflow)
+                droppedLogLineCount += overflow
+            }
+            return
+        }
+        if event.streamID == activeLogStreamID, event.type == "logs.error" {
+            errorMessage = event.result?.objectValue?["message"]?.stringValue ?? "The log stream ended with an error."
+            return
+        }
+        if event.streamID == activeLogStreamID, event.type == "logs.closed" {
+            activeLogStreamID = nil
             return
         }
         if event.type == "portforward.error", let streamID = event.streamID,

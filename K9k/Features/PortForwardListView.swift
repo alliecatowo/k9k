@@ -4,6 +4,7 @@ import SwiftUI
 struct PortForwardListView: View {
     @Environment(ClusterStore.self) private var store
     @Binding var isPresented: Bool
+    let benchmarkHistory: BenchmarkHistoryStore
     @State private var benchmarkForward: ActivePortForward?
 
     var body: some View {
@@ -48,6 +49,6 @@ struct PortForwardListView: View {
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { isPresented = false } } }
         }
         .frame(minWidth: 580, minHeight: 360)
-        .sheet(item: $benchmarkForward) { HTTPBenchmarkView(forward: $0) }
+        .sheet(item: $benchmarkForward) { HTTPBenchmarkView(forward: $0, history: benchmarkHistory) }
     }
 }

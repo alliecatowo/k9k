@@ -7,7 +7,7 @@ import Foundation
 /// every configured view as one concatenated string column.
 struct K9sViewColumn: Identifiable, Hashable {
     enum Source: Hashable {
-        case name, namespace, status, age, kind, uid, resourceVersion, labels
+        case name, namespace, status, age, kind, apiVersion, uid, resourceVersion, labels
         case label(String)
         case projection(String)
         case ready(readyPath: String, desiredPath: String)
@@ -39,6 +39,7 @@ struct K9sViewColumn: Identifiable, Hashable {
         case .status: resource.status
         case .age: resource.age
         case .kind: resource.kind
+        case .apiVersion: resource.apiVersion
         case .uid: resource.uid
         case .resourceVersion: resource.resourceVersion ?? "—"
         case .labels:
@@ -121,7 +122,6 @@ struct K9sViewColumn: Identifiable, Hashable {
         let name = column("Name", .name)
         let status = column("Status", .status)
         let age = column("Age", .age, rightAligned: true)
-        let kind = column("Kind", .kind)
         let projection: (String, String, Bool) -> K9sViewColumn = { title, path, rightAligned in
             column(title, .projection(path), rightAligned: rightAligned)
         }
@@ -152,7 +152,15 @@ struct K9sViewColumn: Identifiable, Hashable {
         case "role", "clusterrole", "serviceaccount":
             return [name, age]
         default:
-            return [name, status, age, kind]
+            // Dynamic resources have no safe common spec. Present only stable
+            // discovery identity and schema-free status metadata; no guessed
+            // CRD columns or raw list object are required.
+            var columns = [name]
+            if type.namespaced { columns.append(column("Namespace", .namespace)) }
+            columns.append(status)
+            columns.append(age)
+            columns.append(column("API Version", .apiVersion))
+            return columns
         }
     }
 
@@ -163,6 +171,7 @@ struct K9sViewColumn: Identifiable, Hashable {
         case "STATUS", "PHASE": .status
         case "AGE", "CREATED": .age
         case "KIND": .kind
+        case "APIVERSION", "API VERSION": .apiVersion
         case "UID": .uid
         case "RESOURCEVERSION", "RESOURCE VERSION", "RV": .resourceVersion
         case "LABELS": .labels

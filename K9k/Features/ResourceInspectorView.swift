@@ -133,6 +133,7 @@ struct ResourceInspectorView: View {
                 LabeledContent("Status", value: resource.status)
                 LabeledContent("Age", value: resource.age)
             }
+            schemaFreeDetails(resource, type: type)
             if let access = store.deleteAccess {
                 Section("Access") {
                     LabeledContent("Delete", value: access.allowed ? "Allowed" : "Not allowed")
@@ -188,6 +189,42 @@ struct ResourceInspectorView: View {
                 Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 Button("Open Pulse Diagnostics…") { store.openPulseDrilldown(for: resource) }
                 Button("Retry Metrics") { Task { await store.loadMetrics(for: resource) } }
+            }
+        }
+    }
+
+    @ViewBuilder private func schemaFreeDetails(_ resource: ResourceSummary, type: ResourceType?) -> some View {
+        // Avoid duplicating the dedicated Pod/Service/Node/workload/RBAC
+        // inspectors. Everything else, including arbitrary CRDs, is rendered
+        // only from structural Kubernetes conventions rather than a guessed
+        // OpenAPI schema or custom resource fields.
+        let specialisedKinds: Set<String> = ["Pod", "Service", "Node", "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "Job", "CronJob", "ConfigMap", "Secret", "Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding", "ServiceAccount"]
+        guard !specialisedKinds.contains(resource.kind), let raw = resource.raw?.objectValue else { return }
+        let metadata = raw["metadata"]?.objectValue ?? [:]
+        let spec = raw["spec"]?.objectValue ?? [:]
+        let status = raw["status"]?.objectValue ?? [:]
+        Section("Resource Identity") {
+            if let type { LabeledContent("Resource", value: type.gvr) }
+            LabeledContent("API Version", value: resource.apiVersion)
+            LabeledContent("Scope", value: resource.namespace?.isEmpty == false ? "Namespaced" : "Cluster-scoped")
+            if let generation = metadata["generation"]?.intValue { LabeledContent("Generation", value: "\(generation)") }
+            if let observed = status["observedGeneration"]?.intValue { LabeledContent("Observed generation", value: "\(observed)") }
+            if !spec.isEmpty { LabeledContent("Spec fields", value: "\(spec.count)") }
+            if !status.isEmpty { LabeledContent("Status fields", value: "\(status.count)") }
+        }
+        let conditions = status["conditions"]?.arrayValue ?? []
+        if !conditions.isEmpty {
+            Section("Conditions") {
+                ForEach(Array(conditions.enumerated()), id: \.offset) { _, condition in
+                    if let value = condition.objectValue, let conditionType = value["type"]?.stringValue {
+                        VStack(alignment: .leading, spacing: 2) {
+                            LabeledContent(conditionType, value: value["status"]?.stringValue ?? "Unknown")
+                            if let reason = value["reason"]?.stringValue, !reason.isEmpty { Text(reason).font(.caption).foregroundStyle(.secondary) }
+                            if let message = value["message"]?.stringValue, !message.isEmpty { Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                            if let transition = value["lastTransitionTime"]?.stringValue, !transition.isEmpty { Text("Last transition: \(transition)").font(.caption2).foregroundStyle(.tertiary) }
+                        }
+                    }
+                }
             }
         }
     }
