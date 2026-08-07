@@ -338,7 +338,9 @@ func (c *Cluster) ListPage(ctx context.Context, gvr schema.GroupVersionResource,
 	for i := range list.Items {
 		summary := Summarize(&list.Items[i])
 		summary.ResourceVersion = list.Items[i].GetResourceVersion()
-		summary.Raw = nil
+		if !query.IncludeRaw {
+			summary.Raw = nil
+		}
 		if len(query.Columns) > 0 {
 			summary.Columns = make(map[string]string, len(query.Columns))
 			for _, path := range query.Columns {

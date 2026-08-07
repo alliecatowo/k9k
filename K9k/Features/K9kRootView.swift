@@ -13,6 +13,7 @@ struct K9kRootView: View {
     @State private var cronJobTriggerConfirmation = false
     @State private var terminalPresented = false
     @State private var terminalMode: PodTerminalMode = .shell
+    @State private var podFileTransferPresented = false
     @State private var manifestEditorPresented = false
     @State private var relationshipsPresented = false
     @State private var nodeCordonConfirmation = false
@@ -65,6 +66,11 @@ struct K9kRootView: View {
             accessCheckPresented: $accessCheckPresented,
             navigationHelpPresented: $navigationHelpPresented
         ))
+        .sheet(isPresented: $podFileTransferPresented) {
+            if let resource = store.resource(for: store.selectedResources.first) {
+                PodFileTransferView(resource: resource)
+            }
+        }
     }
 
     @ViewBuilder private func navigationContent(selectedResourceType: Binding<ResourceType?>) -> some View {
@@ -283,6 +289,8 @@ struct K9kRootView: View {
                     Button("Attach…") { terminalMode = .attach; terminalPresented = true }
                         .disabled(store.isReadOnly)
                     Button("Debug Container…") { debugPresented = true }
+                        .disabled(store.isReadOnly)
+                    Button("File Transfer…") { podFileTransferPresented = true }
                         .disabled(store.isReadOnly)
                 }
                 if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Service" {

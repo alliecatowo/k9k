@@ -150,7 +150,7 @@ func (s *Server) readRequests(ctx context.Context) error {
 		// Input and resize frames must retain their NDJSON arrival order. Both
 		// operations are bounded/non-blocking, so handling them on the reader
 		// goroutine cannot stall cancellation or ordinary API requests.
-		if request.Operation == "exec.stdin" || request.Operation == "exec.resize" {
+		if request.Operation == "exec.stdin" || request.Operation == "exec.stdin.close" || request.Operation == "exec.resize" {
 			s.dispatch(ctx, request)
 			continue
 		}
@@ -595,6 +595,23 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(historyErr)
 		}
 		return result, nil
+	case "helm.inspect":
+		var params HelmReleaseInspectionRequest
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		params, err := validateHelmInspectionParams(params)
+		if err != nil {
+			if strings.Contains(err.Error(), "acknowledgeSensitive") {
+				return nil, &operationError{code: "confirmation_required", err: err}
+			}
+			return nil, invalidParams(err)
+		}
+		result, inspectErr := s.helmInspect(ctx, params)
+		if inspectErr != nil {
+			return nil, kubeError(inspectErr)
+		}
+		return result, nil
 	case "relationships.get":
 		params, err := decodeResourceParams(request.Params, true)
 		if err != nil {
@@ -888,6 +905,23 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, invalidParams(err)
 		}
 		return map[string]any{"streamID": params.StreamID, "accepted": true, "bytes": len(params.Data)}, nil
+	case "exec.stdin.close":
+		streamID, err := decodeExecStreamID(request)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		session := s.execSession(streamID)
+		if session == nil {
+			return nil, &operationError{code: "stream_not_found", err: fmt.Errorf("exec stream %q is not active", streamID)}
+		}
+		if !session.stdin {
+			return nil, invalidParams(errors.New("exec.stdin.close requires an exec stream opened with stdin: true"))
+		}
+		// Closing stdin is deliberately distinct from cancelling the stream: a
+		// non-interactive command such as `tar -x -f -` must see EOF, flush its
+		// archive, and report its true remote exit status.
+		session.input.Close()
+		return map[string]any{"streamID": streamID, "closed": true}, nil
 	case "exec.resize":
 		params, err := decodeExecResizeParams(request)
 		if err != nil {
@@ -1058,6 +1092,26 @@ type execInputParams struct {
 	StreamID   string  `json:"streamID"`
 	Data       *string `json:"data"`
 	DataBase64 *string `json:"dataBase64"`
+}
+
+// decodeExecStreamID accepts the same stream addressing convention as the
+// rest of the streaming protocol. Keeping this independent from stdin bytes
+// lets callers half-close a binary stream without fabricating a final frame.
+func decodeExecStreamID(request protocol.Request) (string, error) {
+	var params struct {
+		StreamID string `json:"streamID"`
+	}
+	if err := decodeParams(request.Params, &params); err != nil {
+		return "", err
+	}
+	streamID := request.StreamID
+	if streamID == "" {
+		streamID = params.StreamID
+	}
+	if streamID == "" {
+		return "", errors.New("streamID is required")
+	}
+	return streamID, nil
 }
 
 func decodeExecInputParams(request protocol.Request) (struct {

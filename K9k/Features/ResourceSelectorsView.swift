@@ -8,6 +8,7 @@ struct ResourceSelectorsView: View {
     @Binding var isPresented: Bool
     @State private var labelSelector = ""
     @State private var fieldSelector = ""
+    @State private var savedQueryName = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,6 +25,45 @@ struct ResourceSelectorsView: View {
                     Text("Selectors narrow both the initial list and the live watch. Kubernetes validates their syntax and reports any unsupported field.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+                Section("Saved queries") {
+                    if store.savedQueries(for: store.selectedResourceType).isEmpty {
+                        Text("Save a useful production or staging scope here. Saved queries are local to this Kubernetes context.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(store.savedQueries(for: store.selectedResourceType)) { query in
+                            HStack {
+                                Button {
+                                    Task {
+                                        await store.applySavedSelectorQuery(query)
+                                        isPresented = false
+                                    }
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(query.name)
+                                        Text(query.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                Spacer()
+                                Button("Delete", role: .destructive) { store.removeSavedSelectorQuery(query) }
+                                    .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                    HStack {
+                        TextField("Query name", text: $savedQueryName)
+                        Button("Save Current") {
+                            store.saveSelectorQuery(
+                                named: savedQueryName,
+                                labelSelector: labelSelector.trimmingCharacters(in: .whitespacesAndNewlines),
+                                fieldSelector: fieldSelector.trimmingCharacters(in: .whitespacesAndNewlines)
+                            )
+                            savedQueryName = ""
+                        }
+                        .disabled(savedQueryName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.selectedResourceType == nil)
+                    }
                 }
             }
             .formStyle(.grouped)

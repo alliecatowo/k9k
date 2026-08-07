@@ -1,22 +1,37 @@
 package api
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-const maxHelmHistoryRevisions = 128
+const (
+	maxHelmHistoryRevisions      = 128
+	maxHelmDecodedReleaseBytes   = 4 << 20
+	maxHelmSensitiveContentBytes = 1 << 20
+	helmSensitiveContentWarning  = "This release content can contain credentials, tokens, endpoints, or other production-sensitive values."
+)
+
+var helmSecretsGVR = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
 
 // helmHistory converts Helm v3's standard Secret labels into a stable,
-// metadata-only history. The release payload is intentionally never decoded:
-// its contents can include chart values, credentials, and rendered objects.
+// metadata-only history. It deliberately does not decode a release payload;
+// the separately gated helmInspect path verifies a selected revision before
+// reading its bounded, opt-in sensitive fields.
 func (s *Server) helmHistory(ctx context.Context, namespace, release string) (HelmReleaseHistory, error) {
-	secrets, err := s.cluster.List(ctx, schema.GroupVersionResource{Version: "v1", Resource: "secrets"}, namespace, true, "owner=helm", "")
+	secrets, err := s.cluster.List(ctx, helmSecretsGVR, namespace, true, "owner=helm", "")
 	if err != nil {
 		return HelmReleaseHistory{}, err
 	}
@@ -91,4 +106,232 @@ func validateHelmHistoryParams(namespace, release string) (string, string, error
 		return "", "", fmt.Errorf("release must not exceed 253 characters")
 	}
 	return namespace, release, nil
+}
+
+// HelmReleaseInspectionRequest names an already-discovered Helm storage
+// Secret. The server verifies every identity component again before decoding
+// its opaque release payload, so a caller cannot use this read path to expose
+// arbitrary Kubernetes Secret data.
+type HelmReleaseInspectionRequest struct {
+	Namespace            string `json:"namespace"`
+	Release              string `json:"release"`
+	StorageName          string `json:"storageName"`
+	Revision             int    `json:"revision"`
+	IncludeSensitive     bool   `json:"includeSensitive"`
+	AcknowledgeSensitive bool   `json:"acknowledgeSensitive"`
+}
+
+func validateHelmInspectionParams(params HelmReleaseInspectionRequest) (HelmReleaseInspectionRequest, error) {
+	namespace, release, err := validateHelmHistoryParams(params.Namespace, params.Release)
+	if err != nil {
+		return HelmReleaseInspectionRequest{}, err
+	}
+	params.Namespace, params.Release = namespace, release
+	params.StorageName = strings.TrimSpace(params.StorageName)
+	if params.Namespace == "" {
+		return HelmReleaseInspectionRequest{}, fmt.Errorf("namespace is required for Helm Secret storage")
+	}
+	if params.StorageName == "" || len(params.StorageName) > 253 {
+		return HelmReleaseInspectionRequest{}, fmt.Errorf("a valid Helm storage name is required")
+	}
+	if params.Revision < 1 {
+		return HelmReleaseInspectionRequest{}, fmt.Errorf("a positive Helm revision is required")
+	}
+	if params.IncludeSensitive && !params.AcknowledgeSensitive {
+		return HelmReleaseInspectionRequest{}, fmt.Errorf("set acknowledgeSensitive: true before reading sensitive Helm content")
+	}
+	return params, nil
+}
+
+// helmInspect reads Helm's default v3 Secret driver directly through
+// client-go. It does not call Helm, invoke a shell, or mutate release storage.
+func (s *Server) helmInspect(ctx context.Context, request HelmReleaseInspectionRequest) (HelmReleaseInspection, error) {
+	secret, err := s.cluster.Get(ctx, helmSecretsGVR, request.Namespace, request.StorageName, true)
+	if err != nil {
+		return HelmReleaseInspection{}, err
+	}
+	if secret == nil {
+		return HelmReleaseInspection{}, fmt.Errorf("Helm storage Secret was not found")
+	}
+	labels := secret.GetLabels()
+	if labels["owner"] != "helm" || helmReleaseNameFromMetadata(labels, secret.GetAnnotations()) != request.Release {
+		return HelmReleaseInspection{}, fmt.Errorf("requested Secret is not Helm storage for release %q", request.Release)
+	}
+	if revision := helmRevisionFromLabels(labels); revision != request.Revision {
+		return HelmReleaseInspection{}, fmt.Errorf("requested Secret does not match Helm revision %d", request.Revision)
+	}
+
+	payload, err := decodeHelmStorageSecret(secret)
+	if err != nil {
+		return HelmReleaseInspection{}, err
+	}
+	if payload.Name != request.Release || (payload.Version != 0 && payload.Version != request.Revision) {
+		return HelmReleaseInspection{}, fmt.Errorf("Helm storage payload identity does not match the selected revision")
+	}
+	if payload.Namespace != "" && payload.Namespace != request.Namespace {
+		return HelmReleaseInspection{}, fmt.Errorf("Helm storage payload namespace does not match the selected release")
+	}
+
+	metadata := payload.Chart.Metadata
+	if metadata == nil {
+		return HelmReleaseInspection{}, fmt.Errorf("Helm release has no chart metadata")
+	}
+	inspection := HelmReleaseInspection{
+		Release: request.Release, Namespace: request.Namespace,
+		Revision:                  HelmReleaseRevision{Revision: request.Revision, Status: helmStatusFromLabels(labels), StorageName: secret.GetName(), CreatedAt: secret.GetCreationTimestamp().Time},
+		Chart:                     chartMetadataProjection(metadata),
+		SensitiveContentAvailable: payload.Manifest != "" || payload.Info.Notes != "" || len(payload.Config) > 0,
+	}
+	if request.IncludeSensitive {
+		inspection.Sensitive, err = payload.sensitiveContents()
+		if err != nil {
+			return HelmReleaseInspection{}, err
+		}
+	}
+	return inspection, nil
+}
+
+func helmReleaseNameFromMetadata(labels, annotations map[string]string) string {
+	if name := strings.TrimSpace(labels["name"]); name != "" {
+		return name
+	}
+	return strings.TrimSpace(annotations["meta.helm.sh/release-name"])
+}
+
+func helmRevisionFromLabels(labels map[string]string) int {
+	revision, err := strconv.Atoi(strings.TrimSpace(labels["version"]))
+	if err != nil || revision < 1 {
+		return 0
+	}
+	return revision
+}
+
+func helmStatusFromLabels(labels map[string]string) string {
+	if status := strings.TrimSpace(labels["status"]); status != "" {
+		return status
+	}
+	return "unknown"
+}
+
+// helmReleasePayload models only the stable JSON fields Helm's storage
+// driver encodes. We intentionally do not deserialize templates, raw chart
+// files, hooks, or Kubernetes runtime objects from the opaque archive.
+type helmReleasePayload struct {
+	Name      string                `json:"name"`
+	Namespace string                `json:"namespace"`
+	Version   int                   `json:"version"`
+	Chart     helmStoredChart       `json:"chart"`
+	Config    map[string]any        `json:"config"`
+	Manifest  string                `json:"manifest"`
+	Info      helmStoredReleaseInfo `json:"info"`
+}
+
+type helmStoredChart struct {
+	Metadata *helmStoredChartMetadata `json:"metadata"`
+}
+
+type helmStoredReleaseInfo struct {
+	Notes string `json:"notes"`
+}
+
+type helmStoredChartMetadata struct {
+	Name        string   `json:"name"`
+	Version     string   `json:"version"`
+	AppVersion  string   `json:"appVersion"`
+	APIVersion  string   `json:"apiVersion"`
+	Description string   `json:"description"`
+	Type        string   `json:"type"`
+	Home        string   `json:"home"`
+	Icon        string   `json:"icon"`
+	KubeVersion string   `json:"kubeVersion"`
+	Deprecated  bool     `json:"deprecated"`
+	Sources     []string `json:"sources"`
+	Keywords    []string `json:"keywords"`
+}
+
+func chartMetadataProjection(metadata *helmStoredChartMetadata) HelmChartMetadata {
+	return HelmChartMetadata{
+		Name: metadata.Name, Version: metadata.Version, AppVersion: metadata.AppVersion, APIVersion: metadata.APIVersion,
+		Description: metadata.Description, Type: metadata.Type, Home: metadata.Home, Icon: metadata.Icon,
+		KubeVersion: metadata.KubeVersion, Deprecated: metadata.Deprecated,
+		Sources: append([]string{}, metadata.Sources...), Keywords: append([]string{}, metadata.Keywords...),
+	}
+}
+
+func decodeHelmStorageSecret(secret *unstructured.Unstructured) (helmReleasePayload, error) {
+	encodedSecretData, found, err := unstructured.NestedString(secret.Object, "data", "release")
+	if err != nil || !found || strings.TrimSpace(encodedSecretData) == "" {
+		return helmReleasePayload{}, fmt.Errorf("Helm storage Secret has no release payload")
+	}
+	// Kubernetes serializes Secret data as base64 JSON. Helm then stores its
+	// own base64 release envelope inside that byte sequence, so two decodes are
+	// required for dynamic/unstructured client-go reads.
+	helmEnvelope, err := base64.StdEncoding.DecodeString(encodedSecretData)
+	if err != nil {
+		return helmReleasePayload{}, fmt.Errorf("decode Kubernetes Helm Secret data: %w", err)
+	}
+	payload, err := base64.StdEncoding.DecodeString(string(helmEnvelope))
+	if err != nil {
+		return helmReleasePayload{}, fmt.Errorf("decode Helm release envelope: %w", err)
+	}
+	if len(payload) >= 3 && bytes.Equal(payload[:3], []byte{0x1f, 0x8b, 0x08}) {
+		reader, err := gzip.NewReader(bytes.NewReader(payload))
+		if err != nil {
+			return helmReleasePayload{}, fmt.Errorf("open Helm release compression: %w", err)
+		}
+		decompressed, readErr := readHelmReleaseBounded(reader)
+		closeErr := reader.Close()
+		if readErr != nil {
+			return helmReleasePayload{}, readErr
+		}
+		if closeErr != nil {
+			return helmReleasePayload{}, fmt.Errorf("close Helm release compression: %w", closeErr)
+		}
+		payload = decompressed
+	}
+	if len(payload) > maxHelmDecodedReleaseBytes {
+		return helmReleasePayload{}, fmt.Errorf("Helm release payload exceeds the %d-byte inspection limit", maxHelmDecodedReleaseBytes)
+	}
+	var result helmReleasePayload
+	if err := json.Unmarshal(payload, &result); err != nil {
+		return helmReleasePayload{}, fmt.Errorf("decode Helm release payload: %w", err)
+	}
+	return result, nil
+}
+
+func readHelmReleaseBounded(reader io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, maxHelmDecodedReleaseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read Helm release payload: %w", err)
+	}
+	if len(data) > maxHelmDecodedReleaseBytes {
+		return nil, fmt.Errorf("Helm release payload exceeds the %d-byte inspection limit", maxHelmDecodedReleaseBytes)
+	}
+	return data, nil
+}
+
+func (payload helmReleasePayload) sensitiveContents() (*HelmSensitiveContents, error) {
+	values := ""
+	if len(payload.Config) > 0 {
+		data, err := json.MarshalIndent(payload.Config, "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("encode Helm release values for inspection: %w", err)
+		}
+		values = string(data)
+	}
+	manifest, manifestTruncated := truncateHelmText(payload.Manifest)
+	notes, notesTruncated := truncateHelmText(payload.Info.Notes)
+	values, valuesTruncated := truncateHelmText(values)
+	return &HelmSensitiveContents{Warning: helmSensitiveContentWarning, Manifest: manifest, ManifestTruncated: manifestTruncated, Notes: notes, NotesTruncated: notesTruncated, ValuesJSON: values, ValuesTruncated: valuesTruncated}, nil
+}
+
+func truncateHelmText(value string) (string, bool) {
+	if len(value) <= maxHelmSensitiveContentBytes {
+		return value, false
+	}
+	end := maxHelmSensitiveContentBytes
+	for end > 0 && !utf8.ValidString(value[:end]) {
+		end--
+	}
+	return value[:end], true
 }

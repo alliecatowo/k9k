@@ -1516,6 +1516,54 @@ func TestServerAttachStartsTerminalWithoutCommand(t *testing.T) {
 	}
 }
 
+func TestServerExecInputCloseDeliversEOFWithoutCancellingRemoteCommand(t *testing.T) {
+	received := make(chan []byte, 1)
+	client := &fakeCluster{execFn: func(_ context.Context, request PodExecRequest, streams PodExecStreams) error {
+		if request.TTY || !request.Stdin {
+			t.Errorf("transfer exec request = %#v", request)
+		}
+		payload, err := io.ReadAll(streams.Stdin)
+		if err != nil {
+			return err
+		}
+		received <- payload
+		_, err = streams.Stdout.Write([]byte("extracted"))
+		return err
+	}}
+	inputReader, inputWriter := io.Pipe()
+	var output lockedBuffer
+	server := NewServer(client, inputReader, &output)
+	done := make(chan error, 1)
+	go func() { done <- server.Run(context.Background()) }()
+
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "open", Operation: "exec.open", StreamID: "transfer", Params: json.RawMessage(`{"namespace":"demo","pod":"api","command":["tar","-x","-f","-"],"tty":false,"stdin":true}`)})
+	waitFor(t, &output, func(values []protocol.Envelope) bool { return hasEnvelope(values, "open", "response") })
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "bytes", Operation: "exec.stdin", StreamID: "transfer", Params: json.RawMessage(`{"dataBase64":"AP8B"}`)})
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "eof", Operation: "exec.stdin.close", StreamID: "transfer", Params: json.RawMessage(`{}`)})
+	waitFor(t, &output, func(values []protocol.Envelope) bool {
+		return hasEnvelope(values, "bytes", "response") && hasEnvelope(values, "eof", "response") && hasEnvelope(values, "", "exec.closed")
+	})
+	select {
+	case got := <-received:
+		if !bytes.Equal(got, []byte{0x00, 0xff, 0x01}) {
+			t.Errorf("stdin bytes = %x", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("transfer command did not receive EOF")
+	}
+	for _, value := range decodeEnvelopes(t, output.String()) {
+		if value.Type == "exec.closed" && mustObject(t, value.Result)["reason"] != "completed" {
+			t.Errorf("close = %#v", value.Result)
+		}
+	}
+	if err := inputWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestServerExecReportsRemoteExitAndRejectsBadFrames(t *testing.T) {
 	client := &fakeCluster{execErr: kubeexec.CodeExitError{Err: errors.New("command terminated with exit code 7"), Code: 7}}
 	inputReader, inputWriter := io.Pipe()

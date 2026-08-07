@@ -67,6 +67,10 @@ type ResourceListQuery struct {
 	Limit         int64
 	Continue      string
 	Columns       []string
+	// IncludeRaw is reserved for bounded internal consumers such as XRay. It
+	// is intentionally not exposed by resource.listPage: normal browser lists
+	// must stay lean and hydrate one selected object at a time.
+	IncludeRaw bool
 }
 
 // ResourceListPage is an additive v1 protocol response. ResourceVersion is
@@ -104,6 +108,51 @@ type HelmReleaseRevision struct {
 	Age         string    `json:"age"`
 }
 
+// HelmReleaseInspection is a bounded, read-only projection of one revision
+// stored by Helm's default v3 Secret driver. Chart metadata is returned by
+// default. The release manifest, rendered NOTES, and user-supplied values are
+// deliberately omitted unless the caller explicitly acknowledges they may
+// contain credentials or other production-sensitive material.
+type HelmReleaseInspection struct {
+	Release                   string                 `json:"release"`
+	Namespace                 string                 `json:"namespace"`
+	Revision                  HelmReleaseRevision    `json:"revision"`
+	Chart                     HelmChartMetadata      `json:"chart"`
+	SensitiveContentAvailable bool                   `json:"sensitiveContentAvailable"`
+	Sensitive                 *HelmSensitiveContents `json:"sensitive,omitempty"`
+}
+
+// HelmChartMetadata is intentionally the public Chart.yaml metadata rather
+// than Helm's complete Chart archive. Templates, embedded files, and chart
+// default values are not exported from the storage payload.
+type HelmChartMetadata struct {
+	Name        string   `json:"name"`
+	Version     string   `json:"version"`
+	AppVersion  string   `json:"appVersion,omitempty"`
+	APIVersion  string   `json:"apiVersion,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Type        string   `json:"type,omitempty"`
+	Home        string   `json:"home,omitempty"`
+	Icon        string   `json:"icon,omitempty"`
+	KubeVersion string   `json:"kubeVersion,omitempty"`
+	Deprecated  bool     `json:"deprecated"`
+	Sources     []string `json:"sources"`
+	Keywords    []string `json:"keywords"`
+}
+
+// HelmSensitiveContents is returned only after an explicit acknowledgement.
+// Every field is independently bounded and may be marked truncated, so a
+// compressed release Secret cannot turn into an unbounded IPC payload.
+type HelmSensitiveContents struct {
+	Warning           string `json:"warning"`
+	Manifest          string `json:"manifest,omitempty"`
+	ManifestTruncated bool   `json:"manifestTruncated"`
+	Notes             string `json:"notes,omitempty"`
+	NotesTruncated    bool   `json:"notesTruncated"`
+	ValuesJSON        string `json:"valuesJSON,omitempty"`
+	ValuesTruncated   bool   `json:"valuesTruncated"`
+}
+
 // RelationshipGraph is a bounded, read-only topology snapshot centred on one
 // selected object. Nodes use stable object identity where Kubernetes provided
 // a UID; unresolved references are retained rather than silently discarded.
@@ -112,6 +161,10 @@ type RelationshipGraph struct {
 	Nodes    []RelationshipNode `json:"nodes"`
 	Edges    []RelationshipEdge `json:"edges"`
 	Warnings []string           `json:"warnings"`
+	// Truncated is true when a deliberately finite XRay safety bound was hit.
+	// A partial graph is still useful, but must never masquerade as complete.
+	Truncated bool `json:"truncated"`
+	MaxDepth  int  `json:"maxDepth"`
 }
 
 type RelationshipNode struct {

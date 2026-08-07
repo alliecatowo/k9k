@@ -179,6 +179,47 @@ struct HelmReleaseRevision: Codable, Identifiable, Hashable {
     var id: String { storageName }
 }
 
+/// Read-only projection of one Helm v3 Secret-backed release revision. The
+/// sensitive payload is intentionally absent until the operator explicitly
+/// acknowledges it in the inspector.
+struct HelmReleaseInspection: Codable, Hashable {
+    let release: String
+    let namespace: String
+    let revision: HelmReleaseRevision
+    let chart: HelmChartMetadata
+    let sensitiveContentAvailable: Bool
+    let sensitive: HelmSensitiveContents?
+}
+
+struct HelmChartMetadata: Codable, Hashable {
+    let name: String
+    let version: String
+    let appVersion: String?
+    let apiVersion: String?
+    let description: String?
+    let type: String?
+    let home: String?
+    let icon: String?
+    let kubeVersion: String?
+    let deprecated: Bool
+    let sources: [String]
+    let keywords: [String]
+}
+
+/// The backend sets this only after an explicit acknowledgement. Manifest,
+/// release notes, and configured values are all treated as potentially
+/// sensitive because real-world charts routinely template credentials into
+/// them.
+struct HelmSensitiveContents: Codable, Hashable {
+    let warning: String
+    let manifest: String?
+    let manifestTruncated: Bool
+    let notes: String?
+    let notesTruncated: Bool
+    let valuesJSON: String?
+    let valuesTruncated: Bool
+}
+
 struct NodeDrainResult: Codable, Hashable {
     let node: String
     let evicted: [NodeDrainPod]
@@ -208,6 +249,8 @@ struct RelationshipGraph: Codable, Hashable {
     let nodes: [RelationshipNode]
     let edges: [RelationshipEdge]
     let warnings: [String]
+    let truncated: Bool
+    let maxDepth: Int
 
     var root: RelationshipNode? { nodes.first(where: { $0.id == rootID }) }
 

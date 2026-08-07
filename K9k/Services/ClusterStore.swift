@@ -32,6 +32,7 @@ final class ClusterStore {
     var loadedResourceCount = 0
     var remainingResourceCount: Int?
     var selectedResources = Set<ResourceSummary.ID>()
+    var savedResourceQueries: [SavedResourceQuery] = []
     var searchText = "" {
         didSet { recomputeVisibleResources() }
     }
@@ -108,12 +109,14 @@ final class ClusterStore {
     private var isRestoringNavigation = false
     private let navigationHistoryDefaultsKey = "k9k.resourceNavigationHistory.v1"
     private let navigationHistoryLimit = 30
+    private let savedResourceQueriesDefaultsKey = "k9k.savedResourceQueries.v1"
 
     private let client = CoreClient()
 
     init() {
         client.onEvent = { [weak self] envelope in self?.apply(event: envelope) }
         loadNavigationHistory()
+        loadSavedResourceQueries()
     }
 
     /// Current-context history only. This avoids a Back command unexpectedly
@@ -151,6 +154,55 @@ final class ClusterStore {
         let favorites = favoriteNamespaces.filter { namespaces.contains($0) }
         let remaining = namespaces.filter { $0 != "All Namespaces" && !favorites.contains($0) }.sorted()
         return ["All Namespaces"] + favorites + remaining
+    }
+
+    func savedQueries(for type: ResourceType? = nil) -> [SavedResourceQuery] {
+        guard let contextName = selectedContext?.name else { return [] }
+        return savedResourceQueries
+            .filter { $0.contextName == contextName && (type == nil || $0.resourceTypeID == type?.id) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func saveSelectorQuery(named name: String, labelSelector: String, fieldSelector: String) {
+        guard let type = selectedResourceType, let contextName = selectedContext?.name else { return }
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            errorMessage = "Give the saved query a name."
+            return
+        }
+        let query = SavedResourceQuery(
+            id: UUID(), name: trimmedName, contextName: contextName, resourceTypeID: type.id,
+            namespace: selectedNamespace, labelSelector: labelSelector, fieldSelector: fieldSelector, createdAt: Date()
+        )
+        savedResourceQueries.removeAll {
+            $0.contextName == query.contextName && $0.resourceTypeID == query.resourceTypeID &&
+                $0.name.caseInsensitiveCompare(query.name) == .orderedSame
+        }
+        savedResourceQueries.append(query)
+        persistSavedResourceQueries()
+    }
+
+    func removeSavedSelectorQuery(_ query: SavedResourceQuery) {
+        savedResourceQueries.removeAll { $0.id == query.id }
+        persistSavedResourceQueries()
+    }
+
+    func applySavedSelectorQuery(_ query: SavedResourceQuery) async {
+        guard query.contextName == selectedContext?.name,
+              let type = discoveredResources.first(where: { $0.id == query.resourceTypeID }) else {
+            errorMessage = "This saved query is unavailable in the active Kubernetes context."
+            return
+        }
+        isRestoringNavigation = true
+        selectedNamespace = query.namespace
+        labelSelector = query.labelSelector
+        fieldSelector = query.fieldSelector
+        selectorResourceTypeID = type.id
+        selectedResources.removeAll()
+        selectedResourceType = type
+        isRestoringNavigation = false
+        recordNavigation(to: type)
+        await loadResources()
     }
 
     func toggleFavoriteNamespace(_ namespace: String) {
@@ -507,6 +559,20 @@ final class ClusterStore {
     private func persistNavigationHistory() {
         guard let data = try? JSONEncoder().encode(navigationHistory) else { return }
         UserDefaults.standard.set(data, forKey: navigationHistoryDefaultsKey)
+    }
+
+    private func loadSavedResourceQueries() {
+        guard let data = UserDefaults.standard.data(forKey: savedResourceQueriesDefaultsKey),
+              let saved = try? JSONDecoder().decode([SavedResourceQuery].self, from: data) else { return }
+        // Bound local state just as navigation history is bounded. This keeps
+        // the app's preferences small even when a shared workstation has many
+        // exploratory queries.
+        savedResourceQueries = Array(saved.sorted { $0.createdAt > $1.createdAt }.prefix(100))
+    }
+
+    private func persistSavedResourceQueries() {
+        guard let data = try? JSONEncoder().encode(savedResourceQueries) else { return }
+        UserDefaults.standard.set(data, forKey: savedResourceQueriesDefaultsKey)
     }
 
     /// Keeps user-authored selectors associated with the current GVR. This
@@ -1140,6 +1206,27 @@ final class ClusterStore {
             if generation == execAccessGeneration {
                 execAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify Pod exec permission: \(error.localizedDescription)", evaluationError: nil)
             }
+        }
+    }
+
+    /// File transfer uses the same direct pods/exec subresource as Terminal.
+    /// Keep the access review at the Store boundary so a transfer sheet cannot
+    /// accidentally turn a merely visible Pod into an executable target.
+    func podExecAccess(for resource: ResourceSummary) async -> AccessReview {
+        guard resource.kind == "Pod", let namespace = resource.namespace, !namespace.isEmpty else {
+            return AccessReview(allowed: false, denied: false, reason: "File transfer requires a namespaced Pod.", evaluationError: nil)
+        }
+        do {
+            return try decode(
+                (try await client.request("rbac.check", parameters: .object([
+                    "group": .string(""), "version": .string("v1"), "resource": .string("pods"),
+                    "namespaced": .bool(true), "namespace": .string(namespace), "name": .string(resource.name),
+                    "verb": .string("create"), "subresource": .string("exec")
+                ]))).result,
+                as: AccessReview.self
+            )
+        } catch {
+            return AccessReview(allowed: false, denied: false, reason: "K9k could not verify Pod exec permission: \(error.localizedDescription)", evaluationError: nil)
         }
     }
 

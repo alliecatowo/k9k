@@ -11,6 +11,7 @@ struct HelmReleaseHistorySection: View {
     @State private var history: HelmReleaseHistory?
     @State private var isLoading = false
     @State private var errorMessage: String?
+    @State private var selectedRevision: HelmReleaseRevision?
 
     var body: some View {
         Section("Helm History") {
@@ -22,19 +23,29 @@ struct HelmReleaseHistorySection: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(history.revisions) { revision in
-                        HStack(alignment: .firstTextBaseline, spacing: 10) {
-                            Text(revision.revision == 0 ? "Revision unknown" : "Revision \(revision.revision)")
-                                .fontWeight(.medium)
-                            Text(revision.status.capitalized)
-                                .font(.caption)
-                                .foregroundStyle(statusColor(revision.status))
-                            Spacer(minLength: 8)
-                            Text(revision.age.isEmpty ? revision.createdAt.formatted(date: .abbreviated, time: .shortened) : revision.age)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        Button {
+                            selectedRevision = revision
+                        } label: {
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                Text(revision.revision == 0 ? "Revision unknown" : "Revision \(revision.revision)")
+                                    .fontWeight(.medium)
+                                Text(revision.status.capitalized)
+                                    .font(.caption)
+                                    .foregroundStyle(statusColor(revision.status))
+                                Spacer(minLength: 8)
+                                Text(revision.age.isEmpty ? revision.createdAt.formatted(date: .abbreviated, time: .shortened) : revision.age)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
                         }
+                        .buttonStyle(.plain)
+                        .disabled(revision.revision == 0)
                         .accessibilityElement(children: .combine)
-                        .accessibilityLabel("Helm \(release), revision \(revision.revision == 0 ? "unknown" : String(revision.revision)), \(revision.status)")
+                        .accessibilityLabel("Inspect Helm \(release), revision \(revision.revision == 0 ? "unknown" : String(revision.revision)), \(revision.status)")
+                        .accessibilityHint(revision.revision == 0 ? "This legacy storage object has no usable revision number" : "Opens a read-only Helm release inspection")
                     }
                 }
                 if history.truncated {
@@ -42,7 +53,7 @@ struct HelmReleaseHistorySection: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Text("Read from Helm v3 storage metadata. No chart values or manifests are decoded.")
+                Text("Select a revision to inspect chart metadata. Manifests, notes, and values require an explicit sensitive-content acknowledgement.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if let errorMessage {
@@ -52,6 +63,9 @@ struct HelmReleaseHistorySection: View {
         }
         .task(id: "\(namespace)/\(release)") { await load() }
         .onDisappear { client.stop() }
+        .sheet(item: $selectedRevision) { revision in
+            HelmReleaseInspectionView(release: release, namespace: namespace, revision: revision)
+        }
     }
 
     private func load() async {
