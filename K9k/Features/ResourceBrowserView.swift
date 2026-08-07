@@ -40,7 +40,7 @@ struct ResourceBrowserView: View {
                         .disabled(!store.canDeleteSelected || selection.isEmpty)
                 } primaryAction: { _ in inspectorIsPresented = true }
                 .overlay { if store.isLoading { ProgressView().controlSize(.small) } }
-                .navigationTitle(type.kind)
+                .navigationTitle(store.labelSelector == "owner=helm" && type.resource == "secrets" ? "Helm Releases" : type.kind)
             } else {
                 ContentUnavailableView("No Resource Selected", systemImage: "cube.transparent", description: Text("Choose a Kubernetes resource from the resource catalog."))
             }

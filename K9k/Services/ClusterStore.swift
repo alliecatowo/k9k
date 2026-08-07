@@ -172,6 +172,14 @@ final class ClusterStore {
         relationshipGraph = nil
     }
 
+    func openHelmReleases() async {
+        guard let secrets = preferredResource(named: "secrets") else { return }
+        selectedResourceType = secrets
+        selectedResources.removeAll()
+        labelSelector = "owner=helm"
+        await loadResources()
+    }
+
     func loadRelationships(for resource: ResourceSummary?, type: ResourceType?) async {
         guard let resource, let type else { relationshipGraph = nil; return }
         isLoadingRelationships = true
