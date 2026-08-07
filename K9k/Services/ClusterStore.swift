@@ -467,6 +467,27 @@ final class ClusterStore {
         }
     }
 
+    /// Performs a direct SelfSubjectAccessReview for the active kubeconfig
+    /// identity. This is deliberately exposed as an explicit user tool instead
+    /// of deriving permissions from RBAC objects, which can be incomplete when
+    /// aggregated roles or external authorization are in play.
+    func checkAccess(verb: String, type: ResourceType, namespace: String, name: String, subresource: String) async -> AccessReview? {
+        var parameters = type.requestParameters.objectValue ?? [:]
+        parameters["verb"] = .string(verb.trimmingCharacters(in: .whitespacesAndNewlines))
+        let normalizedNamespace = namespace.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSubresource = subresource.trimmingCharacters(in: .whitespacesAndNewlines)
+        if type.namespaced { parameters["namespace"] = .string(normalizedNamespace) }
+        if !normalizedName.isEmpty { parameters["name"] = .string(normalizedName) }
+        if !normalizedSubresource.isEmpty { parameters["subresource"] = .string(normalizedSubresource) }
+        do {
+            return try decode((try await client.request("rbac.check", parameters: .object(parameters))).result, as: AccessReview.self)
+        } catch {
+            errorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
     func updateScaleAccess() async {
         scaleAccessGeneration &+= 1
         let generation = scaleAccessGeneration

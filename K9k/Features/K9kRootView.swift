@@ -23,6 +23,7 @@ struct K9kRootView: View {
     @State private var pluginToRun: K9sPlugin?
     @State private var manifestImportPresented = false
     @State private var pulsePresented = false
+    @State private var accessCheckPresented = false
 
     var body: some View {
         @Bindable var store = store
@@ -69,7 +70,8 @@ struct K9kRootView: View {
             resourceSelectorsPresented: $resourceSelectorsPresented,
             pluginToRun: $pluginToRun,
             manifestImportPresented: $manifestImportPresented,
-            pulsePresented: $pulsePresented
+            pulsePresented: $pulsePresented,
+            accessCheckPresented: $accessCheckPresented
         ))
     }
 
@@ -92,7 +94,7 @@ struct K9kRootView: View {
         paletteIsPresented: Binding<Bool>, logsPresented: Binding<Bool>, portForwardPresented: Binding<Bool>, portForwardListPresented: Binding<Bool>,
         scalePresented: Binding<Bool>, terminalPresented: Binding<Bool>, terminalMode: Binding<PodTerminalMode>, manifestEditorPresented: Binding<Bool>,
         relationshipsPresented: Binding<Bool>, nodeDrainPresented: Binding<Bool>, debugPresented: Binding<Bool>, resourceSelectorsPresented: Binding<Bool>,
-        pluginToRun: Binding<K9sPlugin?>, manifestImportPresented: Binding<Bool>, pulsePresented: Binding<Bool>
+        pluginToRun: Binding<K9sPlugin?>, manifestImportPresented: Binding<Bool>, pulsePresented: Binding<Bool>, accessCheckPresented: Binding<Bool>
     ) -> some ViewModifier {
         RootPresentations(
             destructiveConfirmation: destructiveConfirmation, restartConfirmation: restartConfirmation, rollbackConfirmation: rollbackConfirmation, cronJobTriggerConfirmation: cronJobTriggerConfirmation,
@@ -100,7 +102,8 @@ struct K9kRootView: View {
             portForwardPresented: portForwardPresented, portForwardListPresented: portForwardListPresented, scalePresented: scalePresented,
             terminalPresented: terminalPresented, terminalMode: terminalMode, manifestEditorPresented: manifestEditorPresented,
             relationshipsPresented: relationshipsPresented, nodeDrainPresented: nodeDrainPresented, debugPresented: debugPresented,
-            resourceSelectorsPresented: resourceSelectorsPresented, pluginToRun: pluginToRun, manifestImportPresented: manifestImportPresented, pulsePresented: pulsePresented
+            resourceSelectorsPresented: resourceSelectorsPresented, pluginToRun: pluginToRun, manifestImportPresented: manifestImportPresented, pulsePresented: pulsePresented,
+            accessCheckPresented: accessCheckPresented
         )
     }
 
@@ -126,6 +129,7 @@ struct K9kRootView: View {
         @Binding var pluginToRun: K9sPlugin?
         @Binding var manifestImportPresented: Bool
         @Binding var pulsePresented: Bool
+        @Binding var accessCheckPresented: Bool
 
         func body(content: Content) -> some View {
             content
@@ -180,6 +184,9 @@ struct K9kRootView: View {
         }
         .sheet(isPresented: $manifestImportPresented) { if let type = store.selectedResourceType { ManifestImportView(type: type) } }
         .sheet(isPresented: $pulsePresented) { PulseView(isPresented: $pulsePresented) }
+        .sheet(isPresented: $accessCheckPresented) {
+            AccessCheckView(initialType: store.selectedResourceType, initialResource: store.resource(for: store.selectedResources.first))
+        }
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
         } message: { Text(store.errorMessage ?? "") }
@@ -292,6 +299,8 @@ struct K9kRootView: View {
                         .disabled(!store.canDrainSelectedNode || node.raw?.objectValue?["spec"]?.objectValue?["unschedulable"]?.boolValue != true)
                 }
                 Divider()
+                Button("Check Access…") { accessCheckPresented = true }
+                    .disabled(store.selectedResourceType == nil)
                 Button("Pulse…") { pulsePresented = true }
                 Button("Helm Releases") { Task { await store.openHelmReleases() } }
                 Button("Active Port Forwards…") { portForwardListPresented = true }
