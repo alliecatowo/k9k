@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct PortForwardView: View {
@@ -26,6 +27,13 @@ struct PortForwardView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 HStack {
+                    Button("Copy Endpoint") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString("http://\(binding.localAddress):\(binding.localPort)", forType: .string)
+                    }
+                    Button("Open in Browser") {
+                        NSWorkspace.shared.open(URL(string: "http://\(binding.localAddress):\(binding.localPort)")!)
+                    }
                     Spacer()
                     Button("Stop Forward", role: .destructive) {
                         Task { await store.closePortForward() }
