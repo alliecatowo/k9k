@@ -69,12 +69,36 @@ struct ResourceInspectorView: View {
             } else if store.isCheckingDeleteAccess {
                 Section("Access") { LabeledContent("Delete") { ProgressView().controlSize(.small) } }
             }
+            metrics(resource)
             if let labels = resource.labels, !labels.isEmpty {
                 Section("Labels") { ForEach(labels.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in LabeledContent(key, value: value).textSelection(.enabled) } }
             }
         }
         .formStyle(.grouped)
         .padding(.bottom)
+    }
+
+    @ViewBuilder private func metrics(_ resource: ResourceSummary) -> some View {
+        if let metrics = store.resourceMetrics, metrics.name == resource.name, metrics.namespace == resource.namespace {
+            Section("Metrics") {
+                LabeledContent("CPU", value: metrics.usage["cpu"] ?? "—")
+                LabeledContent("Memory", value: metrics.usage["memory"] ?? "—")
+                LabeledContent("Sample", value: metrics.timestamp.formatted(date: .omitted, time: .standard))
+                if !metrics.window.isEmpty { LabeledContent("Window", value: metrics.window) }
+                if !metrics.containers.isEmpty {
+                    ForEach(metrics.containers) { container in
+                        LabeledContent(container.name, value: "CPU \(container.usage["cpu"] ?? "—") · Memory \(container.usage["memory"] ?? "—")")
+                    }
+                }
+            }
+        } else if store.isLoadingMetrics, resource.kind == "Pod" || resource.kind == "Node" {
+            Section("Metrics") { LabeledContent("Usage") { ProgressView().controlSize(.small) } }
+        } else if let message = store.metricsUnavailableMessage, resource.kind == "Pod" || resource.kind == "Node" {
+            Section("Metrics") {
+                LabeledContent("Usage", value: "Unavailable")
+                Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+        }
     }
 
     @ViewBuilder private func metadata(_ resource: ResourceSummary) -> some View {

@@ -26,6 +26,9 @@ final class ClusterStore {
     var activeLogStreamID: String?
     var activePortForward: PortForwardBinding?
     var activePortForwardStreamID: String?
+    var resourceMetrics: ResourceMetrics?
+    var metricsUnavailableMessage: String?
+    var isLoadingMetrics = false
     var deleteAccess: AccessReview?
     var isCheckingDeleteAccess = false
     var scaleAccess: AccessReview?
@@ -302,6 +305,35 @@ final class ClusterStore {
         do {
             events = try decodeArray((try await client.request("resource.events", parameters: .object(["namespace": .string(namespace), "uid": .string(resource.uid)]))).result, as: ClusterEvent.self)
         } catch { events = [] }
+    }
+
+    func loadMetrics(for resource: ResourceSummary?) async {
+        resourceMetrics = nil
+        metricsUnavailableMessage = nil
+        guard let resource else { return }
+        let metricResource: String
+        switch resource.kind {
+        case "Pod": metricResource = "pods"
+        case "Node": metricResource = "nodes"
+        default: return
+        }
+        isLoadingMetrics = true
+        defer { isLoadingMetrics = false }
+        var parameters: [String: JSONValue] = [
+            "resource": .string(metricResource),
+            "name": .string(resource.name)
+        ]
+        if metricResource == "pods", let namespace = resource.namespace {
+            parameters["namespace"] = .string(namespace)
+        }
+        do {
+            let response = try decode((try await client.request("metrics.list", parameters: .object(parameters))).result, as: MetricsListResponse.self)
+            resourceMetrics = response.items.first
+        } catch let error as CoreError where error.code == "metrics_unavailable" {
+            metricsUnavailableMessage = error.message
+        } catch {
+            metricsUnavailableMessage = "K9k could not load metrics: \(error.localizedDescription)"
+        }
     }
 
     func openLogs(for resource: ResourceSummary) async {

@@ -85,6 +85,30 @@ struct PortForwardBinding: Codable, Hashable {
     var endpoint: String { "\(localAddress):\(localPort) → \(pod):\(remotePort)" }
 }
 
+struct MetricsListResponse: Codable, Hashable {
+    let apiVersion: String
+    let resource: String
+    let items: [ResourceMetrics]
+}
+
+struct ResourceMetrics: Codable, Identifiable, Hashable {
+    let apiVersion: String
+    let resource: String
+    let namespace: String?
+    let name: String
+    let timestamp: Date
+    let window: String
+    let usage: [String: String]
+    let containers: [ContainerMetrics]
+    var id: String { "\(resource)/\(namespace ?? "")/\(name)" }
+}
+
+struct ContainerMetrics: Codable, Identifiable, Hashable {
+    let name: String
+    let usage: [String: String]
+    var id: String { name }
+}
+
 enum JSONValue: Codable, Hashable {
     case string(String), number(Double), bool(Bool), object([String: JSONValue]), array([JSONValue]), null
 

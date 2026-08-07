@@ -31,6 +31,7 @@ struct K9kRootView: View {
         .onChange(of: store.selectedResources) { _, selection in
             Task {
                 await store.loadEvents(for: store.resource(for: selection.first))
+                await store.loadMetrics(for: store.resource(for: selection.first))
                 await store.updateDeleteAccess()
                 await store.updateScaleAccess()
                 await store.updateRestartAccess()
