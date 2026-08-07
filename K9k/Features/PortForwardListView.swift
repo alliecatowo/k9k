@@ -4,6 +4,7 @@ import SwiftUI
 struct PortForwardListView: View {
     @Environment(ClusterStore.self) private var store
     @Binding var isPresented: Bool
+    @State private var benchmarkForward: ActivePortForward?
 
     var body: some View {
         NavigationStack {
@@ -18,6 +19,7 @@ struct PortForwardListView: View {
                             HStack {
                                 Button("Copy") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString("http://\(forward.binding.localAddress):\(forward.binding.localPort)", forType: .string) }
                                 Button("Open") { NSWorkspace.shared.open(URL(string: "http://\(forward.binding.localAddress):\(forward.binding.localPort)")!) }
+                                Button("Benchmark…") { benchmarkForward = forward }
                                 Spacer()
                                 Button("Stop", role: .destructive) { Task { await store.closePortForward(streamID: forward.streamID) } }
                             }
@@ -29,5 +31,6 @@ struct PortForwardListView: View {
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { isPresented = false } } }
         }
         .frame(minWidth: 580, minHeight: 360)
+        .sheet(item: $benchmarkForward) { HTTPBenchmarkView(forward: $0) }
     }
 }
