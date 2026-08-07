@@ -404,6 +404,16 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(getErr)
 		}
 		return result.Object, nil
+	case "relationships.get":
+		params, err := decodeResourceParams(request.Params, true)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		result, relationshipErr := s.relationships(ctx, params)
+		if relationshipErr != nil {
+			return nil, kubeError(relationshipErr)
+		}
+		return result, nil
 	case "manifest.get":
 		params, err := decodeResourceParams(request.Params, true)
 		if err != nil {

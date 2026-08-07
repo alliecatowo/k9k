@@ -88,6 +88,44 @@ struct ResourceSummary: Codable, Identifiable, Hashable {
     var subtitle: String { namespace?.isEmpty == false ? namespace! : "Cluster-scoped" }
 }
 
+struct RelationshipGraph: Codable, Hashable {
+    let rootID: String
+    let nodes: [RelationshipNode]
+    let edges: [RelationshipEdge]
+    let warnings: [String]
+
+    var root: RelationshipNode? { nodes.first(where: { $0.id == rootID }) }
+
+    func node(id: String) -> RelationshipNode? { nodes.first(where: { $0.id == id }) }
+    func edges(relation: String) -> [RelationshipEdge] { edges.filter { $0.relation == relation } }
+}
+
+struct RelationshipNode: Codable, Identifiable, Hashable {
+    let id: String
+    let apiVersion: String
+    let kind: String
+    let namespace: String?
+    let name: String
+    let uid: String?
+    let status: String?
+    let resolved: Bool
+
+    var title: String { "\(kind) / \(name)" }
+    var subtitle: String {
+        var values = [namespace?.isEmpty == false ? namespace! : "Cluster-scoped"]
+        if let status, !status.isEmpty, status != "Unknown" { values.append(status) }
+        if !resolved { values.append("unresolved reference") }
+        return values.joined(separator: " · ")
+    }
+}
+
+struct RelationshipEdge: Codable, Hashable, Identifiable {
+    let from: String
+    let to: String
+    let relation: String
+    var id: String { "\(from):\(relation):\(to)" }
+}
+
 struct ClusterEvent: Codable, Identifiable, Hashable {
     let namespace: String
     let type: String

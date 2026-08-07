@@ -41,6 +41,8 @@ final class ClusterStore {
     var isCheckingScaleAccess = false
     var restartAccess: AccessReview?
     var isCheckingRestartAccess = false
+    var relationshipGraph: RelationshipGraph?
+    var isLoadingRelationships = false
     private var deleteAccessGeneration = 0
     private var scaleAccessGeneration = 0
     private var restartAccessGeneration = 0
@@ -146,6 +148,22 @@ final class ClusterStore {
         restartAccess = nil
         execAccess = nil
         manifestAccess = nil
+        relationshipGraph = nil
+    }
+
+    func loadRelationships(for resource: ResourceSummary?, type: ResourceType?) async {
+        guard let resource, let type else { relationshipGraph = nil; return }
+        isLoadingRelationships = true
+        defer { isLoadingRelationships = false }
+        do {
+            relationshipGraph = try decode(
+                (try await client.request("relationships.get", parameters: operationParameters(type: type, resource: resource))).result,
+                as: RelationshipGraph.self
+            )
+        } catch {
+            relationshipGraph = nil
+            errorMessage = error.localizedDescription
+        }
     }
 
     func deleteSelected() async {

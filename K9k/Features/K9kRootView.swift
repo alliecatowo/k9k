@@ -11,6 +11,7 @@ struct K9kRootView: View {
     @State private var restartConfirmation = false
     @State private var terminalPresented = false
     @State private var manifestEditorPresented = false
+    @State private var relationshipsPresented = false
 
     var body: some View {
         @Bindable var store = store
@@ -63,6 +64,11 @@ struct K9kRootView: View {
                 ManifestEditorView(resource: resource, type: type)
             }
         }
+        .sheet(isPresented: $relationshipsPresented) {
+            if let resource = store.resource(for: store.selectedResources.first), let type = store.selectedResourceType {
+                RelationshipGraphView(resource: resource, type: type)
+            }
+        }
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
         } message: { Text(store.errorMessage ?? "") }
@@ -95,6 +101,8 @@ struct K9kRootView: View {
                 Button("Copy Name", action: store.copySelectedName).disabled(store.selectedResources.isEmpty)
                 Button("Edit Manifest…") { manifestEditorPresented = true }
                     .disabled(!store.hasSelectedManifest)
+                Button("View Relationships…") { relationshipsPresented = true }
+                    .disabled(store.selectedResources.count != 1 || store.selectedResourceType == nil)
                 if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Pod" {
                     Button("View Logs") { logsPresented = true }
                     Button("Port Forward…") { portForwardPresented = true }

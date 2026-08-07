@@ -475,8 +475,17 @@ func TestManifestGetAndApplyUseCanonicalYAMLDryRunAndExplicitConfirm(t *testing.
 	if len(client.applyManifests) != 3 {
 		t.Fatalf("apply calls = %d, want preview dry run plus confirmed dry run and write", len(client.applyManifests))
 	}
-	if !client.applyManifests[0].DryRun || !client.applyManifests[1].DryRun || client.applyManifests[2].DryRun {
-		t.Errorf("dry-run sequence = %#v", client.applyManifests)
+	// Requests run concurrently by design, so their recording order is not a
+	// protocol guarantee. The invariant is two dry-runs (preview + confirmed
+	// validation) and one explicit write.
+	dryRuns := 0
+	for _, apply := range client.applyManifests {
+		if apply.DryRun {
+			dryRuns++
+		}
+	}
+	if dryRuns != 2 || len(client.applyManifests)-dryRuns != 1 {
+		t.Errorf("dry-run counts = %d dry / %d write: %#v", dryRuns, len(client.applyManifests)-dryRuns, client.applyManifests)
 	}
 }
 

@@ -55,6 +55,36 @@ type ResourceSummary struct {
 	Raw        map[string]any    `json:"raw,omitempty"`
 }
 
+// RelationshipGraph is a bounded, read-only topology snapshot centred on one
+// selected object. Nodes use stable object identity where Kubernetes provided
+// a UID; unresolved references are retained rather than silently discarded.
+type RelationshipGraph struct {
+	RootID   string             `json:"rootID"`
+	Nodes    []RelationshipNode `json:"nodes"`
+	Edges    []RelationshipEdge `json:"edges"`
+	Warnings []string           `json:"warnings"`
+}
+
+type RelationshipNode struct {
+	ID         string `json:"id"`
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Namespace  string `json:"namespace,omitempty"`
+	Name       string `json:"name"`
+	UID        string `json:"uid,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Resolved   bool   `json:"resolved"`
+}
+
+// RelationshipEdge is directed: from is the resource that owns, selects,
+// routes to, or uses to. Relation is one of owner, owns, selects, routes, or
+// uses and is intentionally descriptive rather than a Kubernetes API type.
+type RelationshipEdge struct {
+	From     string `json:"from"`
+	To       string `json:"to"`
+	Relation string `json:"relation"`
+}
+
 // ClusterEvent is a normalized Kubernetes Event, retaining the fields users
 // need for diagnosis without exposing Swift to core/v1 API details.
 type ClusterEvent struct {
