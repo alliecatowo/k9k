@@ -8,6 +8,11 @@ struct TerminalSessionView: View {
     @Environment(\.dismiss) private var dismiss
     let resource: ResourceSummary
     @State private var isStarting = false
+    @State private var selectedContainer = ""
+
+    private var containers: [String] {
+        resource.raw?.objectValue?["spec"]?.objectValue?["containers"]?.arrayValue?.compactMap { $0.objectValue?["name"]?.stringValue } ?? []
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -41,6 +46,11 @@ struct TerminalSessionView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                if containers.count > 1 && store.activeExecStreamID == nil {
+                    Picker("Container", selection: $selectedContainer) {
+                        ForEach(containers, id: \.self) { Text($0).tag($0) }
+                    }.frame(maxWidth: 180)
+                }
                 if store.activeExecStreamID == nil {
                     Button("Start Shell") { startShell() }
                         .keyboardShortcut(.defaultAction)
@@ -53,6 +63,7 @@ struct TerminalSessionView: View {
             .padding()
         }
         .frame(minWidth: 820, minHeight: 540)
+        .onAppear { if selectedContainer.isEmpty { selectedContainer = containers.first ?? "" } }
         .task { await store.updateExecAccess() }
         .onDisappear {
             store.clearTerminalOutputSink()
@@ -63,7 +74,7 @@ struct TerminalSessionView: View {
     private func startShell() {
         isStarting = true
         Task {
-            await store.openExec(for: resource, command: ["/bin/sh"])
+            await store.openExec(for: resource, command: ["/bin/sh"], container: selectedContainer)
             isStarting = false
         }
     }

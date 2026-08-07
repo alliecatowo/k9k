@@ -247,6 +247,7 @@ enum JSONValue: Codable, Hashable {
         return nil
     }
     var objectValue: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
+    var arrayValue: [JSONValue]? { if case .array(let value) = self { value } else { nil } }
 }
 
 enum NavigationDestination: String, CaseIterable, Identifiable {
