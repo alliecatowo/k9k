@@ -158,6 +158,93 @@ func TestHelmInspectTruncatesEachSensitiveField(t *testing.T) {
 	}
 }
 
+func TestHelmLifecycleUsesConfirmedPinnedReleaseAndStorageRBAC(t *testing.T) {
+	target := helmStorageSecret(t, "demo", "web", 3, map[string]any{
+		"name": "web", "namespace": "demo", "version": 3,
+		"chart": map[string]any{"metadata": map[string]any{"name": "web-chart", "version": "1.0.0"}},
+	})
+	current := helmStorageSecret(t, "demo", "web", 5, map[string]any{
+		"name": "web", "namespace": "demo", "version": 5,
+		"chart": map[string]any{"metadata": map[string]any{"name": "web-chart", "version": "1.1.0"}},
+	})
+	target.SetLabels(map[string]string{"owner": "helm", "name": "web", "version": "3", "status": "superseded"})
+	current.SetLabels(map[string]string{"owner": "helm", "name": "web", "version": "5", "status": "deployed"})
+	client := &fakeCluster{
+		list: []ResourceSummary{
+			{Name: target.GetName(), Namespace: "demo", Labels: target.GetLabels()},
+			{Name: current.GetName(), Namespace: "demo", Labels: current.GetLabels()},
+		},
+		objects: map[string]*unstructured.Unstructured{
+			"demo/" + target.GetName():  target,
+			"demo/" + current.GetName(): current,
+		},
+		accessFn: func(AccessCheck) AccessReview { return AccessReview{Allowed: true} },
+	}
+	rollback := map[string]any{
+		"namespace": "demo", "release": "web", "targetStorageName": target.GetName(), "targetRevision": 3,
+		"expectedStorageName": current.GetName(), "expectedRevision": 5, "confirm": true,
+	}
+	uninstall := map[string]any{
+		"namespace": "demo", "release": "web", "expectedStorageName": current.GetName(), "expectedRevision": 5,
+		"confirm": true, "confirmationText": "web",
+	}
+	responses := runRequests(t, client,
+		request("rollback-missing", "helm.rollback", map[string]any{
+			"namespace": "demo", "release": "web", "targetStorageName": target.GetName(), "targetRevision": 3,
+			"expectedStorageName": current.GetName(), "expectedRevision": 5,
+		}),
+		request("rollback", "helm.rollback", rollback),
+		request("uninstall", "helm.uninstall", uninstall),
+	)
+	if failure := envelopeByID(t, responses, "rollback-missing"); failure.Error == nil || failure.Error.Code != "confirmation_required" {
+		t.Fatalf("unconfirmed rollback = %#v", failure)
+	}
+	if response := envelopeByID(t, responses, "rollback"); response.Error != nil {
+		t.Fatalf("rollback = %#v", response)
+	}
+	if response := envelopeByID(t, responses, "uninstall"); response.Error != nil {
+		t.Fatalf("uninstall = %#v", response)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if got, want := client.helmRollbacks, []HelmRollbackRequest{{Namespace: "demo", Release: "web", TargetStorageName: target.GetName(), TargetRevision: 3, ExpectedStorageName: current.GetName(), ExpectedRevision: 5}}; len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("Helm rollbacks = %#v, want %#v", got, want)
+	}
+	if got, want := client.helmUninstalls, []HelmUninstallRequest{{Namespace: "demo", Release: "web", ExpectedStorageName: current.GetName(), ExpectedRevision: 5}}; len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("Helm uninstalls = %#v, want %#v", got, want)
+	}
+	if len(client.accesses) != 7 { // rollback get/list/create/update; uninstall get/list/update
+		t.Fatalf("storage access checks = %#v", client.accesses)
+	}
+}
+
+func TestHelmLifecycleRejectsStaleReleaseAndUninstallConfirmation(t *testing.T) {
+	current := helmStorageSecret(t, "demo", "web", 6, map[string]any{
+		"name": "web", "namespace": "demo", "version": 6,
+		"chart": map[string]any{"metadata": map[string]any{"name": "web-chart", "version": "1.2.0"}},
+	})
+	client := &fakeCluster{
+		list: []ResourceSummary{{Name: current.GetName(), Namespace: "demo", Labels: current.GetLabels()}},
+		objects: map[string]*unstructured.Unstructured{"demo/" + current.GetName(): current},
+		accessFn: func(AccessCheck) AccessReview { return AccessReview{Allowed: true} },
+	}
+	responses := runRequests(t, client,
+		request("stale", "helm.uninstall", map[string]any{"namespace": "demo", "release": "web", "expectedStorageName": "sh.helm.release.v1.web.v5", "expectedRevision": 5, "confirm": true, "confirmationText": "web"}),
+		request("typed-wrong", "helm.uninstall", map[string]any{"namespace": "demo", "release": "web", "expectedStorageName": current.GetName(), "expectedRevision": 6, "confirm": true, "confirmationText": "different"}),
+	)
+	if failure := envelopeByID(t, responses, "stale"); failure.Error == nil || failure.Error.Code != "stale_release" {
+		t.Fatalf("stale uninstall = %#v", failure)
+	}
+	if failure := envelopeByID(t, responses, "typed-wrong"); failure.Error == nil || failure.Error.Code != "confirmation_required" {
+		t.Fatalf("uninstall confirmation = %#v", failure)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.helmUninstalls) != 0 {
+		t.Fatalf("uninstalls must not run for stale or unconfirmed requests: %#v", client.helmUninstalls)
+	}
+}
+
 func helmStorageSecret(t *testing.T, namespace, release string, revision int, payload map[string]any) *unstructured.Unstructured {
 	t.Helper()
 	jsonPayload, err := json.Marshal(payload)

@@ -374,6 +374,21 @@ func (c *Cluster) Delete(ctx context.Context, gvr schema.GroupVersionResource, n
 	}
 	return resource.Delete(ctx, name, metav1.DeleteOptions{})
 }
+
+// DeleteManifest supplies Kubernetes' UID precondition. The server already
+// verifies every identity before starting a batch, while this final guard
+// closes the delete/recreate race before an individual removal.
+func (c *Cluster) DeleteManifest(ctx context.Context, identity api.ManifestIdentity) error {
+	if identity.UID == "" {
+		return api.ErrManifestIdentityMismatch
+	}
+	resource, err := c.resource(schema.GroupVersionResource{Group: identity.Group, Version: identity.Version, Resource: identity.Resource}, identity.Namespace, identity.Namespaced)
+	if err != nil {
+		return err
+	}
+	uid := types.UID(identity.UID)
+	return resource.Delete(ctx, identity.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
+}
 func (c *Cluster) Patch(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string, namespaced bool, patch []byte) (*unstructured.Unstructured, error) {
 	resource, err := c.resource(gvr, namespace, namespaced)
 	if err != nil {

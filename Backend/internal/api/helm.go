@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -25,6 +26,15 @@ const (
 )
 
 var helmSecretsGVR = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
+
+var (
+	// ErrHelmReleaseChanged is deliberately distinct from a Kubernetes API
+	// error. It means the release changed after an operator opened its history,
+	// so K9k must require a fresh review rather than applying an action to the
+	// newer state.
+	ErrHelmReleaseChanged = errors.New("Helm release changed since it was reviewed")
+	ErrHelmReleaseUnsafe  = errors.New("Helm release is not in a lifecycle state K9k can safely mutate")
+)
 
 // helmHistory converts Helm v3's standard Secret labels into a stable,
 // metadata-only history. It deliberately does not decode a release payload;
@@ -143,6 +153,108 @@ func validateHelmInspectionParams(params HelmReleaseInspectionRequest) (HelmRele
 	return params, nil
 }
 
+func validateHelmRollbackParams(params HelmRollbackRequest) (HelmRollbackRequest, error) {
+	namespace, release, err := validateHelmHistoryParams(params.Namespace, params.Release)
+	if err != nil {
+		return HelmRollbackRequest{}, err
+	}
+	params.Namespace, params.Release = namespace, release
+	params.TargetStorageName = strings.TrimSpace(params.TargetStorageName)
+	params.ExpectedStorageName = strings.TrimSpace(params.ExpectedStorageName)
+	if params.Namespace == "" {
+		return HelmRollbackRequest{}, fmt.Errorf("namespace is required for Helm Secret storage")
+	}
+	if params.TargetRevision < 1 || params.ExpectedRevision < 1 {
+		return HelmRollbackRequest{}, fmt.Errorf("targetRevision and expectedRevision must be positive")
+	}
+	if params.TargetStorageName == "" || params.ExpectedStorageName == "" || len(params.TargetStorageName) > 253 || len(params.ExpectedStorageName) > 253 {
+		return HelmRollbackRequest{}, fmt.Errorf("valid Helm storage names are required")
+	}
+	if params.TargetRevision >= params.ExpectedRevision {
+		return HelmRollbackRequest{}, fmt.Errorf("targetRevision must be an earlier revision than the reviewed release")
+	}
+	return params, nil
+}
+
+func validateHelmUninstallParams(params HelmUninstallRequest) (HelmUninstallRequest, error) {
+	namespace, release, err := validateHelmHistoryParams(params.Namespace, params.Release)
+	if err != nil {
+		return HelmUninstallRequest{}, err
+	}
+	params.Namespace, params.Release = namespace, release
+	params.ExpectedStorageName = strings.TrimSpace(params.ExpectedStorageName)
+	if params.Namespace == "" {
+		return HelmUninstallRequest{}, fmt.Errorf("namespace is required for Helm Secret storage")
+	}
+	if params.ExpectedRevision < 1 || params.ExpectedStorageName == "" || len(params.ExpectedStorageName) > 253 {
+		return HelmUninstallRequest{}, fmt.Errorf("a valid current Helm storage revision is required")
+	}
+	return params, nil
+}
+
+// verifyHelmCurrentRevision closes the UI-to-action race as far as Kubernetes
+// permits. Helm itself has no resourceVersion precondition for lifecycle
+// operations, so the helper reloads Secret-backed history and requires the
+// exact latest storage revision that the native sheet showed the operator.
+func (s *Server) verifyHelmCurrentRevision(ctx context.Context, namespace, release, storageName string, revision int) error {
+	history, err := s.helmHistory(ctx, namespace, release)
+	if err != nil {
+		return err
+	}
+	var current *HelmReleaseRevision
+	for i := range history.Revisions {
+		if history.Revisions[i].Revision > 0 {
+			current = &history.Revisions[i]
+			break
+		}
+	}
+	if current == nil || current.Revision != revision || current.StorageName != storageName {
+		return fmt.Errorf("%w; refresh Helm history before retrying", ErrHelmReleaseChanged)
+	}
+	switch strings.ToLower(strings.TrimSpace(current.Status)) {
+	case "uninstalled", "uninstalling", "pending-install", "pending-upgrade", "pending-rollback":
+		return fmt.Errorf("%w: current status is %q", ErrHelmReleaseUnsafe, current.Status)
+	}
+	// List metadata is not sufficient to trust an opaque Secret reference.
+	// Reuse the inspection identity gate without returning its potentially
+	// sensitive payload to the lifecycle operation.
+	_, err = s.helmInspect(ctx, HelmReleaseInspectionRequest{
+		Namespace: namespace, Release: release, StorageName: storageName, Revision: revision,
+	})
+	return err
+}
+
+func (s *Server) verifyHelmRollback(ctx context.Context, request HelmRollbackRequest) error {
+	if err := s.verifyHelmCurrentRevision(ctx, request.Namespace, request.Release, request.ExpectedStorageName, request.ExpectedRevision); err != nil {
+		return err
+	}
+	_, err := s.helmInspect(ctx, HelmReleaseInspectionRequest{
+		Namespace: request.Namespace, Release: request.Release, StorageName: request.TargetStorageName, Revision: request.TargetRevision,
+	})
+	return err
+}
+
+// checkHelmStorageAccess checks the Secret-driver verbs that Helm needs before
+// starting a lifecycle operation. Chart resources and hooks can vary by
+// release; those are still enforced authoritatively by the API server during
+// the SDK operation and reported verbatim if unavailable.
+func (s *Server) checkHelmStorageAccess(ctx context.Context, namespace string, verbs ...string) *operationError {
+	for _, verb := range verbs {
+		review, err := s.cluster.CheckAccess(ctx, AccessCheck{Verb: verb, Resource: "secrets", Namespace: namespace})
+		if err != nil {
+			return kubeError(err)
+		}
+		if !review.Allowed {
+			reason := strings.TrimSpace(review.Reason)
+			if reason == "" {
+				reason = "Kubernetes did not authorize this Helm storage action"
+			}
+			return &operationError{code: "forbidden", err: fmt.Errorf("Helm lifecycle requires secrets.%s in namespace %q: %s", verb, namespace, reason)}
+		}
+	}
+	return nil
+}
+
 // helmInspect reads Helm's default v3 Secret driver directly through
 // client-go. It does not call Helm, invoke a shell, or mutate release storage.
 func (s *Server) helmInspect(ctx context.Context, request HelmReleaseInspectionRequest) (HelmReleaseInspection, error) {
@@ -152,6 +264,9 @@ func (s *Server) helmInspect(ctx context.Context, request HelmReleaseInspectionR
 	}
 	if secret == nil {
 		return HelmReleaseInspection{}, fmt.Errorf("Helm storage Secret was not found")
+	}
+	if secret.GetName() != request.StorageName || secret.GetNamespace() != request.Namespace {
+		return HelmReleaseInspection{}, fmt.Errorf("Helm storage Secret identity no longer matches the selected revision")
 	}
 	labels := secret.GetLabels()
 	if labels["owner"] != "helm" || helmReleaseNameFromMetadata(labels, secret.GetAnnotations()) != request.Release {

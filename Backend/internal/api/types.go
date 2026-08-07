@@ -153,6 +153,45 @@ type HelmSensitiveContents struct {
 	ValuesTruncated   bool   `json:"valuesTruncated"`
 }
 
+// HelmRollbackRequest pins both ends of a Helm rollback. TargetRevision is
+// the historical revision to restore, while ExpectedRevision identifies the
+// release state the operator actually reviewed. The storage names make a
+// delete/recreate or a racing Helm upgrade fail before the SDK runs.
+type HelmRollbackRequest struct {
+	Namespace           string `json:"namespace"`
+	Release             string `json:"release"`
+	TargetStorageName   string `json:"targetStorageName"`
+	TargetRevision      int    `json:"targetRevision"`
+	ExpectedStorageName string `json:"expectedStorageName"`
+	ExpectedRevision    int    `json:"expectedRevision"`
+}
+
+type HelmRollbackResult struct {
+	Namespace      string `json:"namespace"`
+	Release        string `json:"release"`
+	TargetRevision int    `json:"targetRevision"`
+	Message        string `json:"message"`
+}
+
+// HelmUninstallRequest retains release storage history by default. The
+// expected storage revision is never treated as a generic Secret identifier:
+// the server revalidates that it is the current Secret for this exact Helm
+// release before invoking the Helm SDK.
+type HelmUninstallRequest struct {
+	Namespace           string `json:"namespace"`
+	Release             string `json:"release"`
+	ExpectedStorageName string `json:"expectedStorageName"`
+	ExpectedRevision    int    `json:"expectedRevision"`
+}
+
+type HelmUninstallResult struct {
+	Namespace   string `json:"namespace"`
+	Release     string `json:"release"`
+	KeepHistory bool   `json:"keepHistory"`
+	Info        string `json:"info,omitempty"`
+	Message     string `json:"message"`
+}
+
 // RelationshipGraph is a bounded, read-only topology snapshot centred on one
 // selected object. Nodes use stable object identity where Kubernetes provided
 // a UID; unresolved references are retained rather than silently discarded.
@@ -455,6 +494,15 @@ type ManifestDiffChange struct {
 	Operation string `json:"operation"`
 	Live      string `json:"live,omitempty"`
 	Preview   string `json:"preview,omitempty"`
+}
+
+// ManifestBatchDeleteResult describes a manifest-directory deletion preflight
+// or a completed outcome. Kubernetes cannot transact arbitrary deletes, so a
+// caller must always disclose that a later failure may follow earlier removes.
+type ManifestBatchDeleteResult struct {
+	Validated bool               `json:"validated"`
+	Deleted   bool               `json:"deleted"`
+	Items     []ManifestIdentity `json:"items"`
 }
 
 // ManifestApplyRequest crosses into the direct client-go layer only after the

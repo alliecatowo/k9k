@@ -7,6 +7,17 @@ struct ResourceInspectorView: View {
     let type: ResourceType?
     let events: [ClusterEvent]
     @State private var section: InspectorSection = .overview
+    @State private var isLoadingEvents = false
+
+    /// The raw-object viewer can be revisited many times while a watch is
+    /// updating the resource list. Keep the expensive JSON serialization out
+    /// of those unrelated observer passes, while still invalidating it for a
+    /// new Kubernetes resource version.
+    private static let rawJSONCache: NSCache<NSString, NSString> = {
+        let cache = NSCache<NSString, NSString>()
+        cache.countLimit = 24
+        return cache
+    }()
 
     enum InspectorSection: String, CaseIterable, Identifiable { case overview = "Overview", events = "Events", raw = "Raw JSON", metadata = "Metadata"; var id: String { rawValue } }
 
@@ -33,7 +44,9 @@ struct ResourceInspectorView: View {
                     case .metadata:
                         metadata(resource)
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .navigationTitle(resource.name)
             } else {
                 ContentUnavailableView("No Selection", systemImage: "sidebar.right", description: Text("Select a \(type?.kind ?? "resource") to inspect its status, metadata, and raw Kubernetes object."))
@@ -43,10 +56,18 @@ struct ResourceInspectorView: View {
             // Event polling is valuable while reading the timeline but wastes
             // API capacity (and triggers needless view updates) on Overview,
             // Raw JSON, and Metadata.
-            guard section == .events, let resource else { return }
+            guard section == .events, let resource else {
+                isLoadingEvents = false
+                return
+            }
+            isLoadingEvents = true
+            await store.loadEvents(for: resource)
+            guard !Task.isCancelled else { return }
+            isLoadingEvents = false
             while !Task.isCancelled {
-                await store.loadEvents(for: resource)
                 try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled else { return }
+                await store.loadEvents(for: resource)
             }
         }
     }
@@ -63,18 +84,29 @@ struct ResourceInspectorView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            .layoutPriority(1)
             Spacer(minLength: 8)
             Text(resource.status)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(statusColor(resource.status))
                 .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: 104, alignment: .trailing)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(resource.kind) \(resource.name), \(resource.namespace?.isEmpty == false ? "namespace \(resource.namespace!)" : "cluster-scoped"), status \(resource.status)")
     }
 
     @ViewBuilder private var eventList: some View {
-        if events.isEmpty {
+        if isLoadingEvents && events.isEmpty {
+            ProgressView("Loading events…")
+                .controlSize(.small)
+                .frame(maxWidth: .infinity, minHeight: 140, alignment: .top)
+                .padding(.top, 32)
+                .accessibilityLabel("Loading Kubernetes events")
+        } else if events.isEmpty {
             ContentUnavailableView("No Events", systemImage: "bell.slash", description: Text("There are no Kubernetes events for this resource."))
                 .padding(.top, 48)
         } else {
@@ -307,6 +339,7 @@ struct ResourceInspectorView: View {
     }
 
     @ViewBuilder private func rawJSON(_ resource: ResourceSummary) -> some View {
+        let source = prettyJSON(resource)
         VStack(spacing: 0) {
             HStack {
                 Text("Sorted, API-faithful object JSON")
@@ -315,20 +348,30 @@ struct ResourceInspectorView: View {
                 Spacer()
                 Button("Copy JSON") {
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(prettyJSON(resource.raw), forType: .string)
+                    NSPasteboard.general.setString(source, forType: .string)
                 }
+                .help("Copy the full Kubernetes object as sorted JSON")
+                .accessibilityHint("Copies the full Kubernetes object as sorted JSON")
             }
             .padding(.horizontal)
             .padding(.vertical, 10)
             Divider()
-            SyntaxHighlightedTextView(source: prettyJSON(resource.raw), language: .json)
+            SyntaxHighlightedTextView(source: source, language: .json)
+                .accessibilityLabel("Raw JSON for \(resource.kind) \(resource.name)")
         }
-        .frame(minHeight: 300)
+        .frame(maxWidth: .infinity, minHeight: 300, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    private func prettyJSON(_ raw: JSONValue?) -> String {
+    private func prettyJSON(_ resource: ResourceSummary) -> String {
+        let cacheKey = "\(resource.id)|\(resource.resourceVersion ?? "")|\(resource.raw == nil ? "summary" : "raw")" as NSString
+        if let cached = Self.rawJSONCache.object(forKey: cacheKey) {
+            return cached as String
+        }
+        let raw = resource.raw
         guard let raw, let data = try? JSONEncoder().encode(raw), let value = try? JSONSerialization.jsonObject(with: data), let pretty = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys]) else { return "No raw object available." }
-        return String(decoding: pretty, as: UTF8.self)
+        let formatted = String(decoding: pretty, as: UTF8.self)
+        Self.rawJSONCache.setObject(formatted as NSString, forKey: cacheKey)
+        return formatted
     }
 
     private func list(_ value: JSONValue?, fallback: String = "") -> String {

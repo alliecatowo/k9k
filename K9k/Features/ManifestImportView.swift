@@ -8,6 +8,8 @@ struct ManifestImportView: View {
     @State private var isWorking = false
     @State private var validationMessage: String?
     @State private var applyConfirmation = false
+    @State private var deleteConfirmation = false
+    @State private var appliedBatch: ManifestBatchApplyResult?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -17,7 +19,7 @@ struct ManifestImportView: View {
                     Text("K9k resolves every document through active-cluster discovery, validates the complete set, then applies only after confirmation.").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Open YAML Files…") { openFiles() }.disabled(isWorking)
+                Button("Open YAML Files…") { openFiles() }.disabled(isWorking || appliedBatch != nil)
                 Button("Close") { dismiss() }
             }.padding()
             Divider()
@@ -27,14 +29,25 @@ struct ManifestImportView: View {
                 Text(validationMessage ?? "Paste YAML or choose files/directories. Files are read recursively; namespace and name come from each manifest.")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 Spacer()
-                Button("Validate") { validate() }.disabled(source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isWorking)
-                Button("Apply \(documentLabel)…") { applyConfirmation = true }.disabled(source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isWorking || store.isReadOnly)
+                if let appliedBatch {
+                    Button("Prepare Removal…") { prepareRemoval(appliedBatch.items.map(\.identity)) }
+                        .disabled(isWorking || store.isReadOnly || appliedBatch.items.contains { $0.identity.uid.isEmpty })
+                        .help("Recheck delete authorization and the UID of every applied object before asking for confirmation")
+                } else {
+                    Button("Validate") { validate() }.disabled(source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isWorking)
+                    Button("Apply \(documentLabel)…") { applyConfirmation = true }.disabled(source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isWorking || store.isReadOnly)
+                }
             }.padding()
         }
         .frame(minWidth: 820, minHeight: 620)
         .confirmationDialog("Apply manifest batch?", isPresented: $applyConfirmation, titleVisibility: .visible) {
             Button("Apply \(documentLabel)", role: .destructive) { apply() }
         } message: { Text("K9k will resolve each document against live discovery, dry-run every document first, then server-side apply the exact batch without forcing ownership. Kubernetes does not provide a transaction across multiple resources, so a later write could fail after an earlier one succeeds.") }
+        .confirmationDialog("Delete imported manifest batch?", isPresented: $deleteConfirmation, titleVisibility: .visible) {
+            Button("Delete \(appliedBatch?.items.count ?? 0) Imported Objects", role: .destructive) { deleteAppliedBatch() }
+        } message: {
+            Text("K9k has checked delete access, existence, kind, and UID for every imported object. It will send UID-preconditioned deletes directly to Kubernetes. Kubernetes cannot make this atomic; a later delete can fail after earlier objects are already removed.")
+        }
     }
 
     private var documentLabel: String {
@@ -126,8 +139,45 @@ struct ManifestImportView: View {
         isWorking = true
         Task {
             defer { isWorking = false }
-            do { _ = try await store.importMixedManifests(source: source, confirm: true); await store.loadResources(); dismiss() }
+            do {
+                let result = try await store.importMixedManifests(source: source, confirm: true)
+                appliedBatch = result
+                validationMessage = "Applied \(result.items.count) document\(result.items.count == 1 ? "" : "s"). You can now prepare a UID-pinned removal of this exact batch."
+                await store.loadResources()
+            }
             catch { validationMessage = "Batch apply failed. Earlier documents may have been applied."; store.errorMessage = error.localizedDescription }
+        }
+    }
+
+    private func prepareRemoval(_ identities: [ManifestIdentity]) {
+        isWorking = true
+        Task {
+            defer { isWorking = false }
+            do {
+                let result = try await store.deleteImportedManifestBatch(identities, confirm: false)
+                validationMessage = "Deletion preflight passed for \(result.items.count) object\(result.items.count == 1 ? "" : "s"). No objects have been removed."
+                deleteConfirmation = true
+            } catch {
+                validationMessage = "Deletion preflight failed; no objects were removed."
+                store.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func deleteAppliedBatch() {
+        guard let appliedBatch else { return }
+        isWorking = true
+        Task {
+            defer { isWorking = false }
+            do {
+                let result = try await store.deleteImportedManifestBatch(appliedBatch.items.map(\.identity), confirm: true)
+                self.appliedBatch = nil
+                validationMessage = "Deleted \(result.items.count) imported object\(result.items.count == 1 ? "" : "s")."
+                await store.loadResources()
+            } catch {
+                validationMessage = "Batch deletion failed. Earlier objects may already be deleted; refresh the list before retrying."
+                store.errorMessage = error.localizedDescription
+            }
         }
     }
 }

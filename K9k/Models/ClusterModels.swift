@@ -403,6 +403,15 @@ struct ManifestBatchApplyResult: Codable, Hashable {
     let items: [ManifestDocument]
 }
 
+/// A previewed or completed deletion of the exact objects returned by a prior
+/// manifest import. Kubernetes has no transaction across arbitrary resources,
+/// so the UI must always describe confirmed deletes as potentially partial.
+struct ManifestBatchDeleteResult: Codable, Hashable {
+    let validated: Bool
+    let deleted: Bool
+    let items: [ManifestIdentity]
+}
+
 enum JSONValue: Codable, Hashable {
     case string(String), number(Double), bool(Bool), object([String: JSONValue]), array([JSONValue]), null
 

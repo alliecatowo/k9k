@@ -64,7 +64,12 @@ struct HelmReleaseHistorySection: View {
         .task(id: "\(namespace)/\(release)") { await load() }
         .onDisappear { client.stop() }
         .sheet(item: $selectedRevision) { revision in
-            HelmReleaseInspectionView(release: release, namespace: namespace, revision: revision)
+            HelmReleaseInspectionView(
+                release: release,
+                namespace: namespace,
+                revision: revision,
+                currentRevision: history?.revisions.first(where: { $0.revision > 0 })
+            )
         }
     }
 

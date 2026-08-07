@@ -52,6 +52,10 @@ type ClusterClient interface {
 	Get(context.Context, schema.GroupVersionResource, string, string, bool) (*unstructured.Unstructured, error)
 	Watch(context.Context, schema.GroupVersionResource, string, bool, string, string, string) (watch.Interface, error)
 	Delete(context.Context, schema.GroupVersionResource, string, string, bool) error
+	// DeleteManifest performs a UID-preconditioned delete for the manifest
+	// directory flow. It prevents a recreated name from being deleted after a
+	// successful batch preflight.
+	DeleteManifest(context.Context, ManifestIdentity) error
 	Patch(context.Context, schema.GroupVersionResource, string, string, bool, []byte) (*unstructured.Unstructured, error)
 	Manifest(context.Context, schema.GroupVersionResource, string, string, bool) (ManifestDocument, error)
 	ApplyManifest(context.Context, ManifestApplyRequest) (*unstructured.Unstructured, error)
@@ -63,6 +67,8 @@ type ClusterClient interface {
 	DebugPod(context.Context, PodDebugRequest) (PodDebugResult, error)
 	TriggerCronJob(context.Context, CronJobTriggerRequest) (CronJobTriggerResult, error)
 	RollbackDeployment(context.Context, DeploymentRollbackRequest) (DeploymentRollbackResult, error)
+	RollbackHelm(context.Context, HelmRollbackRequest) (HelmRollbackResult, error)
+	UninstallHelm(context.Context, HelmUninstallRequest) (HelmUninstallResult, error)
 	CheckAccess(context.Context, AccessCheck) (AccessReview, error)
 	PortForward(context.Context, PortForwardRequest, func(PortForwardBinding)) error
 	PodExec(context.Context, PodExecRequest, PodExecStreams) error
@@ -210,8 +216,9 @@ func (s *Server) setReadOnly(value bool) { s.policyMu.Lock(); s.readOnly = value
 func protectedReadOnlyOperation(operation string) bool {
 	switch operation {
 	case "context.select", "context.update", "context.rename", "context.copy", "context.delete", "config.write",
-		"resource.patch", "resource.delete", "resource.scale", "manifest.apply", "manifest.applyBatch", "manifest.applyMixed",
-		"node.drain", "pod.debug", "cronjob.trigger", "deployment.rollback", "exec.open", "attach.open", "portforward.open":
+		"resource.patch", "resource.delete", "resource.scale", "manifest.apply", "manifest.applyBatch", "manifest.applyMixed", "manifest.deleteBatch",
+		"node.drain", "pod.debug", "cronjob.trigger", "deployment.rollback", "exec.open", "attach.open", "portforward.open",
+		"helm.rollback", "helm.uninstall":
 		return true
 	default:
 		return false
@@ -614,6 +621,65 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(inspectErr)
 		}
 		return result, nil
+	case "helm.rollback":
+		var params struct {
+			HelmRollbackRequest
+			Confirm bool `json:"confirm"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		validated, err := validateHelmRollbackParams(params.HelmRollbackRequest)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		if !params.Confirm {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("Helm rollback requires confirm: true")}
+		}
+		if err := s.verifyHelmRollback(ctx, validated); err != nil {
+			if errors.Is(err, ErrHelmReleaseChanged) || errors.Is(err, ErrHelmReleaseUnsafe) {
+				return nil, &operationError{code: "stale_release", err: err}
+			}
+			return nil, kubeError(err)
+		}
+		if accessErr := s.checkHelmStorageAccess(ctx, validated.Namespace, "get", "list", "create", "update"); accessErr != nil {
+			return nil, accessErr
+		}
+		result, rollbackErr := s.cluster.RollbackHelm(ctx, validated)
+		if rollbackErr != nil {
+			return nil, kubeError(rollbackErr)
+		}
+		return result, nil
+	case "helm.uninstall":
+		var params struct {
+			HelmUninstallRequest
+			Confirm          bool   `json:"confirm"`
+			ConfirmationText string `json:"confirmationText"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		validated, err := validateHelmUninstallParams(params.HelmUninstallRequest)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		if !params.Confirm || strings.TrimSpace(params.ConfirmationText) != validated.Release {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("Helm uninstall requires confirm: true and the exact release name in confirmationText")}
+		}
+		if err := s.verifyHelmCurrentRevision(ctx, validated.Namespace, validated.Release, validated.ExpectedStorageName, validated.ExpectedRevision); err != nil {
+			if errors.Is(err, ErrHelmReleaseChanged) || errors.Is(err, ErrHelmReleaseUnsafe) {
+				return nil, &operationError{code: "stale_release", err: err}
+			}
+			return nil, kubeError(err)
+		}
+		if accessErr := s.checkHelmStorageAccess(ctx, validated.Namespace, "get", "list", "update"); accessErr != nil {
+			return nil, accessErr
+		}
+		result, uninstallErr := s.cluster.UninstallHelm(ctx, validated)
+		if uninstallErr != nil {
+			return nil, kubeError(uninstallErr)
+		}
+		return result, nil
 	case "relationships.get":
 		params, err := decodeResourceParams(request.Params, true)
 		if err != nil {
@@ -695,6 +761,12 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, invalidParams(resolveErr)
 		}
 		return s.applyManifestBatch(ctx, items, params.Confirm)
+	case "manifest.deleteBatch":
+		params, err := decodeManifestBatchDeleteParams(request.Params)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		return s.deleteManifestBatch(ctx, params.Items, params.Confirm)
 	case "resource.events":
 		var params struct {
 			Namespace string `json:"namespace"`
@@ -1882,6 +1954,14 @@ type manifestMixedApplyParams struct {
 	Documents []string `json:"-"`
 }
 
+// manifestBatchDeleteParams accepts identities only from a prior manifest
+// import result. It never derives a target from arbitrary YAML, and every
+// target remains pinned to the UID returned by Kubernetes after apply.
+type manifestBatchDeleteParams struct {
+	Items   []ManifestIdentity `json:"items"`
+	Confirm bool               `json:"confirm"`
+}
+
 // manifestDiscoveryError keeps a live-cluster failure distinct from an invalid
 // import. The native client can then distinguish a transient RBAC/API outage
 // from YAML a user needs to correct.
@@ -1909,6 +1989,40 @@ func decodeManifestMixedApplyParams(raw json.RawMessage) (manifestMixedApplyPara
 		return params, fmt.Errorf("manifest batch contains %d documents; maximum is %d", len(documents), maxManifestBatchDocuments)
 	}
 	params.Documents = documents
+	return params, nil
+}
+
+func decodeManifestBatchDeleteParams(raw json.RawMessage) (manifestBatchDeleteParams, error) {
+	var params manifestBatchDeleteParams
+	if err := decodeParams(raw, &params); err != nil {
+		return params, err
+	}
+	if len(params.Items) == 0 {
+		return params, errors.New("at least one manifest identity is required")
+	}
+	if len(params.Items) > maxManifestBatchDocuments {
+		return params, fmt.Errorf("manifest batch contains %d documents; maximum is %d", len(params.Items), maxManifestBatchDocuments)
+	}
+	seen := make(map[string]struct{}, len(params.Items))
+	for index, identity := range params.Items {
+		identity.Group, identity.Version, identity.Resource = strings.TrimSpace(identity.Group), strings.TrimSpace(identity.Version), strings.TrimSpace(identity.Resource)
+		identity.Namespace, identity.Name, identity.UID, identity.Kind = strings.TrimSpace(identity.Namespace), strings.TrimSpace(identity.Name), strings.TrimSpace(identity.UID), strings.TrimSpace(identity.Kind)
+		if identity.Version == "" || identity.Resource == "" || identity.Name == "" || identity.UID == "" || identity.Kind == "" {
+			return params, fmt.Errorf("manifest document %d has an incomplete identity", index+1)
+		}
+		if identity.Namespaced && identity.Namespace == "" {
+			return params, fmt.Errorf("manifest document %d requires a namespace", index+1)
+		}
+		if !identity.Namespaced && identity.Namespace != "" {
+			return params, fmt.Errorf("manifest document %d is cluster-scoped but includes a namespace", index+1)
+		}
+		key := identity.Group + "/" + identity.Version + "/" + identity.Resource + "|" + identity.Namespace + "|" + identity.Name
+		if _, duplicate := seen[key]; duplicate {
+			return params, fmt.Errorf("manifest document %d duplicates target %s", index+1, key)
+		}
+		seen[key] = struct{}{}
+		params.Items[index] = identity
+	}
 	return params, nil
 }
 
@@ -2056,6 +2170,46 @@ func (s *Server) applyManifestBatch(ctx context.Context, items []manifestApplyPa
 		appliedDocuments = append(appliedDocuments, document)
 	}
 	return map[string]any{"validated": true, "applied": true, "items": appliedDocuments}, nil
+}
+
+// deleteManifestBatch completes all authorization, existence, kind, and UID
+// checks before it sends the first delete. Kubernetes has no cross-resource
+// transaction, so confirmation deletes in order and reports a failure as a
+// possible partial outcome. DeleteManifest still supplies a UID precondition
+// to protect against a replacement between this preflight and the delete.
+func (s *Server) deleteManifestBatch(ctx context.Context, items []ManifestIdentity, confirm bool) (any, *operationError) {
+	for _, identity := range items {
+		access, accessErr := s.cluster.CheckAccess(ctx, AccessCheck{
+			Verb: "delete", Group: identity.Group, Version: identity.Version, Resource: identity.Resource,
+			Namespace: identity.Namespace, Name: identity.Name,
+		})
+		if accessErr != nil {
+			return nil, kubeError(accessErr)
+		}
+		if !access.Allowed {
+			reason := strings.TrimSpace(access.Reason)
+			if reason == "" {
+				reason = "Kubernetes did not authorize delete"
+			}
+			return nil, &operationError{code: "forbidden", err: fmt.Errorf("delete %s %s: %s", identity.Kind, identity.Name, reason)}
+		}
+		live, manifestErr := s.cluster.Manifest(ctx, schema.GroupVersionResource{Group: identity.Group, Version: identity.Version, Resource: identity.Resource}, identity.Namespace, identity.Name, identity.Namespaced)
+		if manifestErr != nil {
+			return nil, kubeError(manifestErr)
+		}
+		if live.Identity.UID == "" || live.Identity.UID != identity.UID || live.Identity.Kind != identity.Kind || live.Identity.Group != identity.Group || live.Identity.Version != identity.Version || live.Identity.Resource != identity.Resource || live.Identity.Namespaced != identity.Namespaced || live.Identity.Namespace != identity.Namespace || live.Identity.Name != identity.Name {
+			return nil, manifestOperationError(ErrManifestIdentityMismatch, "manifest identity changed before deletion")
+		}
+	}
+	if !confirm {
+		return ManifestBatchDeleteResult{Validated: true, Deleted: false, Items: items}, nil
+	}
+	for _, identity := range items {
+		if deleteErr := s.cluster.DeleteManifest(ctx, identity); deleteErr != nil {
+			return nil, manifestOperationError(deleteErr, "manifest batch deletion failed; earlier documents may already be deleted")
+		}
+	}
+	return ManifestBatchDeleteResult{Validated: true, Deleted: true, Items: items}, nil
 }
 
 // diffManifest intentionally uses the same non-forced SSA dry-run as Apply.

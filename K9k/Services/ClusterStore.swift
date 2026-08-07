@@ -1466,6 +1466,27 @@ final class ClusterStore {
         return try decode((try await client.request("manifest.applyMixed", parameters: parameters)).result, as: ManifestBatchApplyResult.self)
     }
 
+    /// Preflights or deletes the immutable identities returned by a confirmed
+    /// import. The helper rechecks RBAC and UID for the whole batch before any
+    /// confirmed deletion starts; no local shell or kubectl process is used.
+    func deleteImportedManifestBatch(_ items: [ManifestIdentity], confirm: Bool) async throws -> ManifestBatchDeleteResult {
+        let identities: [JSONValue] = items.map { identity in
+            .object([
+                "group": .string(identity.group ?? ""),
+                "version": .string(identity.version),
+                "resource": .string(identity.resource),
+                "namespaced": .bool(identity.namespaced),
+                "namespace": .string(identity.namespace ?? ""),
+                "name": .string(identity.name),
+                "uid": .string(identity.uid),
+                "kind": .string(identity.kind),
+            ])
+        }
+        return try decode((try await client.request("manifest.deleteBatch", parameters: .object([
+            "items": .array(identities), "confirm": .bool(confirm),
+        ]))).result, as: ManifestBatchDeleteResult.self)
+    }
+
     func copySelectedName() {
         guard let resource = resources.first(where: { selectedResources.contains($0.id) }) else { return }
         NSPasteboard.general.clearContents()

@@ -9,6 +9,9 @@ struct HelmReleaseInspectionView: View {
     let release: String
     let namespace: String
     let revision: HelmReleaseRevision
+    /// The newest valid revision observed in the history sheet. The helper
+    /// independently rechecks this exact storage revision before mutating.
+    let currentRevision: HelmReleaseRevision?
 
     @Environment(\.dismiss) private var dismiss
     @State private var client = CoreClient()
@@ -16,6 +19,10 @@ struct HelmReleaseInspectionView: View {
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var sensitiveAcknowledged = false
+    @State private var rollbackConfirmationPresented = false
+    @State private var uninstallConfirmationPresented = false
+    @State private var isActing = false
+    @State private var lifecycleMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -33,13 +40,31 @@ struct HelmReleaseInspectionView: View {
             .navigationTitle("\(release) · Revision \(revision.revision)")
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        Task { await load(includeSensitive: inspection?.sensitive != nil) }
+                    Menu {
+                        Button {
+                            Task { await load(includeSensitive: inspection?.sensitive != nil) }
+                        } label: {
+                            Label("Refresh Helm release", systemImage: "arrow.clockwise")
+                        }
+                        if canRollback {
+                            Divider()
+                            Button("Roll Back to Revision \(revision.revision)…", systemImage: "arrow.uturn.backward") {
+                                rollbackConfirmationPresented = true
+                            }
+                            .disabled(isActing)
+                        }
+                        if canUninstall {
+                            Divider()
+                            Button("Uninstall Release…", systemImage: "trash", role: .destructive) {
+                                uninstallConfirmationPresented = true
+                            }
+                            .disabled(isActing)
+                        }
                     } label: {
-                        Label("Refresh Helm release", systemImage: "arrow.clockwise")
+                        Label("Helm release actions", systemImage: "ellipsis.circle")
                     }
-                    .disabled(isLoading)
-                    .help("Refresh Helm release inspection")
+                    .disabled(isLoading || isActing)
+                    .help("Helm release actions")
                 }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
@@ -49,10 +74,41 @@ struct HelmReleaseInspectionView: View {
         .frame(minWidth: 620, idealWidth: 800, minHeight: 560, idealHeight: 720)
         .task(id: revision.id) { await load(includeSensitive: false) }
         .onDisappear { client.stop() }
+        .confirmationDialog(
+            "Roll Back \(release) to Revision \(revision.revision)?",
+            isPresented: $rollbackConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Roll Back", role: .destructive) {
+                Task { await rollback() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Helm will create a new release revision using revision \(revision.revision). Hooks remain enabled; K9k will not wait for workload readiness.")
+        }
+        .sheet(isPresented: $uninstallConfirmationPresented) {
+            HelmUninstallConfirmationSheet(release: release, isActing: $isActing) { confirmationText in
+                uninstallConfirmationPresented = false
+                Task { await uninstall(confirmationText: confirmationText) }
+            }
+        }
     }
 
     @ViewBuilder private func inspectionForm(_ inspection: HelmReleaseInspection) -> some View {
         Form {
+            if let errorMessage {
+                Section("Action Error") {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                }
+            }
+            if let lifecycleMessage {
+                Section("Lifecycle") {
+                    Label(lifecycleMessage, systemImage: "checkmark.circle")
+                        .foregroundStyle(.green)
+                }
+            }
             Section("Release") {
                 LabeledContent("Namespace", value: inspection.namespace)
                 LabeledContent("Revision", value: String(inspection.revision.revision))
@@ -91,6 +147,20 @@ struct HelmReleaseInspectionView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var canRollback: Bool {
+        guard let currentRevision else { return false }
+        return revision.revision > 0 && revision.revision < currentRevision.revision && isMutableLifecycleStatus(currentRevision.status)
+    }
+
+    private var canUninstall: Bool {
+        guard let currentRevision else { return false }
+        return revision.id == currentRevision.id && isMutableLifecycleStatus(currentRevision.status)
+    }
+
+    private func isMutableLifecycleStatus(_ status: String) -> Bool {
+        !["uninstalled", "uninstalling", "pending-install", "pending-upgrade", "pending-rollback"].contains(status.lowercased())
     }
 
     @ViewBuilder private func optionalContent(_ label: String, _ value: String?) -> some View {
@@ -165,8 +235,96 @@ struct HelmReleaseInspectionView: View {
         }
     }
 
+    private func rollback() async {
+        guard let currentRevision else { return }
+        isActing = true
+        errorMessage = nil
+        defer { isActing = false }
+        do {
+            _ = try await client.request("helm.rollback", parameters: .object([
+                "namespace": .string(namespace),
+                "release": .string(release),
+                "targetStorageName": .string(revision.storageName),
+                "targetRevision": .number(Double(revision.revision)),
+                "expectedStorageName": .string(currentRevision.storageName),
+                "expectedRevision": .number(Double(currentRevision.revision)),
+                "confirm": .bool(true),
+            ]))
+            lifecycleMessage = "Rollback started through Helm. Watch the resource browser for rollout status."
+            await load(includeSensitive: inspection?.sensitive != nil)
+        } catch {
+            errorMessage = "K9k could not roll back this Helm release: \(error.localizedDescription)"
+        }
+    }
+
+    private func uninstall(confirmationText: String) async {
+        guard let currentRevision else { return }
+        isActing = true
+        errorMessage = nil
+        defer { isActing = false }
+        do {
+            _ = try await client.request("helm.uninstall", parameters: .object([
+                "namespace": .string(namespace),
+                "release": .string(release),
+                "expectedStorageName": .string(currentRevision.storageName),
+                "expectedRevision": .number(Double(currentRevision.revision)),
+                "confirmationText": .string(confirmationText),
+                "confirm": .bool(true),
+            ]))
+            lifecycleMessage = "Uninstall started through Helm. Release history is retained."
+            await load(includeSensitive: inspection?.sensitive != nil)
+        } catch {
+            errorMessage = "K9k could not uninstall this Helm release: \(error.localizedDescription)"
+        }
+    }
+
     private func copy(_ source: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(source, forType: .string)
+    }
+}
+
+private struct HelmUninstallConfirmationSheet: View {
+    let release: String
+    @Binding var isActing: Bool
+    let confirm: (String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirmationText = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Text("This runs Helm's uninstall lifecycle, including chart hooks. K9k preserves Helm release history but Kubernetes resources owned by the release will be deleted.")
+                        .foregroundStyle(.secondary)
+                }
+                Section("Confirm") {
+                    TextField("Release name", text: $confirmationText, prompt: Text(release))
+                        .textFieldStyle(.roundedBorder)
+                        .textInputAutocapitalization(.never)
+                        .disableAutocorrection(true)
+                    Text("Type \(release) to enable uninstall.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Uninstall \(release)")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .disabled(isActing)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Uninstall", role: .destructive) {
+                        confirm(confirmationText)
+                    }
+                    .disabled(confirmationText.trimmingCharacters(in: .whitespacesAndNewlines) != release || isActing)
+                }
+            }
+        }
+        .frame(minWidth: 460, idealWidth: 520, minHeight: 250)
+        .interactiveDismissDisabled(isActing)
     }
 }

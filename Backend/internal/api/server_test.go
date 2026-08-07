@@ -34,6 +34,7 @@ type fakeCluster struct {
 	list       []ResourceSummary
 	listPage   ResourceListPage
 	object     *unstructured.Unstructured
+	objects    map[string]*unstructured.Unstructured
 	watcher    *contextWatch
 
 	contextsErr, selectErr, namespacesErr, discoveryErr error
@@ -49,8 +50,10 @@ type fakeCluster struct {
 	debugErr                                            error
 	triggerCronJobErr                                   error
 	rollbackDeploymentErr                               error
+	helmRollbackErr, helmUninstallErr                   error
 	execErr                                             error
 	manifestErr, applyManifestErr                       error
+	manifestDeleteErr                                   error
 
 	selected        []string
 	contextUpdates  []Context
@@ -71,10 +74,14 @@ type fakeCluster struct {
 	debugs          []PodDebugRequest
 	cronJobTriggers []CronJobTriggerRequest
 	rollbacks       []DeploymentRollbackRequest
+	helmRollbacks   []HelmRollbackRequest
+	helmUninstalls  []HelmUninstallRequest
 	execs           []PodExecRequest
 	execFn          func(context.Context, PodExecRequest, PodExecStreams) error
 	manifests       []resourceCall
 	applyManifests  []ManifestApplyRequest
+	manifestDeletes []ManifestIdentity
+	accessFn        func(AccessCheck) AccessReview
 }
 
 type resourceCall struct {
@@ -172,6 +179,9 @@ func (f *fakeCluster) Get(_ context.Context, gvr schema.GroupVersionResource, na
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gets = append(f.gets, resourceCall{gvr: gvr, namespace: namespace, name: name, namespaced: namespaced})
+	if f.objects != nil {
+		return f.objects[namespace+"/"+name], f.getErr
+	}
 	return f.object, f.getErr
 }
 
@@ -199,6 +209,13 @@ func (f *fakeCluster) Delete(_ context.Context, gvr schema.GroupVersionResource,
 	defer f.mu.Unlock()
 	f.deletes = append(f.deletes, resourceCall{gvr: gvr, namespace: namespace, name: name, namespaced: namespaced})
 	return f.deleteErr
+}
+
+func (f *fakeCluster) DeleteManifest(_ context.Context, identity ManifestIdentity) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.manifestDeletes = append(f.manifestDeletes, identity)
+	return f.manifestDeleteErr
 }
 
 func (f *fakeCluster) Patch(_ context.Context, gvr schema.GroupVersionResource, namespace, name string, namespaced bool, patch []byte) (*unstructured.Unstructured, error) {
@@ -297,12 +314,35 @@ func (f *fakeCluster) RollbackDeployment(_ context.Context, request DeploymentRo
 	return DeploymentRollbackResult{Namespace: request.Namespace, Deployment: "web", ReplicaSet: request.ReplicaSet}, f.rollbackDeploymentErr
 }
 
+func (f *fakeCluster) RollbackHelm(_ context.Context, request HelmRollbackRequest) (HelmRollbackResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.helmRollbacks = append(f.helmRollbacks, request)
+	if f.helmRollbackErr != nil {
+		return HelmRollbackResult{}, f.helmRollbackErr
+	}
+	return HelmRollbackResult{Namespace: request.Namespace, Release: request.Release, TargetRevision: request.TargetRevision, Message: "rollback started"}, nil
+}
+
+func (f *fakeCluster) UninstallHelm(_ context.Context, request HelmUninstallRequest) (HelmUninstallResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.helmUninstalls = append(f.helmUninstalls, request)
+	if f.helmUninstallErr != nil {
+		return HelmUninstallResult{}, f.helmUninstallErr
+	}
+	return HelmUninstallResult{Namespace: request.Namespace, Release: request.Release, KeepHistory: true, Message: "uninstall started"}, nil
+}
+
 func (f *fakeCluster) CheckAccess(_ context.Context, check AccessCheck) (AccessReview, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.accesses = append(f.accesses, check)
 	if f.accessErr != nil {
 		return AccessReview{}, f.accessErr
+	}
+	if f.accessFn != nil {
+		return f.accessFn(check), nil
 	}
 	return AccessReview{Allowed: check.Verb == "get", Reason: "fake authorization decision"}, nil
 }
@@ -812,6 +852,70 @@ func TestManifestBatchRejectsDuplicateAndMismatchedDocumentsBeforeCallingCluster
 	defer client.mu.Unlock()
 	if len(client.applyManifests) != 0 {
 		t.Errorf("invalid batch must not reach cluster: %#v", client.applyManifests)
+	}
+}
+
+func TestManifestBatchDeletePreflightsEveryUIDAndAuthorizationBeforeDeleting(t *testing.T) {
+	object := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "settings", "namespace": "demo", "uid": "uid-settings"},
+	}}
+	client := &fakeCluster{object: object, accessFn: func(check AccessCheck) AccessReview {
+		return AccessReview{Allowed: check.Verb == "delete", Reason: "allowed by test"}
+	}}
+	item := map[string]any{"version": "v1", "resource": "configmaps", "namespaced": true, "namespace": "demo", "name": "settings", "uid": "uid-settings", "kind": "ConfigMap"}
+	preview := envelopeByID(t, runRequests(t, client, request("preview", "manifest.deleteBatch", map[string]any{"items": []any{item}})), "preview")
+	if preview.Error != nil {
+		t.Fatalf("preview error = %#v", preview.Error)
+	}
+	result := decodeResult[ManifestBatchDeleteResult](t, preview.Result)
+	if !result.Validated || result.Deleted || len(result.Items) != 1 {
+		t.Errorf("preview = %#v", result)
+	}
+	client.mu.Lock()
+	if len(client.manifestDeletes) != 0 || len(client.accesses) != 1 || len(client.manifests) != 1 {
+		t.Errorf("preview must only preflight: deletes=%#v accesses=%#v manifests=%#v", client.manifestDeletes, client.accesses, client.manifests)
+	}
+	client.mu.Unlock()
+
+	confirmed := envelopeByID(t, runRequests(t, client, request("confirmed", "manifest.deleteBatch", map[string]any{"items": []any{item}, "confirm": true})), "confirmed")
+	if confirmed.Error != nil {
+		t.Fatalf("confirmed deletion error = %#v", confirmed.Error)
+	}
+	client.mu.Lock()
+	deletes := append([]ManifestIdentity(nil), client.manifestDeletes...)
+	accesses, manifests := append([]AccessCheck(nil), client.accesses...), append([]resourceCall(nil), client.manifests...)
+	client.mu.Unlock()
+	if len(deletes) != 1 || deletes[0].UID != "uid-settings" || len(accesses) != 2 || len(manifests) != 2 {
+		t.Errorf("confirmed batch boundary = deletes=%#v accesses=%#v manifests=%#v", deletes, accesses, manifests)
+	}
+}
+
+func TestManifestBatchDeleteRejectsStaleOrUnauthorizedBatchesBeforeAnyDelete(t *testing.T) {
+	item := map[string]any{"version": "v1", "resource": "configmaps", "namespaced": true, "namespace": "demo", "name": "settings", "uid": "old-uid", "kind": "ConfigMap"}
+	stale := &fakeCluster{object: &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "settings", "namespace": "demo", "uid": "new-uid"},
+	}}, accessFn: func(check AccessCheck) AccessReview { return AccessReview{Allowed: true} }}
+	staleResponse := envelopeByID(t, runRequests(t, stale, request("stale", "manifest.deleteBatch", map[string]any{"items": []any{item}, "confirm": true})), "stale")
+	if staleResponse.Error == nil || staleResponse.Error.Code != "identity_mismatch" {
+		t.Errorf("stale response = %#v", staleResponse.Error)
+	}
+	stale.mu.Lock()
+	staleDeletes := len(stale.manifestDeletes)
+	stale.mu.Unlock()
+	if staleDeletes != 0 {
+		t.Errorf("stale target reached delete: %#v", stale.manifestDeletes)
+	}
+
+	denied := &fakeCluster{object: stale.object, accessFn: func(check AccessCheck) AccessReview { return AccessReview{Allowed: false, Reason: "no delete"} }}
+	deniedResponse := envelopeByID(t, runRequests(t, denied, request("denied", "manifest.deleteBatch", map[string]any{"items": []any{item}, "confirm": true})), "denied")
+	if deniedResponse.Error == nil || deniedResponse.Error.Code != "forbidden" {
+		t.Errorf("denied response = %#v", deniedResponse.Error)
+	}
+	denied.mu.Lock()
+	deniedDeletes, deniedReads := len(denied.manifestDeletes), len(denied.manifests)
+	denied.mu.Unlock()
+	if deniedDeletes != 0 || deniedReads != 0 {
+		t.Errorf("unauthorized target should stop before identity read: deletes=%d reads=%d", deniedDeletes, deniedReads)
 	}
 }
 
