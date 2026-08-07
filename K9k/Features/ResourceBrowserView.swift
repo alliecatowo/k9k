@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct ResourceBrowserView: View {
@@ -55,6 +56,14 @@ struct ResourceBrowserView: View {
                     Button("Clear") { store.searchText = "" }
                         .buttonStyle(.borderless)
                 }
+                Menu("Export") {
+                    Button("Copy Visible Rows as TSV") { copyVisibleRows() }
+                    Divider()
+                    Button("Save Visible Rows as JSON…") { saveVisibleRows(as: .json) }
+                    Button("Save Visible Rows as CSV…") { saveVisibleRows(as: .csv) }
+                    Button("Save Visible Rows as TSV…") { saveVisibleRows(as: .tsv) }
+                }
+                .menuStyle(.borderedButton)
                 if !store.labelSelector.isEmpty || !store.fieldSelector.isEmpty {
                     Menu("Selectors") {
                         if !store.labelSelector.isEmpty { Text("Label: \(store.labelSelector)") }
@@ -96,5 +105,57 @@ struct ResourceBrowserView: View {
         if let number = current?.intValue { return String(number) }
         if let bool = current?.boolValue { return bool ? "true" : "false" }
         return ""
+    }
+
+    private enum ExportFormat: String { case json, csv, tsv }
+
+    private func copyVisibleRows() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(tabularRows(separator: "\t"), forType: .string)
+    }
+
+    private func saveVisibleRows(as format: ExportFormat) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "k9k-\(store.selectedResourceType?.resource ?? "resources").\(format.rawValue)"
+        panel.allowedContentTypes = switch format {
+        case .json: [.json]
+        case .csv: [.commaSeparatedText]
+        case .tsv: [.tabSeparatedText]
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let contents: String
+        switch format {
+        case .json:
+            contents = prettyJSONRows()
+        case .csv:
+            contents = tabularRows(separator: ",")
+        case .tsv:
+            contents = tabularRows(separator: "\t")
+        }
+        do {
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            store.errorMessage = "K9k could not save the resource export: \(error.localizedDescription)"
+        }
+    }
+
+    private func tabularRows(separator: String) -> String {
+        let headers = ["Name", "Namespace", "Kind", "Status", "Age"]
+        let rows = store.visibleResources.map { [$0.name, $0.namespace ?? "", $0.kind, $0.status, $0.age] }
+        return ([headers] + rows).map { $0.map { escaped($0, separator: separator) }.joined(separator: separator) }.joined(separator: "\n") + "\n"
+    }
+
+    private func escaped(_ value: String, separator: String) -> String {
+        guard separator == "," else { return value.replacing("\t", with: " ").replacing("\n", with: " ") }
+        guard value.contains(",") || value.contains("\"") || value.contains("\n") else { return value }
+        return "\"\(value.replacing("\"", with: "\"\""))\""
+    }
+
+    private func prettyJSONRows() -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(store.visibleResources) else { return "[]\n" }
+        return String(decoding: data, as: UTF8.self) + "\n"
     }
 }
