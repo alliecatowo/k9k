@@ -57,7 +57,7 @@ func (s *Server) relationships(ctx context.Context, params resourceParams) (Rela
 				continue
 			}
 		}
-		items, listErr := s.cluster.List(ctx, candidate.GVR, namespace, candidate.Namespaced, "")
+		items, listErr := s.cluster.List(ctx, candidate.GVR, namespace, candidate.Namespaced, "", "")
 		if listErr != nil {
 			graph.Warnings = append(graph.Warnings, "Could not inspect "+candidate.Kind+": "+listErr.Error())
 			continue

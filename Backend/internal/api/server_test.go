@@ -65,11 +65,12 @@ type fakeCluster struct {
 }
 
 type resourceCall struct {
-	gvr        schema.GroupVersionResource
-	namespace  string
-	name       string
-	namespaced bool
-	selector   string
+	gvr           schema.GroupVersionResource
+	namespace     string
+	name          string
+	namespaced    bool
+	selector      string
+	fieldSelector string
 }
 
 type patchCall struct {
@@ -109,10 +110,10 @@ func (f *fakeCluster) Discovery(context.Context) ([]ResourceType, error) {
 	return append([]ResourceType(nil), f.discovery...), f.discoveryErr
 }
 
-func (f *fakeCluster) List(_ context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector string) ([]ResourceSummary, error) {
+func (f *fakeCluster) List(_ context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector, fieldSelector string) ([]ResourceSummary, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.lists = append(f.lists, resourceCall{gvr: gvr, namespace: namespace, namespaced: namespaced, selector: selector})
+	f.lists = append(f.lists, resourceCall{gvr: gvr, namespace: namespace, namespaced: namespaced, selector: selector, fieldSelector: fieldSelector})
 	return append([]ResourceSummary(nil), f.list...), f.listErr
 }
 
@@ -123,9 +124,9 @@ func (f *fakeCluster) Get(_ context.Context, gvr schema.GroupVersionResource, na
 	return f.object, f.getErr
 }
 
-func (f *fakeCluster) Watch(ctx context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector string) (watch.Interface, error) {
+func (f *fakeCluster) Watch(ctx context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector, fieldSelector string) (watch.Interface, error) {
 	f.mu.Lock()
-	f.watches = append(f.watches, resourceCall{gvr: gvr, namespace: namespace, namespaced: namespaced, selector: selector})
+	f.watches = append(f.watches, resourceCall{gvr: gvr, namespace: namespace, namespaced: namespaced, selector: selector, fieldSelector: fieldSelector})
 	if f.watchErr != nil {
 		f.mu.Unlock()
 		return nil, f.watchErr
@@ -418,7 +419,7 @@ func TestServerContextAndReadOperations(t *testing.T) {
 		request("select", "context.select", map[string]any{"name": "prod"}),
 		request("namespaces", "namespace.list", nil),
 		request("discovery", "discovery.list", nil),
-		request("list", "resource.list", map[string]any{"gvr": "v1/pods", "namespace": "demo", "selector": "app=api"}),
+		request("list", "resource.list", map[string]any{"gvr": "v1/pods", "namespace": "demo", "selector": "app=api", "fieldSelector": "status.phase=Running"}),
 		request("get", "resource.get", map[string]any{"group": "apps", "version": "v1", "resource": "deployments", "namespace": "demo", "name": "api"}),
 	)
 	if got := mustObject(t, envelopeByID(t, responses, "select").Result)["selected"]; got != "prod" {
@@ -445,7 +446,7 @@ func TestServerContextAndReadOperations(t *testing.T) {
 	if len(client.selected) != 1 || client.selected[0] != "prod" {
 		t.Errorf("selected = %#v", client.selected)
 	}
-	if len(client.lists) != 1 || client.lists[0].gvr != (schema.GroupVersionResource{Version: "v1", Resource: "pods"}) || client.lists[0].namespace != "demo" || client.lists[0].selector != "app=api" {
+	if len(client.lists) != 1 || client.lists[0].gvr != (schema.GroupVersionResource{Version: "v1", Resource: "pods"}) || client.lists[0].namespace != "demo" || client.lists[0].selector != "app=api" || client.lists[0].fieldSelector != "status.phase=Running" {
 		t.Errorf("list call = %#v", client.lists)
 	}
 	if len(client.gets) != 1 || client.gets[0].gvr != (schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}) || client.gets[0].name != "api" {

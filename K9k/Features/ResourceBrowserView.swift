@@ -55,6 +55,18 @@ struct ResourceBrowserView: View {
                     Button("Clear") { store.searchText = "" }
                         .buttonStyle(.borderless)
                 }
+                if !store.labelSelector.isEmpty || !store.fieldSelector.isEmpty {
+                    Menu("Selectors") {
+                        if !store.labelSelector.isEmpty { Text("Label: \(store.labelSelector)") }
+                        if !store.fieldSelector.isEmpty { Text("Field: \(store.fieldSelector)") }
+                        Button("Clear Selectors") {
+                            store.labelSelector = ""
+                            store.fieldSelector = ""
+                            Task { await store.loadResources() }
+                        }
+                    }
+                    .menuStyle(.borderedButton)
+                }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 9)

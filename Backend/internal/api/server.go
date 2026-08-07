@@ -41,9 +41,9 @@ type ClusterClient interface {
 	UpdateContextNamespace(name, namespace string) error
 	Namespaces(context.Context) ([]string, error)
 	Discovery(context.Context) ([]ResourceType, error)
-	List(context.Context, schema.GroupVersionResource, string, bool, string) ([]ResourceSummary, error)
+	List(context.Context, schema.GroupVersionResource, string, bool, string, string) ([]ResourceSummary, error)
 	Get(context.Context, schema.GroupVersionResource, string, string, bool) (*unstructured.Unstructured, error)
-	Watch(context.Context, schema.GroupVersionResource, string, bool, string) (watch.Interface, error)
+	Watch(context.Context, schema.GroupVersionResource, string, bool, string, string) (watch.Interface, error)
 	Delete(context.Context, schema.GroupVersionResource, string, string, bool) error
 	Patch(context.Context, schema.GroupVersionResource, string, string, bool, []byte) (*unstructured.Unstructured, error)
 	Manifest(context.Context, schema.GroupVersionResource, string, string, bool) (ManifestDocument, error)
@@ -449,7 +449,7 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 		if err != nil {
 			return nil, invalidParams(err)
 		}
-		result, listErr := s.cluster.List(ctx, params.gvr(), params.Namespace, params.isNamespaced(), params.Selector)
+		result, listErr := s.cluster.List(ctx, params.gvr(), params.Namespace, params.isNamespaced(), params.Selector, params.FieldSelector)
 		if listErr != nil {
 			return nil, kubeError(listErr)
 		}
@@ -1329,7 +1329,7 @@ func (s *Server) startWatch(ctx context.Context, request protocol.Request) {
 		return
 	}
 
-	watcher, watchErr := s.cluster.Watch(watchContext, params.gvr(), params.Namespace, params.isNamespaced(), params.Selector)
+	watcher, watchErr := s.cluster.Watch(watchContext, params.gvr(), params.Namespace, params.isNamespaced(), params.Selector, params.FieldSelector)
 	if watchErr != nil {
 		s.unregisterStream(streamID)
 		cancel()
@@ -1446,15 +1446,16 @@ func decodeParams(raw json.RawMessage, destination any) error {
 }
 
 type resourceParams struct {
-	Group      string `json:"group"`
-	Version    string `json:"version"`
-	Resource   string `json:"resource"`
-	GVR        string `json:"gvr"`
-	Namespace  string `json:"namespace"`
-	Namespaced *bool  `json:"namespaced"`
-	Selector   string `json:"selector"`
-	Name       string `json:"name"`
-	StreamID   string `json:"streamID"`
+	Group         string `json:"group"`
+	Version       string `json:"version"`
+	Resource      string `json:"resource"`
+	GVR           string `json:"gvr"`
+	Namespace     string `json:"namespace"`
+	Namespaced    *bool  `json:"namespaced"`
+	Selector      string `json:"selector"`
+	FieldSelector string `json:"fieldSelector"`
+	Name          string `json:"name"`
+	StreamID      string `json:"streamID"`
 }
 
 func decodeResourceParams(raw json.RawMessage, nameRequired bool) (resourceParams, error) {

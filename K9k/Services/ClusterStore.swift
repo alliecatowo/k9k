@@ -15,6 +15,8 @@ final class ClusterStore {
     var selectedResources = Set<ResourceSummary.ID>()
     var searchText = ""
     var labelSelector = ""
+    var fieldSelector = ""
+    private var selectorResourceTypeID: String?
     var errorMessage: String?
     var isLoading = false
     var isReadOnly = UserDefaults.standard.bool(forKey: "k9k.readOnly") { didSet { UserDefaults.standard.set(isReadOnly, forKey: "k9k.readOnly") } }
@@ -165,6 +167,10 @@ final class ClusterStore {
 
     func loadResources() async {
         guard let type = selectedResourceType else { return }
+        if selectorResourceTypeID != type.id {
+            labelSelector = ""
+            fieldSelector = ""
+        }
         if let activeStreamID { await client.cancel(streamID: activeStreamID) }
         isLoading = true
         defer { isLoading = false }
@@ -174,6 +180,7 @@ final class ClusterStore {
             var params = type.requestParameters.objectValue ?? [:]
             params["namespace"] = .string(namespace)
             params["selector"] = .string(labelSelector)
+            params["fieldSelector"] = .string(fieldSelector)
             params["streamID"] = .string(streamID)
             resources = try decodeArray((try await client.request("resource.list", parameters: .object(params))).result, as: ResourceSummary.self)
             watchReconnectAttempts = 0
@@ -198,6 +205,8 @@ final class ClusterStore {
         selectedResourceType = secrets
         selectedResources.removeAll()
         labelSelector = "owner=helm"
+        fieldSelector = ""
+        selectorResourceTypeID = secrets.id
         await loadResources()
     }
 
@@ -210,15 +219,13 @@ final class ClusterStore {
             errorMessage = "K9k could not find the custom-jump target \(jump.targetGVR) in this cluster's discovery results."
             return
         }
-        guard jump.fieldSelector.isEmpty else {
-            errorMessage = "This custom jump uses a field selector, which the selected Kubernetes API resource does not expose through K9k yet."
-            return
-        }
         let namespace = resolvedJumpValue(jump.targetNamespace, resource: resource)
         if namespace.lowercased() == "all" { selectedNamespace = "All Namespaces" }
         else if !namespace.isEmpty, namespaces.contains(namespace) { selectedNamespace = namespace }
         else if jump.targetNamespace.isEmpty, let sourceNamespace = resource.namespace, namespaces.contains(sourceNamespace) { selectedNamespace = sourceNamespace }
         labelSelector = resolvedJumpValue(jump.labelSelector, resource: resource)
+        fieldSelector = resolvedJumpValue(jump.fieldSelector, resource: resource)
+        selectorResourceTypeID = target.id
         selectedResources.removeAll()
         selectedResourceType = target
         await loadResources()

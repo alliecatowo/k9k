@@ -212,12 +212,12 @@ func (c *Cluster) resource(gvr schema.GroupVersionResource, namespace string, na
 	}
 	return r, nil
 }
-func (c *Cluster) List(ctx context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector string) ([]api.ResourceSummary, error) {
+func (c *Cluster) List(ctx context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector, fieldSelector string) ([]api.ResourceSummary, error) {
 	resource, err := c.resource(gvr, namespace, namespaced)
 	if err != nil {
 		return nil, err
 	}
-	list, err := resource.List(ctx, metav1.ListOptions{LabelSelector: selector})
+	list, err := resource.List(ctx, metav1.ListOptions{LabelSelector: selector, FieldSelector: fieldSelector})
 	if err != nil {
 		return nil, err
 	}
@@ -234,12 +234,12 @@ func (c *Cluster) Get(ctx context.Context, gvr schema.GroupVersionResource, name
 	}
 	return resource.Get(ctx, name, metav1.GetOptions{})
 }
-func (c *Cluster) Watch(ctx context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector string) (watch.Interface, error) {
+func (c *Cluster) Watch(ctx context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector, fieldSelector string) (watch.Interface, error) {
 	resource, err := c.resource(gvr, namespace, namespaced)
 	if err != nil {
 		return nil, err
 	}
-	return resource.Watch(ctx, metav1.ListOptions{LabelSelector: selector})
+	return resource.Watch(ctx, metav1.ListOptions{LabelSelector: selector, FieldSelector: fieldSelector})
 }
 func (c *Cluster) Delete(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string, namespaced bool) error {
 	resource, err := c.resource(gvr, namespace, namespaced)
