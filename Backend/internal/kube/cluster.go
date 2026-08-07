@@ -12,6 +12,7 @@ import (
 
 	"github.com/k9k-app/k9k/backend/internal/api"
 	authorizationv1 "k8s.io/api/authorization/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
@@ -32,6 +34,8 @@ import (
 	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 	metricsclient "k8s.io/metrics/pkg/client/clientset/versioned/typed/metrics/v1beta1"
 )
+
+const maxManualCronJobNamePrefix = 42
 
 // Cluster centralizes client-go semantics; Swift never parses kubeconfig or speaks to the API server.
 type Cluster struct {
@@ -654,6 +658,57 @@ func (c *Cluster) DebugPod(ctx context.Context, request api.PodDebugRequest) (ap
 		return api.PodDebugResult{}, err
 	}
 	return api.PodDebugResult{Namespace: request.Namespace, Pod: request.Pod, Container: name, Image: request.Image}, nil
+}
+
+// TriggerCronJob creates one Job from the live CronJob template. The metadata
+// and controller reference mirror K9s' CronJob runner, adapted from
+// `.vendor/k9s/internal/dao/cronjob.go` (Apache-2.0): a manually-run Job keeps
+// the template labels/annotations and remains visibly owned by its CronJob.
+func (c *Cluster) TriggerCronJob(ctx context.Context, request api.CronJobTriggerRequest) (api.CronJobTriggerResult, error) {
+	c.mu.RLock()
+	typed := c.typed
+	c.mu.RUnlock()
+	if typed == nil {
+		return api.CronJobTriggerResult{}, fmt.Errorf("no usable Kubernetes context is selected")
+	}
+	cronJob, err := typed.BatchV1().CronJobs(request.Namespace).Get(ctx, request.CronJob, metav1.GetOptions{})
+	if err != nil {
+		return api.CronJobTriggerResult{}, err
+	}
+	prefix := cronJob.Name
+	if len(prefix) >= maxManualCronJobNamePrefix {
+		prefix = prefix[:maxManualCronJobNamePrefix]
+	}
+	controller := true
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        prefix + "-manual-" + rand.String(3),
+			Namespace:   request.Namespace,
+			Labels:      cloneStringMap(cronJob.Spec.JobTemplate.Labels),
+			Annotations: cloneStringMap(cronJob.Spec.JobTemplate.Annotations),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "batch/v1", Kind: "CronJob", Name: cronJob.Name, UID: cronJob.UID,
+				Controller: &controller, BlockOwnerDeletion: &controller,
+			}},
+		},
+		Spec: *cronJob.Spec.JobTemplate.Spec.DeepCopy(),
+	}
+	created, err := typed.BatchV1().Jobs(request.Namespace).Create(ctx, job, metav1.CreateOptions{})
+	if err != nil {
+		return api.CronJobTriggerResult{}, err
+	}
+	return api.CronJobTriggerResult{Namespace: request.Namespace, CronJob: cronJob.Name, Job: created.Name}, nil
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	clone := make(map[string]string, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
 }
 
 func isDaemonSetPod(pod *corev1.Pod) bool {

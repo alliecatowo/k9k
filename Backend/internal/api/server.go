@@ -55,6 +55,7 @@ type ClusterClient interface {
 	Metrics(context.Context, MetricsQuery) ([]ResourceMetrics, error)
 	DrainNode(context.Context, NodeDrainRequest) (NodeDrainResult, error)
 	DebugPod(context.Context, PodDebugRequest) (PodDebugResult, error)
+	TriggerCronJob(context.Context, CronJobTriggerRequest) (CronJobTriggerResult, error)
 	CheckAccess(context.Context, AccessCheck) (AccessReview, error)
 	PortForward(context.Context, PortForwardRequest, func(PortForwardBinding)) error
 	PodExec(context.Context, PodExecRequest, PodExecStreams) error
@@ -638,6 +639,26 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 		result, debugErr := s.cluster.DebugPod(ctx, params.PodDebugRequest)
 		if debugErr != nil {
 			return nil, kubeError(debugErr)
+		}
+		return result, nil
+	case "cronjob.trigger":
+		var params struct {
+			CronJobTriggerRequest
+			Confirm bool `json:"confirm"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		params.Namespace, params.CronJob = strings.TrimSpace(params.Namespace), strings.TrimSpace(params.CronJob)
+		if params.Namespace == "" || params.CronJob == "" {
+			return nil, invalidParams(errors.New("namespace and cronJob are required"))
+		}
+		if !params.Confirm {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("CronJob trigger requires confirm: true")}
+		}
+		result, triggerErr := s.cluster.TriggerCronJob(ctx, params.CronJobTriggerRequest)
+		if triggerErr != nil {
+			return nil, kubeError(triggerErr)
 		}
 		return result, nil
 	case "rbac.check":

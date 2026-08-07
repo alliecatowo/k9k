@@ -44,28 +44,30 @@ type fakeCluster struct {
 	metricsErr                                          error
 	drainErr                                            error
 	debugErr                                            error
+	triggerCronJobErr                                   error
 	execErr                                             error
 	manifestErr, applyManifestErr                       error
 
-	selected       []string
-	contextUpdates []Context
-	contextRenames [][2]string
-	contextDeletes []string
-	lists          []resourceCall
-	gets           []resourceCall
-	watches        []resourceCall
-	deletes        []resourceCall
-	patches        []patchCall
-	accesses       []AccessCheck
-	forwards       []PortForwardRequest
-	metrics        []MetricsQuery
-	metricItems    []ResourceMetrics
-	drains         []NodeDrainRequest
-	debugs         []PodDebugRequest
-	execs          []PodExecRequest
-	execFn         func(context.Context, PodExecRequest, PodExecStreams) error
-	manifests      []resourceCall
-	applyManifests []ManifestApplyRequest
+	selected        []string
+	contextUpdates  []Context
+	contextRenames  [][2]string
+	contextDeletes  []string
+	lists           []resourceCall
+	gets            []resourceCall
+	watches         []resourceCall
+	deletes         []resourceCall
+	patches         []patchCall
+	accesses        []AccessCheck
+	forwards        []PortForwardRequest
+	metrics         []MetricsQuery
+	metricItems     []ResourceMetrics
+	drains          []NodeDrainRequest
+	debugs          []PodDebugRequest
+	cronJobTriggers []CronJobTriggerRequest
+	execs           []PodExecRequest
+	execFn          func(context.Context, PodExecRequest, PodExecStreams) error
+	manifests       []resourceCall
+	applyManifests  []ManifestApplyRequest
 }
 
 type resourceCall struct {
@@ -234,6 +236,16 @@ func (f *fakeCluster) DebugPod(_ context.Context, request PodDebugRequest) (PodD
 		return PodDebugResult{}, f.debugErr
 	}
 	return PodDebugResult{Namespace: request.Namespace, Pod: request.Pod, Container: "k9k-debug-test", Image: request.Image}, nil
+}
+
+func (f *fakeCluster) TriggerCronJob(_ context.Context, request CronJobTriggerRequest) (CronJobTriggerResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cronJobTriggers = append(f.cronJobTriggers, request)
+	if f.triggerCronJobErr != nil {
+		return CronJobTriggerResult{}, f.triggerCronJobErr
+	}
+	return CronJobTriggerResult{Namespace: request.Namespace, CronJob: request.CronJob, Job: request.CronJob + "-manual-abc"}, nil
 }
 
 func (f *fakeCluster) CheckAccess(_ context.Context, check AccessCheck) (AccessReview, error) {
@@ -746,6 +758,29 @@ func TestServerDebugRequiresConfirmationAndDefaultsShell(t *testing.T) {
 	defer client.mu.Unlock()
 	if len(client.debugs) != 1 || client.debugs[0].TargetContainer != "app" || len(client.debugs[0].Command) != 1 || client.debugs[0].Command[0] != "/bin/sh" {
 		t.Errorf("debugs = %#v", client.debugs)
+	}
+}
+
+func TestServerCronJobTriggerRequiresConfirmation(t *testing.T) {
+	client := &fakeCluster{}
+	responses := runRequests(t, client,
+		request("missing", "cronjob.trigger", map[string]any{"namespace": "demo", "cronJob": "nightly"}),
+		request("confirmed", "cronjob.trigger", map[string]any{"namespace": "demo", "cronJob": "nightly", "confirm": true}),
+	)
+	if got := envelopeByID(t, responses, "missing").Error; got == nil || got.Code != "confirmation_required" {
+		t.Errorf("unconfirmed trigger = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "confirmed").Error; got != nil {
+		t.Errorf("confirmed trigger = %#v", got)
+	}
+	result := decodeResult[CronJobTriggerResult](t, envelopeByID(t, responses, "confirmed").Result)
+	if result.Namespace != "demo" || result.CronJob != "nightly" || result.Job != "nightly-manual-abc" {
+		t.Errorf("trigger result = %#v", result)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if got := client.cronJobTriggers; len(got) != 1 || got[0] != (CronJobTriggerRequest{Namespace: "demo", CronJob: "nightly"}) {
+		t.Errorf("CronJob triggers = %#v", got)
 	}
 }
 

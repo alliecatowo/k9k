@@ -223,6 +223,20 @@ type PodDebugResult struct {
 	Image     string `json:"image"`
 }
 
+// CronJobTriggerRequest runs one immediate Job from a CronJob's configured
+// job template. It is intentionally narrower than generic resource creation:
+// callers can select the CronJob but cannot alter its workload template.
+type CronJobTriggerRequest struct {
+	Namespace string `json:"namespace"`
+	CronJob   string `json:"cronJob"`
+}
+
+type CronJobTriggerResult struct {
+	Namespace string `json:"namespace"`
+	CronJob   string `json:"cronJob"`
+	Job       string `json:"job"`
+}
+
 // PortForwardRequest describes one pod port-forward owned by the helper. The
 // local address is always loopback-only; K9k deliberately never turns a pod
 // port into a network-reachable listener without an explicit Kubernetes

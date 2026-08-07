@@ -49,6 +49,7 @@ final class ClusterStore {
     var isCheckingScaleAccess = false
     var restartAccess: AccessReview?
     var isCheckingRestartAccess = false
+    var cronJobTriggerAccess: AccessReview?
     var nodePatchAccess: AccessReview?
     var nodeDrainAccess: AccessReview?
     var nodeDrainResult: NodeDrainResult?
@@ -343,6 +344,18 @@ final class ClusterStore {
 
     var isSelectedResourceRestartable: Bool { selectedRestartableResource != nil }
 
+    var selectedCronJobResource: ResourceSummary? {
+        guard selectedResourceType?.gvr == "batch/v1/cronjobs",
+              selectedResources.count == 1,
+              let resource = selectedSelectedResource,
+              resource.namespace != nil else { return nil }
+        return resource
+    }
+
+    var canTriggerSelectedCronJob: Bool {
+        !isReadOnly && selectedCronJobResource != nil && cronJobTriggerAccess?.allowed == true
+    }
+
     var selectedNodeResource: ResourceSummary? { guard selectedResources.count == 1, let resource = selectedSelectedResource, resource.kind == "Node" else { return nil }; return resource }
     var canPatchSelectedNode: Bool { !isReadOnly && selectedNodeResource != nil && nodePatchAccess?.allowed == true }
     var canDrainSelectedNode: Bool { !isReadOnly && selectedNodeResource != nil && nodeDrainAccess?.allowed == true }
@@ -497,6 +510,41 @@ final class ClusterStore {
         ])
         do {
             _ = try await client.request("resource.patch", parameters: operationParameters(type: type, resource: resource, additional: ["patch": patch]))
+            await loadResources()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func updateCronJobTriggerAccess() async {
+        guard let resource = selectedCronJobResource, let namespace = resource.namespace else {
+            cronJobTriggerAccess = nil
+            return
+        }
+        do {
+            cronJobTriggerAccess = try decode(
+                (try await client.request("rbac.check", parameters: .object([
+                    "verb": .string("create"), "gvr": .string("batch/v1/jobs"),
+                    "namespace": .string(namespace),
+                ]))).result,
+                as: AccessReview.self
+            )
+        } catch {
+            cronJobTriggerAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify permission to create a Job: \(error.localizedDescription)", evaluationError: nil)
+        }
+    }
+
+    func triggerSelectedCronJob() async {
+        guard !isReadOnly, let resource = selectedCronJobResource, let namespace = resource.namespace else { return }
+        await updateCronJobTriggerAccess()
+        guard canTriggerSelectedCronJob else {
+            errorMessage = cronJobTriggerAccess?.reason ?? "The active Kubernetes identity is not authorized to create Jobs from this CronJob."
+            return
+        }
+        do {
+            _ = try await client.request("cronjob.trigger", parameters: .object([
+                "namespace": .string(namespace), "cronJob": .string(resource.name), "confirm": .bool(true),
+            ]))
             await loadResources()
         } catch {
             errorMessage = error.localizedDescription

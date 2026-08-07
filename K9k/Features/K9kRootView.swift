@@ -9,6 +9,7 @@ struct K9kRootView: View {
     @State private var portForwardPresented = false
     @State private var scalePresented = false
     @State private var restartConfirmation = false
+    @State private var cronJobTriggerConfirmation = false
     @State private var terminalPresented = false
     @State private var terminalMode: PodTerminalMode = .shell
     @State private var manifestEditorPresented = false
@@ -23,17 +24,7 @@ struct K9kRootView: View {
 
     var body: some View {
         @Bindable var store = store
-        NavigationSplitView {
-            SidebarView(selectedResourceType: $store.selectedResourceType) { paletteIsPresented = true }
-                .navigationSplitViewColumnWidth(min: 290, ideal: 320, max: 420)
-        } detail: {
-            ResourceBrowserView(inspectorIsPresented: $inspectorIsPresented, destructiveConfirmation: $destructiveConfirmation)
-        }
-        .navigationSplitViewStyle(.balanced)
-        .inspector(isPresented: $inspectorIsPresented) {
-            ResourceInspectorView(resource: store.resource(for: store.selectedResources.first), type: store.selectedResourceType, events: store.events)
-                .inspectorColumnWidth(min: 280, ideal: 340, max: 480)
-        }
+        navigationContent(selectedResourceType: $store.selectedResourceType)
         .toolbar { toolbar }
         .task { await store.connect() }
         .onChange(of: store.discoveredResources) { _, _ in store.ensureDefaultResourceSelection() }
@@ -46,6 +37,7 @@ struct K9kRootView: View {
                 await store.updateDeleteAccess()
                 await store.updateScaleAccess()
                 await store.updateRestartAccess()
+                await store.updateCronJobTriggerAccess()
                 await store.updateExecAccess()
                 await store.updateAttachAccess()
                 await store.updateDebugAccess()
@@ -54,12 +46,91 @@ struct K9kRootView: View {
                 await store.updateNodeDrainAccess()
             }
         }
+        .modifier(rootPresentations(
+            destructiveConfirmation: $destructiveConfirmation,
+            restartConfirmation: $restartConfirmation,
+            cronJobTriggerConfirmation: $cronJobTriggerConfirmation,
+            nodeCordonConfirmation: $nodeCordonConfirmation,
+            paletteIsPresented: $paletteIsPresented,
+            logsPresented: $logsPresented,
+            portForwardPresented: $portForwardPresented,
+            portForwardListPresented: $portForwardListPresented,
+            scalePresented: $scalePresented,
+            terminalPresented: $terminalPresented,
+            terminalMode: $terminalMode,
+            manifestEditorPresented: $manifestEditorPresented,
+            relationshipsPresented: $relationshipsPresented,
+            nodeDrainPresented: $nodeDrainPresented,
+            debugPresented: $debugPresented,
+            resourceSelectorsPresented: $resourceSelectorsPresented,
+            pluginToRun: $pluginToRun,
+            manifestImportPresented: $manifestImportPresented
+        ))
+    }
+
+    @ViewBuilder private func navigationContent(selectedResourceType: Binding<ResourceType?>) -> some View {
+        NavigationSplitView {
+            SidebarView(selectedResourceType: selectedResourceType) { paletteIsPresented = true }
+                .navigationSplitViewColumnWidth(min: 290, ideal: 320, max: 420)
+        } detail: {
+            ResourceBrowserView(inspectorIsPresented: $inspectorIsPresented, destructiveConfirmation: $destructiveConfirmation)
+        }
+        .navigationSplitViewStyle(.balanced)
+        .inspector(isPresented: $inspectorIsPresented) {
+            ResourceInspectorView(resource: store.resource(for: store.selectedResources.first), type: store.selectedResourceType, events: store.events)
+                .inspectorColumnWidth(min: 280, ideal: 340, max: 480)
+        }
+    }
+
+    private func rootPresentations(
+        destructiveConfirmation: Binding<Bool>, restartConfirmation: Binding<Bool>, cronJobTriggerConfirmation: Binding<Bool>, nodeCordonConfirmation: Binding<Bool>,
+        paletteIsPresented: Binding<Bool>, logsPresented: Binding<Bool>, portForwardPresented: Binding<Bool>, portForwardListPresented: Binding<Bool>,
+        scalePresented: Binding<Bool>, terminalPresented: Binding<Bool>, terminalMode: Binding<PodTerminalMode>, manifestEditorPresented: Binding<Bool>,
+        relationshipsPresented: Binding<Bool>, nodeDrainPresented: Binding<Bool>, debugPresented: Binding<Bool>, resourceSelectorsPresented: Binding<Bool>,
+        pluginToRun: Binding<K9sPlugin?>, manifestImportPresented: Binding<Bool>
+    ) -> some ViewModifier {
+        RootPresentations(
+            destructiveConfirmation: destructiveConfirmation, restartConfirmation: restartConfirmation, cronJobTriggerConfirmation: cronJobTriggerConfirmation,
+            nodeCordonConfirmation: nodeCordonConfirmation, paletteIsPresented: paletteIsPresented, logsPresented: logsPresented,
+            portForwardPresented: portForwardPresented, portForwardListPresented: portForwardListPresented, scalePresented: scalePresented,
+            terminalPresented: terminalPresented, terminalMode: terminalMode, manifestEditorPresented: manifestEditorPresented,
+            relationshipsPresented: relationshipsPresented, nodeDrainPresented: nodeDrainPresented, debugPresented: debugPresented,
+            resourceSelectorsPresented: resourceSelectorsPresented, pluginToRun: pluginToRun, manifestImportPresented: manifestImportPresented
+        )
+    }
+
+    private struct RootPresentations: ViewModifier {
+        @Environment(ClusterStore.self) private var store
+        @Binding var destructiveConfirmation: Bool
+        @Binding var restartConfirmation: Bool
+        @Binding var cronJobTriggerConfirmation: Bool
+        @Binding var nodeCordonConfirmation: Bool
+        @Binding var paletteIsPresented: Bool
+        @Binding var logsPresented: Bool
+        @Binding var portForwardPresented: Bool
+        @Binding var portForwardListPresented: Bool
+        @Binding var scalePresented: Bool
+        @Binding var terminalPresented: Bool
+        @Binding var terminalMode: PodTerminalMode
+        @Binding var manifestEditorPresented: Bool
+        @Binding var relationshipsPresented: Bool
+        @Binding var nodeDrainPresented: Bool
+        @Binding var debugPresented: Bool
+        @Binding var resourceSelectorsPresented: Bool
+        @Binding var pluginToRun: K9sPlugin?
+        @Binding var manifestImportPresented: Bool
+
+        func body(content: Content) -> some View {
+            content
         .confirmationDialog("Delete selected resources?", isPresented: $destructiveConfirmation, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { Task { await store.deleteSelected() } }
         } message: { Text("This changes resources in \(store.selectedContext?.name ?? "the active context").") }
         .confirmationDialog("Restart selected workload?", isPresented: $restartConfirmation, titleVisibility: .visible) {
             Button("Restart", role: .destructive) { Task { await store.restartSelected() } }
         } message: { Text("K9k updates the Pod template restart timestamp, which rolls this workload's Pods.") }
+        .confirmationDialog("Trigger selected CronJob?", isPresented: $cronJobTriggerConfirmation, titleVisibility: .visible) {
+            Button("Create Job", role: .destructive) { Task { await store.triggerSelectedCronJob() } }
+        } message: { Text("K9k will create one Job from the CronJob's current template in \(store.selectedContext?.name ?? "the active context").") }
         .confirmationDialog("Cordon selected node?", isPresented: $nodeCordonConfirmation, titleVisibility: .visible) {
             Button("Cordon", role: .destructive) { Task { await store.setSelectedNodeUnschedulable(true) } }
         } message: { Text("New Pods will not schedule onto this node. Existing Pods are not evicted.") }
@@ -101,6 +172,8 @@ struct K9kRootView: View {
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
         } message: { Text(store.errorMessage ?? "") }
+    }
+
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
@@ -178,6 +251,10 @@ struct K9kRootView: View {
                         .disabled(!store.canOpenAttach)
                     Button("Debug Container…") { debugPresented = true }
                         .disabled(!store.canDebugSelectedPod)
+                }
+                if store.selectedResourceType?.gvr == "batch/v1/cronjobs", !store.selectedResources.isEmpty {
+                    Button("Trigger CronJob…", role: .destructive) { cronJobTriggerConfirmation = true }
+                        .disabled(!store.canTriggerSelectedCronJob)
                 }
                 if store.isSelectedResourceScalable {
                     Button("Scale…") { scalePresented = true }
