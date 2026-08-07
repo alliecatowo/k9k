@@ -210,6 +210,13 @@ final class ClusterStore {
         await loadResources()
     }
 
+    /// Keeps user-authored selectors associated with the current GVR. This
+    /// prevents a Pod-specific field selector leaking into a later Node or CRD
+    /// view, while allowing the user to refresh and keep the current filter.
+    func pinSelectorsToCurrentResource() {
+        selectorResourceTypeID = selectedResourceType?.id
+    }
+
     func customJumps(for type: ResourceType) -> [K9sJump] {
         k9sConfig?.jumps.filter { $0.sourceGVR.lowercased() == type.gvr.lowercased() || $0.sourceGVR.lowercased() == type.resource.lowercased() } ?? []
     }
