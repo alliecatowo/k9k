@@ -19,7 +19,7 @@ struct K9sConfigEditorView: View {
                 Button("Close") { dismiss() }
             }.padding()
             Divider()
-            TextEditor(text: $draft).font(.system(.body, design: .monospaced)).padding(8)
+            SyntaxHighlightingEditor(source: $draft, language: .yaml, isEditable: !isSaving).padding(8)
             Divider()
             HStack {
                 Text("Saved only after YAML compatibility validation and confirmation.").font(.caption).foregroundStyle(.secondary)

@@ -36,12 +36,9 @@ struct ManifestEditorView: View {
             if isLoading {
                 ContentUnavailableView("Loading Manifest", systemImage: "doc.text", description: Text("Reading a canonical editable form from Kubernetes."))
             } else {
-                TextEditor(text: $source)
-                    .font(.system(.body, design: .monospaced))
-                    .textEditorStyle(.plain)
+                SyntaxHighlightingEditor(source: $source, language: .yaml, isEditable: !isWorking)
                     .padding(12)
                     .background(.background)
-                    .disabled(isWorking)
             }
 
             Divider()

@@ -39,6 +39,80 @@ struct SyntaxHighlightedTextView: NSViewRepresentable {
     }
 }
 
+/// An AppKit-backed YAML editor that preserves the native text system's undo,
+/// selection, spellchecking, and copy/paste behavior while applying the same
+/// lightweight syntax treatment used by the read-only inspector. Keeping this
+/// separate from `TextEditor` avoids a web editor dependency for the most
+/// common operational workflow: inspecting, correcting, and applying a
+/// manifest in place.
+struct SyntaxHighlightingEditor: NSViewRepresentable {
+    @Binding var source: String
+    let language: SyntaxHighlightedTextView.Language
+    var isEditable = true
+
+    func makeCoordinator() -> Coordinator { Coordinator(source: $source, language: language) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+
+        let textView = NSTextView()
+        textView.delegate = context.coordinator
+        textView.isEditable = isEditable
+        textView.isSelectable = true
+        textView.allowsUndo = true
+        textView.isRichText = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 14, height: 14)
+        textView.textContainer?.widthTracksTextView = false
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.autoresizingMask = [.width]
+        textView.textStorage?.setAttributedString(source.highlighted(as: language))
+        scrollView.documentView = textView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        textView.isEditable = isEditable
+        guard !context.coordinator.isHighlighting, textView.string != source else { return }
+        context.coordinator.replaceContents(of: textView, with: source)
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        @Binding var source: String
+        let language: SyntaxHighlightedTextView.Language
+        var isHighlighting = false
+
+        init(source: Binding<String>, language: SyntaxHighlightedTextView.Language) {
+            _source = source
+            self.language = language
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView, !isHighlighting else { return }
+            source = textView.string
+            replaceContents(of: textView, with: textView.string)
+        }
+
+        func replaceContents(of textView: NSTextView, with text: String) {
+            let selectedRange = textView.selectedRange()
+            isHighlighting = true
+            textView.textStorage?.setAttributedString(text.highlighted(as: language))
+            textView.setSelectedRange(NSRange(location: min(selectedRange.location, (text as NSString).length), length: 0))
+            isHighlighting = false
+        }
+    }
+}
+
 private extension String {
     func highlighted(as language: SyntaxHighlightedTextView.Language) -> NSAttributedString {
         let font = NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)

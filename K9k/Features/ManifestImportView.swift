@@ -22,7 +22,7 @@ struct ManifestImportView: View {
                 Button("Close") { dismiss() }
             }.padding()
             Divider()
-            TextEditor(text: $source).font(.system(.body, design: .monospaced)).padding(10).disabled(isWorking)
+            SyntaxHighlightingEditor(source: $source, language: .yaml, isEditable: !isWorking).padding(10)
             Divider()
             HStack {
                 Text(validationMessage ?? "Paste YAML or open a YAML file. Namespace and name come from the manifest.")
