@@ -65,6 +65,8 @@ struct ResourceBrowserView: View {
                     Button("Save Visible Rows as JSON…") { saveVisibleRows(as: .json) }
                     Button("Save Visible Rows as CSV…") { saveVisibleRows(as: .csv) }
                     Button("Save Visible Rows as TSV…") { saveVisibleRows(as: .tsv) }
+                    Divider()
+                    Button("Save Current Window as PNG…") { saveCurrentWindowScreenshot() }
                 }
                 .menuStyle(.borderedButton)
                 if !store.labelSelector.isEmpty || !store.fieldSelector.isEmpty {
@@ -138,6 +140,17 @@ struct ResourceBrowserView: View {
             try contents.write(to: url, atomically: true, encoding: .utf8)
         } catch {
             store.errorMessage = "K9k could not save the resource export: \(error.localizedDescription)"
+        }
+    }
+
+    private func saveCurrentWindowScreenshot() {
+        let resource = store.selectedResourceType?.resource ?? "resources"
+        Task {
+            do {
+                try await WindowScreenshotExporter.saveCurrentWindow(named: "k9k-\(resource)-window.png")
+            } catch {
+                store.errorMessage = "K9k could not save the window screenshot: \(error.localizedDescription)"
+            }
         }
     }
 

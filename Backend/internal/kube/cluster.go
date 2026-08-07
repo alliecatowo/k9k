@@ -688,6 +688,78 @@ func (c *Cluster) DrainNode(ctx context.Context, request api.NodeDrainRequest) (
 	return result, nil
 }
 
+// ResolveNodeShell binds a configured, trusted DaemonSet to one exact Pod on
+// the requested node. It does not create a privileged/debug Pod and it never
+// accepts a caller-provided selector or image. The DaemonSet's own selector is
+// used only to narrow the API read; controller UID ownership is checked again
+// before a target can be returned.
+func (c *Cluster) ResolveNodeShell(ctx context.Context, node, namespace, daemonSetName, container string) (api.NodeShellTarget, error) {
+	c.mu.RLock()
+	typed := c.typed
+	c.mu.RUnlock()
+	if typed == nil {
+		return api.NodeShellTarget{}, fmt.Errorf("no usable Kubernetes context is selected")
+	}
+
+	daemonSet, err := typed.AppsV1().DaemonSets(namespace).Get(ctx, daemonSetName, metav1.GetOptions{})
+	if err != nil {
+		return api.NodeShellTarget{}, err
+	}
+	if daemonSet.Spec.Selector == nil {
+		return api.NodeShellTarget{}, fmt.Errorf("configured DaemonSet %s/%s has no pod selector", namespace, daemonSetName)
+	}
+	selector, err := metav1.LabelSelectorAsSelector(daemonSet.Spec.Selector)
+	if err != nil {
+		return api.NodeShellTarget{}, fmt.Errorf("configured DaemonSet %s/%s has an invalid pod selector: %w", namespace, daemonSetName, err)
+	}
+	pods, err := typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector.String()})
+	if err != nil {
+		return api.NodeShellTarget{}, err
+	}
+
+	var matches []corev1.Pod
+	for _, pod := range pods.Items {
+		if pod.Spec.NodeName != node || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		if !isOwnedByDaemonSet(&pod, daemonSet) || !podHasRegularContainer(&pod, container) {
+			continue
+		}
+		matches = append(matches, pod)
+	}
+	if len(matches) == 0 {
+		return api.NodeShellTarget{}, fmt.Errorf("configured DaemonSet %s/%s has no running Pod with container %q on node %q", namespace, daemonSetName, container, node)
+	}
+	if len(matches) != 1 {
+		names := make([]string, 0, len(matches))
+		for _, pod := range matches {
+			names = append(names, pod.Name)
+		}
+		sort.Strings(names)
+		return api.NodeShellTarget{}, fmt.Errorf("configured DaemonSet %s/%s has %d matching Pods on node %q (%s); refuse to guess a shell target", namespace, daemonSetName, len(matches), node, strings.Join(names, ", "))
+	}
+
+	return api.NodeShellTarget{Node: node, Namespace: namespace, DaemonSet: daemonSetName, Pod: matches[0].Name, Container: container}, nil
+}
+
+func isOwnedByDaemonSet(pod *corev1.Pod, daemonSet *appsv1.DaemonSet) bool {
+	for _, owner := range pod.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller && owner.APIVersion == "apps/v1" && owner.Kind == "DaemonSet" && owner.Name == daemonSet.Name && owner.UID == daemonSet.UID {
+			return true
+		}
+	}
+	return false
+}
+
+func podHasRegularContainer(pod *corev1.Pod, container string) bool {
+	for _, candidate := range pod.Spec.Containers {
+		if candidate.Name == container {
+			return true
+		}
+	}
+	return false
+}
+
 // DebugPod appends a minimally-scoped ephemeral container through the typed
 // Kubernetes subresource. This is not a local Docker shell and it never
 // alters the Pod template; admission, image policy, and RBAC apply normally.

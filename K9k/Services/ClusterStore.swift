@@ -28,10 +28,13 @@ final class ClusterStore {
         }
     }
     var resources: [ResourceSummary] = []
+    private(set) var visibleResources: [ResourceSummary] = []
     var loadedResourceCount = 0
     var remainingResourceCount: Int?
     var selectedResources = Set<ResourceSummary.ID>()
-    var searchText = ""
+    var searchText = "" {
+        didSet { recomputeVisibleResources() }
+    }
     var labelSelector = ""
     var fieldSelector = ""
     private var selectorResourceTypeID: String?
@@ -78,6 +81,7 @@ final class ClusterStore {
     var cronJobTriggerAccess: AccessReview?
     var nodePatchAccess: AccessReview?
     var nodeDrainAccess: AccessReview?
+    var nodeShellAccess: AccessReview?
     var nodeDrainResult: NodeDrainResult?
     var relationshipGraph: RelationshipGraph?
     var isLoadingRelationships = false
@@ -130,10 +134,15 @@ final class ClusterStore {
         return navigationHistory.indices.dropFirst(navigationHistoryIndex + 1).contains { navigationHistory[$0].contextName == selectedContext?.name }
     }
 
-    var visibleResources: [ResourceSummary] {
+    /// Cache search results when input changes instead of filtering the full
+    /// live table on every SwiftUI body evaluation.
+    private func recomputeVisibleResources() {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !query.isEmpty else { return resources }
-        return resources.filter { resource in
+        guard !query.isEmpty else {
+            visibleResources = resources
+            return
+        }
+        visibleResources = resources.filter { resource in
             resource.name.lowercased().contains(query) || resource.kind.lowercased().contains(query) || resource.namespace?.lowercased().contains(query) == true
         }
     }
@@ -363,11 +372,13 @@ final class ClusterStore {
     private func installResources(_ values: [ResourceSummary]) {
         resources = values
         resourceIndexByID = Dictionary(uniqueKeysWithValues: values.enumerated().map { ($0.element.id, $0.offset) })
+        recomputeVisibleResources()
     }
 
     func sortResources(using order: [KeyPathComparator<ResourceSummary>]) {
         resources.sort(using: order)
         resourceIndexByID = Dictionary(uniqueKeysWithValues: resources.enumerated().map { ($0.element.id, $0.offset) })
+        recomputeVisibleResources()
     }
 
     func selectResourceType(_ type: ResourceType) async {
@@ -1037,6 +1048,75 @@ final class ClusterStore {
         }
     }
 
+    /// Resolve only an explicitly configured DaemonSet/container pair. The
+    /// helper verifies the controller UID and actual node placement before it
+    /// returns a target; K9k never fabricates a privileged node-debug Pod.
+    func resolveNodeShell(node: String, namespace: String, daemonSet: String, container: String) async -> NodeShellTarget? {
+        guard !isReadOnly else {
+            errorMessage = "Disable read-only mode before opening a node shell."
+            return nil
+        }
+        do {
+            let target = try decode(
+                (try await client.request("node.shell.resolve", parameters: .object([
+                    "node": .string(node), "namespace": .string(namespace),
+                    "daemonSet": .string(daemonSet), "container": .string(container)
+                ]))).result,
+                as: NodeShellTarget.self
+            )
+            await updateNodeShellAccess(for: target)
+            guard nodeShellAccess?.allowed == true else {
+                errorMessage = nodeShellAccess?.reason ?? "The active Kubernetes identity is not authorized to exec into the configured node shell Pod."
+                return nil
+            }
+            return target
+        } catch {
+            errorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    private func updateNodeShellAccess(for target: NodeShellTarget) async {
+        do {
+            nodeShellAccess = try decode(
+                (try await client.request("rbac.check", parameters: .object([
+                    "group": .string(""), "version": .string("v1"), "resource": .string("pods"),
+                    "namespaced": .bool(true), "namespace": .string(target.namespace), "name": .string(target.pod),
+                    "verb": .string("create"), "subresource": .string("exec")
+                ]))).result,
+                as: AccessReview.self
+            )
+        } catch {
+            nodeShellAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify node-shell exec permission: \(error.localizedDescription)", evaluationError: nil)
+        }
+    }
+
+    func openNodeShell(target: NodeShellTarget, command: [String]) async {
+        guard !isReadOnly, !command.isEmpty else { return }
+        // Re-resolve immediately before exec. A DaemonSet rollout can replace
+        // the originally displayed Pod while the terminal sheet is open; a
+        // fresh controller/node/container verification avoids using that stale
+        // target by name.
+        guard let verifiedTarget = await resolveNodeShell(
+            node: target.node, namespace: target.namespace,
+            daemonSet: target.daemonSet, container: target.container
+        ) else { return }
+        await closeExec()
+        let streamID = UUID().uuidString
+        activeExecStreamID = streamID
+        do {
+            _ = try await client.request("exec.open", parameters: .object([
+                "streamID": .string(streamID), "namespace": .string(verifiedTarget.namespace), "pod": .string(verifiedTarget.pod),
+                "container": .string(verifiedTarget.container), "command": .array(command.map(JSONValue.string)),
+                "tty": .bool(true), "stdin": .bool(true),
+                "initialColumns": .number(Double(terminalColumns)), "initialRows": .number(Double(terminalRows))
+            ]))
+        } catch {
+            activeExecStreamID = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
     func updateExecAccess() async {
         execAccessGeneration &+= 1
         let generation = execAccessGeneration
@@ -1241,6 +1321,18 @@ final class ClusterStore {
         parameters["kind"] = .string(type.kind)
         parameters["confirm"] = .bool(confirm)
         return try decode((try await client.request("manifest.applyBatch", parameters: .object(parameters))).result, as: ManifestBatchApplyResult.self)
+    }
+
+    /// Imports a YAML stream that may contain different Kubernetes resource
+    /// kinds. The helper resolves every document through the active cluster's
+    /// discovery response before dry-running the entire stream, rather than
+    /// trusting the UI to infer a GVR from a kind name.
+    func importMixedManifests(source: String, confirm: Bool) async throws -> ManifestBatchApplyResult {
+        let parameters: JSONValue = .object([
+            "manifest": .string(source),
+            "confirm": .bool(confirm),
+        ])
+        return try decode((try await client.request("manifest.applyMixed", parameters: parameters)).result, as: ManifestBatchApplyResult.self)
     }
 
     func copySelectedName() {
@@ -1587,6 +1679,7 @@ final class ClusterStore {
                 resources.remove(at: index)
                 resourceIndexByID.removeValue(forKey: summary.id)
                 for offset in index..<resources.count { resourceIndexByID[resources[offset].id] = offset }
+                recomputeVisibleResources()
             }
         } else if ["resource.added", "resource.modified"].contains(event.type), let summary = try? decode(result, as: ResourceSummary.self) {
             if let index = resourceIndexByID[summary.id], resources.indices.contains(index) {
@@ -1595,6 +1688,7 @@ final class ClusterStore {
                 resourceIndexByID[summary.id] = resources.count
                 resources.append(summary)
             }
+            recomputeVisibleResources()
             if selectedResources.contains(summary.id) { Task { _ = await self.hydrateResourceIfNeeded(summary) } }
         }
     }

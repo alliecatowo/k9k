@@ -74,6 +74,43 @@ func TestCheckAccessRequiresSelectedContext(t *testing.T) {
 	}
 }
 
+func TestResolveNodeShellRequiresExactlyOneRunningOwnedDaemonSetPod(t *testing.T) {
+	controller := true
+	daemonSet := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "trusted-shell", Namespace: "ops", UID: types.UID("daemonset-uid")},
+		Spec:       appsv1.DaemonSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "trusted-shell"}}},
+	}
+	trustedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "trusted-shell-worker-a", Namespace: "ops", Labels: map[string]string{"app": "trusted-shell"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "trusted-shell", UID: daemonSet.UID, Controller: &controller}}},
+		Spec:       corev1.PodSpec{NodeName: "worker-a", Containers: []corev1.Container{{Name: "shell", Image: "registry.example/trusted-shell@sha256:abc"}}},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	unownedPod := trustedPod.DeepCopy()
+	unownedPod.Name = "lookalike"
+	unownedPod.OwnerReferences[0].UID = types.UID("other-daemonset")
+	typed := fake.NewSimpleClientset(daemonSet, trustedPod, unownedPod)
+
+	target, err := (&Cluster{typed: typed}).ResolveNodeShell(context.Background(), "worker-a", "ops", "trusted-shell", "shell")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := target, (api.NodeShellTarget{Node: "worker-a", Namespace: "ops", DaemonSet: "trusted-shell", Pod: "trusted-shell-worker-a", Container: "shell"}); got != want {
+		t.Errorf("target = %#v, want %#v", got, want)
+	}
+
+	if _, err := (&Cluster{typed: typed}).ResolveNodeShell(context.Background(), "worker-a", "ops", "trusted-shell", "missing"); err == nil {
+		t.Fatal("missing container was accepted")
+	}
+	duplicate := trustedPod.DeepCopy()
+	duplicate.Name = "trusted-shell-worker-a-replacement"
+	if _, err := typed.CoreV1().Pods("ops").Create(context.Background(), duplicate, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Cluster{typed: typed}).ResolveNodeShell(context.Background(), "worker-a", "ops", "trusted-shell", "shell"); err == nil {
+		t.Fatal("ambiguous Pod target was accepted")
+	}
+}
+
 func TestTriggerCronJobCreatesOwnedJobFromTemplate(t *testing.T) {
 	cronJob := &batchv1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{Name: "nightly", Namespace: "demo", UID: types.UID("cronjob-uid")},

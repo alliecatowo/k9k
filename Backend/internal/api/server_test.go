@@ -45,6 +45,7 @@ type fakeCluster struct {
 	accessErr, portForwardErr                           error
 	metricsErr                                          error
 	drainErr                                            error
+	nodeShellErr                                        error
 	debugErr                                            error
 	triggerCronJobErr                                   error
 	rollbackDeploymentErr                               error
@@ -66,6 +67,7 @@ type fakeCluster struct {
 	metrics         []MetricsQuery
 	metricItems     []ResourceMetrics
 	drains          []NodeDrainRequest
+	nodeShells      []NodeShellTarget
 	debugs          []PodDebugRequest
 	cronJobTriggers []CronJobTriggerRequest
 	rollbacks       []DeploymentRollbackRequest
@@ -255,6 +257,17 @@ func (f *fakeCluster) DrainNode(_ context.Context, request NodeDrainRequest) (No
 		return NodeDrainResult{}, f.drainErr
 	}
 	return NodeDrainResult{Node: request.Node, Evicted: []NodeDrainPod{}, Skipped: []NodeDrainPod{}, Blocked: []NodeDrainPod{}, Failures: []NodeDrainPod{}}, nil
+}
+
+func (f *fakeCluster) ResolveNodeShell(_ context.Context, node, namespace, daemonSet, container string) (NodeShellTarget, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	target := NodeShellTarget{Node: node, Namespace: namespace, DaemonSet: daemonSet, Container: container, Pod: "trusted-shell-node"}
+	f.nodeShells = append(f.nodeShells, target)
+	if f.nodeShellErr != nil {
+		return NodeShellTarget{}, f.nodeShellErr
+	}
+	return target, nil
 }
 
 func (f *fakeCluster) DebugPod(_ context.Context, request PodDebugRequest) (PodDebugResult, error) {
@@ -764,6 +777,83 @@ func TestManifestBatchRejectsDuplicateAndMismatchedDocumentsBeforeCallingCluster
 	}
 }
 
+func TestManifestMixedApplyResolvesLiveDiscoveryAndDryRunsBeforeWrites(t *testing.T) {
+	manifests := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: demo\ndata:\n  mode: safe\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\n  namespace: demo\nspec:\n  replicas: 2\n---\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: preview\n"
+	client := &fakeCluster{
+		discovery: []ResourceType{
+			{Version: "v1", Resource: "configmaps", Kind: "ConfigMap", Namespaced: true},
+			{Group: "apps", Version: "v1", Resource: "deployments", Kind: "Deployment", Namespaced: true},
+			{Version: "v1", Resource: "namespaces", Kind: "Namespace", Namespaced: false},
+		},
+		object: &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "returned", "namespace": "demo", "uid": "created"}, "data": map[string]any{},
+		}},
+	}
+	response := envelopeByID(t, runRequests(t, client,
+		request("apply", "manifest.applyMixed", map[string]any{"manifest": manifests, "confirm": true}),
+	), "apply")
+	if response.Error != nil {
+		t.Fatalf("mixed apply error = %#v", response.Error)
+	}
+	result := mustObject(t, response.Result)
+	if result["validated"] != true || result["applied"] != true {
+		t.Errorf("result = %#v", result)
+	}
+	if items, ok := result["items"].([]any); !ok || len(items) != 3 {
+		t.Errorf("items = %#v", result["items"])
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.applyManifests) != 6 {
+		t.Fatalf("apply calls = %d, want 3 dry runs then 3 writes", len(client.applyManifests))
+	}
+	for index, call := range client.applyManifests {
+		if call.DryRun != (index < 3) || !call.Create {
+			t.Errorf("call %d = %#v, want create dry=%t", index, call, index < 3)
+		}
+	}
+	if got := client.applyManifests[0].Identity; got.Group != "" || got.Version != "v1" || got.Resource != "configmaps" || !got.Namespaced || got.Namespace != "demo" {
+		t.Errorf("config map identity = %#v", got)
+	}
+	if got := client.applyManifests[1].Identity; got.Group != "apps" || got.Version != "v1" || got.Resource != "deployments" || !got.Namespaced {
+		t.Errorf("deployment identity = %#v", got)
+	}
+	if got := client.applyManifests[2].Identity; got.Resource != "namespaces" || got.Namespaced || got.Namespace != "" {
+		t.Errorf("namespace identity = %#v", got)
+	}
+}
+
+func TestManifestMixedApplyRejectsUnknownOrDuplicateTargetsBeforeAnyApply(t *testing.T) {
+	unknown := "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: no-such-resource\n"
+	duplicates := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: same\n  namespace: demo\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: same\n  namespace: demo\n"
+	client := &fakeCluster{discovery: []ResourceType{{Version: "v1", Resource: "configmaps", Kind: "ConfigMap", Namespaced: true}}}
+	responses := runRequests(t, client,
+		request("unknown", "manifest.applyMixed", map[string]any{"manifest": unknown}),
+		request("duplicate", "manifest.applyMixed", map[string]any{"manifest": duplicates}),
+	)
+	for _, id := range []string{"unknown", "duplicate"} {
+		if got := envelopeByID(t, responses, id).Error; got == nil || got.Code != "invalid_params" {
+			t.Errorf("%s error = %#v", id, got)
+		}
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.applyManifests) != 0 {
+		t.Errorf("invalid mixed batch must not reach cluster apply: %#v", client.applyManifests)
+	}
+}
+
+func TestManifestMixedApplyReportsDiscoveryFailureAsKubernetesError(t *testing.T) {
+	manifest := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: demo\n"
+	response := envelopeByID(t, runRequests(t, &fakeCluster{discoveryErr: errors.New("forbidden discovery")},
+		request("mixed", "manifest.applyMixed", map[string]any{"manifest": manifest}),
+	), "mixed")
+	if response.Error == nil || response.Error.Code != "kubernetes_error" {
+		t.Errorf("discovery response = %#v", response.Error)
+	}
+}
+
 func TestResourceTypeSerializesMissingShortNamesAsArray(t *testing.T) {
 	encoded, err := json.Marshal(ResourceType{Version: "v1", Resource: "pods", Kind: "Pod"})
 	if err != nil {
@@ -860,6 +950,29 @@ func TestServerDrainRequiresExplicitSafetyFlagsAndConfirmation(t *testing.T) {
 	defer client.mu.Unlock()
 	if len(client.drains) != 1 || client.drains[0].Node != "worker" || !client.drains[0].DeleteEmptyDirData {
 		t.Errorf("drains = %#v", client.drains)
+	}
+}
+
+func TestServerNodeShellResolveRequiresAnExplicitTrustedDaemonSetTarget(t *testing.T) {
+	client := &fakeCluster{}
+	responses := runRequests(t, client,
+		request("missing", "node.shell.resolve", map[string]any{"node": "worker-a", "namespace": "ops", "daemonSet": "node-shell"}),
+		request("resolve", "node.shell.resolve", map[string]any{"node": "worker-a", "namespace": "ops", "daemonSet": "node-shell", "container": "shell"}),
+	)
+	if got := envelopeByID(t, responses, "missing").Error; got == nil || got.Code != "invalid_params" {
+		t.Errorf("missing target = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "resolve").Error; got != nil {
+		t.Errorf("resolve = %#v", got)
+	}
+	result := mustObject(t, envelopeByID(t, responses, "resolve").Result)
+	if result["node"] != "worker-a" || result["namespace"] != "ops" || result["daemonSet"] != "node-shell" || result["container"] != "shell" || result["pod"] != "trusted-shell-node" {
+		t.Errorf("resolved target = %#v", result)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if got := client.nodeShells; len(got) != 1 || got[0].Node != "worker-a" || got[0].Namespace != "ops" || got[0].DaemonSet != "node-shell" || got[0].Container != "shell" {
+		t.Errorf("node shell calls = %#v", got)
 	}
 }
 

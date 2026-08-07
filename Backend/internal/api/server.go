@@ -57,6 +57,7 @@ type ClusterClient interface {
 	Events(context.Context, string, string) ([]ClusterEvent, error)
 	Metrics(context.Context, MetricsQuery) ([]ResourceMetrics, error)
 	DrainNode(context.Context, NodeDrainRequest) (NodeDrainResult, error)
+	ResolveNodeShell(context.Context, string, string, string, string) (NodeShellTarget, error)
 	DebugPod(context.Context, PodDebugRequest) (PodDebugResult, error)
 	TriggerCronJob(context.Context, CronJobTriggerRequest) (CronJobTriggerResult, error)
 	RollbackDeployment(context.Context, DeploymentRollbackRequest) (DeploymentRollbackResult, error)
@@ -207,7 +208,7 @@ func (s *Server) setReadOnly(value bool) { s.policyMu.Lock(); s.readOnly = value
 func protectedReadOnlyOperation(operation string) bool {
 	switch operation {
 	case "context.select", "context.update", "context.rename", "context.copy", "context.delete", "config.write",
-		"resource.patch", "resource.delete", "resource.scale", "manifest.apply", "manifest.applyBatch",
+		"resource.patch", "resource.delete", "resource.scale", "manifest.apply", "manifest.applyBatch", "manifest.applyMixed",
 		"node.drain", "pod.debug", "cronjob.trigger", "deployment.rollback", "exec.open", "attach.open", "portforward.open":
 		return true
 	default:
@@ -647,39 +648,21 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 		if err != nil {
 			return nil, invalidParams(err)
 		}
-		// A batch is deliberately two-phase: Kubernetes dry-runs every
-		// document before K9k starts a real apply. Kubernetes has no
-		// transaction spanning arbitrary objects, so a later write can still
-		// fail and leave earlier confirmed documents applied; the UI calls that
-		// out instead of implying atomicity.
-		previewDocuments := make([]ManifestDocument, 0, len(params.Items))
-		for _, item := range params.Items {
-			preview, applyErr := s.cluster.ApplyManifest(ctx, item.request(true))
-			if applyErr != nil {
-				return nil, manifestOperationError(applyErr, "manifest batch validation failed")
-			}
-			document, documentErr := NewManifestDocument(preview, item.identity())
-			if documentErr != nil {
-				return nil, kubeError(documentErr)
-			}
-			previewDocuments = append(previewDocuments, document)
+		return s.applyManifestBatch(ctx, params.Items, params.Confirm)
+	case "manifest.applyMixed":
+		params, err := decodeManifestMixedApplyParams(request.Params)
+		if err != nil {
+			return nil, invalidParams(err)
 		}
-		if !params.Confirm {
-			return map[string]any{"validated": true, "applied": false, "items": previewDocuments}, nil
-		}
-		appliedDocuments := make([]ManifestDocument, 0, len(params.Items))
-		for _, item := range params.Items {
-			applied, applyErr := s.cluster.ApplyManifest(ctx, item.request(false))
-			if applyErr != nil {
-				return nil, manifestOperationError(applyErr, "manifest batch apply failed")
+		items, resolveErr := s.resolveMixedManifestItems(ctx, params.Documents)
+		if resolveErr != nil {
+			var discoveryErr *manifestDiscoveryError
+			if errors.As(resolveErr, &discoveryErr) {
+				return nil, kubeError(discoveryErr)
 			}
-			document, documentErr := NewManifestDocument(applied, item.identity())
-			if documentErr != nil {
-				return nil, kubeError(documentErr)
-			}
-			appliedDocuments = append(appliedDocuments, document)
+			return nil, invalidParams(resolveErr)
 		}
-		return map[string]any{"validated": true, "applied": true, "items": appliedDocuments}, nil
+		return s.applyManifestBatch(ctx, items, params.Confirm)
 	case "resource.events":
 		var params struct {
 			Namespace string `json:"namespace"`
@@ -735,6 +718,28 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 		result, drainErr := s.cluster.DrainNode(ctx, params.NodeDrainRequest)
 		if drainErr != nil {
 			return nil, kubeError(drainErr)
+		}
+		return result, nil
+	case "node.shell.resolve":
+		var params struct {
+			Node      string `json:"node"`
+			Namespace string `json:"namespace"`
+			DaemonSet string `json:"daemonSet"`
+			Container string `json:"container"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		params.Node = strings.TrimSpace(params.Node)
+		params.Namespace = strings.TrimSpace(params.Namespace)
+		params.DaemonSet = strings.TrimSpace(params.DaemonSet)
+		params.Container = strings.TrimSpace(params.Container)
+		if params.Node == "" || params.Namespace == "" || params.DaemonSet == "" || params.Container == "" {
+			return nil, invalidParams(errors.New("node, namespace, daemonSet, and container are required for a configured node shell"))
+		}
+		result, resolveErr := s.cluster.ResolveNodeShell(ctx, params.Node, params.Namespace, params.DaemonSet, params.Container)
+		if resolveErr != nil {
+			return nil, kubeError(resolveErr)
 		}
 		return result, nil
 	case "pod.debug":
@@ -1817,6 +1822,47 @@ type manifestBatchApplyParams struct {
 	Items    []manifestApplyParams
 }
 
+// manifestMixedApplyParams is the directory/import form of a manifest batch.
+// Unlike manifest.applyBatch it deliberately accepts no caller-supplied GVR or
+// scope. Each document is resolved against the active cluster's discovery
+// result, which keeps an import from guessing a plural resource name or
+// applying a manifest to a different served API than it declares.
+type manifestMixedApplyParams struct {
+	Manifest  string   `json:"manifest"`
+	Confirm   bool     `json:"confirm"`
+	Documents []string `json:"-"`
+}
+
+// manifestDiscoveryError keeps a live-cluster failure distinct from an invalid
+// import. The native client can then distinguish a transient RBAC/API outage
+// from YAML a user needs to correct.
+type manifestDiscoveryError struct{ err error }
+
+func (e *manifestDiscoveryError) Error() string {
+	return "discover manifest resource types: " + e.err.Error()
+}
+func (e *manifestDiscoveryError) Unwrap() error { return e.err }
+
+func decodeManifestMixedApplyParams(raw json.RawMessage) (manifestMixedApplyParams, error) {
+	var params manifestMixedApplyParams
+	if err := decodeParams(raw, &params); err != nil {
+		return params, err
+	}
+	params.Manifest = strings.TrimSpace(params.Manifest)
+	if params.Manifest == "" {
+		return params, errors.New("manifest is required")
+	}
+	documents, err := parseManifestYAMLDocuments(params.Manifest)
+	if err != nil {
+		return params, err
+	}
+	if len(documents) > maxManifestBatchDocuments {
+		return params, fmt.Errorf("manifest batch contains %d documents; maximum is %d", len(documents), maxManifestBatchDocuments)
+	}
+	params.Documents = documents
+	return params, nil
+}
+
 func decodeManifestBatchApplyParams(raw json.RawMessage) (manifestBatchApplyParams, error) {
 	var params manifestBatchApplyParams
 	if err := decodeParams(raw, &params); err != nil {
@@ -1867,6 +1913,100 @@ func (p *manifestBatchApplyParams) validate() error {
 		p.Items = append(p.Items, item)
 	}
 	return nil
+}
+
+// resolveMixedManifestItems turns a strict-parsed YAML stream into immutable
+// create requests. Discovery, rather than string pluralisation, is the source
+// of truth for group/version/resource and scope. It happens before the shared
+// batch executor starts any dry run or write.
+func (s *Server) resolveMixedManifestItems(ctx context.Context, documents []string) ([]manifestApplyParams, error) {
+	discovery, err := s.cluster.Discovery(ctx)
+	if err != nil {
+		return nil, &manifestDiscoveryError{err: err}
+	}
+	types := make(map[string]ResourceType, len(discovery))
+	for _, resourceType := range discovery {
+		key := resourceTypeAPIVersion(resourceType) + "|" + resourceType.Kind
+		if existing, found := types[key]; found && (existing.Group != resourceType.Group || existing.Version != resourceType.Version || existing.Resource != resourceType.Resource || existing.Namespaced != resourceType.Namespaced) {
+			return nil, fmt.Errorf("discovery returned ambiguous resource type %s", key)
+		}
+		types[key] = resourceType
+	}
+
+	seen := make(map[string]struct{}, len(documents))
+	items := make([]manifestApplyParams, 0, len(documents))
+	for index, document := range documents {
+		object, parseErr := parseManifestYAML(document)
+		if parseErr != nil {
+			// Documents were parsed in the request decoder, but retaining this
+			// check makes this resolver safe if it is reused by another caller.
+			return nil, fmt.Errorf("manifest document %d: %w", index+1, parseErr)
+		}
+		resourceType, found := types[object.GetAPIVersion()+"|"+object.GetKind()]
+		if !found {
+			return nil, fmt.Errorf("manifest document %d declares %s %s, which is not served by the active cluster", index+1, object.GetAPIVersion(), object.GetKind())
+		}
+		namespaced := resourceType.Namespaced
+		item := manifestApplyParams{
+			resourceParams: resourceParams{Group: resourceType.Group, Version: resourceType.Version, Resource: resourceType.Resource, Namespaced: &namespaced},
+			Kind:           resourceType.Kind,
+			Manifest:       document,
+			Create:         true,
+		}
+		if err := item.validate(); err != nil {
+			return nil, fmt.Errorf("manifest document %d: %w", index+1, err)
+		}
+		key := item.gvrString() + "|" + item.Namespace + "|" + item.Name
+		if _, duplicate := seen[key]; duplicate {
+			return nil, fmt.Errorf("manifest document %d duplicates target %s", index+1, key)
+		}
+		seen[key] = struct{}{}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func resourceTypeAPIVersion(resourceType ResourceType) string {
+	if resourceType.Group == "" {
+		return resourceType.Version
+	}
+	return resourceType.Group + "/" + resourceType.Version
+}
+
+// applyManifestBatch preserves the import safety invariant for both same-GVR
+// and mixed-GVR sources: every request receives a non-forced SSA dry run
+// before any confirmed request can mutate the cluster. Kubernetes has no
+// transaction spanning arbitrary objects, so callers must still report a
+// later confirmed failure as a possible partial apply.
+func (s *Server) applyManifestBatch(ctx context.Context, items []manifestApplyParams, confirm bool) (any, *operationError) {
+	previewDocuments := make([]ManifestDocument, 0, len(items))
+	for _, item := range items {
+		preview, applyErr := s.cluster.ApplyManifest(ctx, item.request(true))
+		if applyErr != nil {
+			return nil, manifestOperationError(applyErr, "manifest batch validation failed")
+		}
+		document, documentErr := NewManifestDocument(preview, item.identity())
+		if documentErr != nil {
+			return nil, kubeError(documentErr)
+		}
+		previewDocuments = append(previewDocuments, document)
+	}
+	if !confirm {
+		return map[string]any{"validated": true, "applied": false, "items": previewDocuments}, nil
+	}
+	appliedDocuments := make([]ManifestDocument, 0, len(items))
+	for _, item := range items {
+		applied, applyErr := s.cluster.ApplyManifest(ctx, item.request(false))
+		if applyErr != nil {
+			return nil, manifestOperationError(applyErr, "manifest batch apply failed")
+		}
+		document, documentErr := NewManifestDocument(applied, item.identity())
+		if documentErr != nil {
+			return nil, kubeError(documentErr)
+		}
+		appliedDocuments = append(appliedDocuments, document)
+	}
+	return map[string]any{"validated": true, "applied": true, "items": appliedDocuments}, nil
 }
 
 func decodeManifestApplyParams(raw json.RawMessage) (manifestApplyParams, error) {

@@ -253,6 +253,19 @@ type NodeDrainPod struct {
 	Reason    string `json:"reason"`
 }
 
+// NodeShellTarget is a verified, existing DaemonSet Pod on one node. K9k
+// intentionally never guesses a debug image, selector, or host mount for a
+// node shell: the operator configures a trusted DaemonSet and container, then
+// this target binds the terminal to the exact Pod Kubernetes reports for the
+// selected node.
+type NodeShellTarget struct {
+	Node      string `json:"node"`
+	Namespace string `json:"namespace"`
+	DaemonSet string `json:"daemonSet"`
+	Pod       string `json:"pod"`
+	Container string `json:"container"`
+}
+
 // PodDebugRequest creates one ephemeral debugging container in an existing
 // Pod. It intentionally contains no privileged/host settings; Kubernetes
 // admission and the Pod's security policy remain authoritative.

@@ -147,6 +147,18 @@ struct ResourceListPage: Codable, Hashable {
     let remainingItemCount: Int?
 }
 
+/// A verified existing shell Pod. It is produced only after the backend has
+/// checked the configured DaemonSet's controller UID, node placement, running
+/// state, and configured container. No image, selector, or host access is
+/// inferred by the macOS app.
+struct NodeShellTarget: Codable, Hashable {
+    let node: String
+    let namespace: String
+    let daemonSet: String
+    let pod: String
+    let container: String
+}
+
 /// A metadata-only Helm v3 release timeline. K9k derives it from Helm's
 /// standard storage Secret labels; it deliberately does not decode the opaque
 /// release payload, which can contain values and rendered manifests.

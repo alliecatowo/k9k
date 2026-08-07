@@ -17,6 +17,7 @@ struct K9kRootView: View {
     @State private var relationshipsPresented = false
     @State private var nodeCordonConfirmation = false
     @State private var nodeDrainPresented = false
+    @State private var nodeShellPresented = false
     @State private var debugPresented = false
     @State private var portForwardListPresented = false
     @State private var resourceSelectorsPresented = false
@@ -55,6 +56,7 @@ struct K9kRootView: View {
             manifestEditorPresented: $manifestEditorPresented,
             relationshipsPresented: $relationshipsPresented,
             nodeDrainPresented: $nodeDrainPresented,
+            nodeShellPresented: $nodeShellPresented,
             debugPresented: $debugPresented,
             resourceSelectorsPresented: $resourceSelectorsPresented,
             pluginToRun: $pluginToRun,
@@ -89,7 +91,7 @@ struct K9kRootView: View {
         destructiveConfirmation: Binding<Bool>, restartConfirmation: Binding<Bool>, rollbackConfirmation: Binding<Bool>, cronJobTriggerConfirmation: Binding<Bool>, nodeCordonConfirmation: Binding<Bool>,
         paletteIsPresented: Binding<Bool>, logsPresented: Binding<Bool>, portForwardPresented: Binding<Bool>, portForwardListPresented: Binding<Bool>,
         scalePresented: Binding<Bool>, terminalPresented: Binding<Bool>, terminalMode: Binding<PodTerminalMode>, manifestEditorPresented: Binding<Bool>,
-        relationshipsPresented: Binding<Bool>, nodeDrainPresented: Binding<Bool>, debugPresented: Binding<Bool>, resourceSelectorsPresented: Binding<Bool>,
+        relationshipsPresented: Binding<Bool>, nodeDrainPresented: Binding<Bool>, nodeShellPresented: Binding<Bool>, debugPresented: Binding<Bool>, resourceSelectorsPresented: Binding<Bool>,
         pluginToRun: Binding<K9sPlugin?>, manifestImportPresented: Binding<Bool>, pulsePresented: Binding<Bool>, accessCheckPresented: Binding<Bool>, navigationHelpPresented: Binding<Bool>
     ) -> some ViewModifier {
         RootPresentations(
@@ -97,7 +99,7 @@ struct K9kRootView: View {
             nodeCordonConfirmation: nodeCordonConfirmation, paletteIsPresented: paletteIsPresented, logsPresented: logsPresented,
             portForwardPresented: portForwardPresented, portForwardListPresented: portForwardListPresented, scalePresented: scalePresented,
             terminalPresented: terminalPresented, terminalMode: terminalMode, manifestEditorPresented: manifestEditorPresented,
-            relationshipsPresented: relationshipsPresented, nodeDrainPresented: nodeDrainPresented, debugPresented: debugPresented,
+            relationshipsPresented: relationshipsPresented, nodeDrainPresented: nodeDrainPresented, nodeShellPresented: nodeShellPresented, debugPresented: debugPresented,
             resourceSelectorsPresented: resourceSelectorsPresented, pluginToRun: pluginToRun, manifestImportPresented: manifestImportPresented, pulsePresented: pulsePresented,
             accessCheckPresented: accessCheckPresented, navigationHelpPresented: navigationHelpPresented
         )
@@ -120,6 +122,7 @@ struct K9kRootView: View {
         @Binding var manifestEditorPresented: Bool
         @Binding var relationshipsPresented: Bool
         @Binding var nodeDrainPresented: Bool
+        @Binding var nodeShellPresented: Bool
         @Binding var debugPresented: Bool
         @Binding var resourceSelectorsPresented: Bool
         @Binding var pluginToRun: K9sPlugin?
@@ -170,6 +173,9 @@ struct K9kRootView: View {
         .sheet(isPresented: $nodeDrainPresented) {
             if let node = store.selectedNodeResource { NodeDrainView(node: node, isPresented: $nodeDrainPresented) }
         }
+        .sheet(isPresented: $nodeShellPresented) {
+            if let node = store.selectedNodeResource { NodeShellView(node: node, isPresented: $nodeShellPresented) }
+        }
         .sheet(isPresented: $debugPresented) {
             if let resource = store.resource(for: store.selectedResources.first) { DebugContainerView(resource: resource, isPresented: $debugPresented) }
         }
@@ -179,7 +185,7 @@ struct K9kRootView: View {
         .sheet(item: $pluginToRun) { plugin in
             if let resource = store.resource(for: store.selectedResources.first) { K9sPluginRunnerView(plugin: plugin, resource: resource) }
         }
-        .sheet(isPresented: $manifestImportPresented) { if let type = store.selectedResourceType { ManifestImportView(type: type) } }
+        .sheet(isPresented: $manifestImportPresented) { ManifestImportView() }
         .sheet(isPresented: $pulsePresented) { PulseView(isPresented: $pulsePresented) }
         .sheet(isPresented: $accessCheckPresented) {
             AccessCheckView(initialType: store.selectedResourceType, initialResource: store.resource(for: store.selectedResources.first))
@@ -236,7 +242,7 @@ struct K9kRootView: View {
             Button { resourceSelectorsPresented = true } label: { Label("Filter Resources", systemImage: "line.3.horizontal.decrease.circle") }
                 .help("Filter the current Kubernetes resource list with label or field selectors")
             Button { manifestImportPresented = true } label: { Label("Import Manifest", systemImage: "square.and.arrow.down") }
-                .disabled(store.selectedResourceType == nil || store.isReadOnly)
+                .disabled(store.isReadOnly)
             Button { paletteIsPresented = true } label: { Label("Open Command Palette", systemImage: "command") }
                 .keyboardShortcut("k", modifiers: .command)
                 .help("Open Command Palette")
@@ -306,6 +312,8 @@ struct K9kRootView: View {
                     }
                     Button("Drain…") { nodeDrainPresented = true }
                         .disabled(store.isReadOnly || node.raw?.objectValue?["spec"]?.objectValue?["unschedulable"]?.boolValue != true)
+                    Button("Node Shell…") { nodeShellPresented = true }
+                        .disabled(store.isReadOnly)
                 }
                 Divider()
                 Button("Check Access…") { accessCheckPresented = true }

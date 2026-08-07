@@ -27,7 +27,7 @@ Cluster → Namespace → Deployment → Inspector → Rollout / Events / Raw JS
 - Stream logs; open a real ANSI/VT Pod terminal; attach; add a confirmed ephemeral debug container.
 - Create loopback-only Pod or Service port-forwards, manage several at once, and benchmark a K9k-owned forward.
 - Scale, restart, roll back Deployments, trigger CronJobs, cordon/drain Nodes, and apply UID-protected manifests.
-- Import up to 100 same-resource manifests at once: every document dry-runs before a confirmed, explicitly non-atomic apply.
+- Import up to 100 mixed-resource manifests from pasted YAML, files, or a directory: live discovery resolves each GVR, every document dry-runs before a confirmed, explicitly non-atomic apply.
 - Manage kubeconfig context references graphically, including default namespace, duplicate, rename, delete, and switch.
 - See K9s aliases, custom views, jumps, hotkeys, and plugins; edit K9s-compatible configuration safely.
 - Browse metadata-only Helm release revisions, use native navigation history, and check access with a graphical `kubectl auth can-i` equivalent.
@@ -108,7 +108,7 @@ These tasks use the disposable `kind-k9k-test` context. Switch back to your prod
 
 ## Parity status
 
-K9k is actively developed and deliberately candid about parity. It covers many high-value K9s workflows today, but it is not yet complete K9s parity. Notable remaining areas include file transfer, node shell/SSH, Helm chart actions, image scanning, full manifest-directory/diff workflows, deeper XRay topology, and more specialised views.
+K9k is actively developed and deliberately candid about parity. It covers many high-value K9s workflows today, but it is not yet complete K9s parity. Notable remaining areas include file transfer, host SSH, Helm chart actions, image scanning, full manifest-directory/diff workflows, deeper XRay topology, and more specialised views. Node Shell is available through an explicitly configured, existing trusted DaemonSet rather than an automatically created privileged Pod.
 
 See [K9S_PARITY.md](Docs/K9S_PARITY.md) for the source-pinned capability ledger, [ARCHITECTURE.md](Docs/ARCHITECTURE.md) for design, and [IPC_PROTOCOL.md](Docs/IPC_PROTOCOL.md) for the helper contract.
 
