@@ -1,0 +1,69 @@
+[tools]
+go = "1.25.8"
+kubectl = "1.35.3"
+kind = "0.31.0"
+helm = "3.19.2"
+golangci-lint = "2.10.1"
+gofumpt = "0.9.2"
+jq = "1.8.1"
+yq = "4.52.4"
+
+[env]
+K9K_ROOT = "{{config_root}}"
+
+[tasks.bootstrap]
+description = "Install Go modules and verify the Apple toolchain"
+run = "Scripts/bootstrap.sh"
+
+[tasks.build-core]
+description = "Build the bundled Kubernetes helper"
+run = "Scripts/build-core.sh"
+
+[tasks.build-app]
+description = "Build and bundle the native macOS app"
+depends = ["build-core"]
+run = "Scripts/build-app.sh"
+
+[tasks.build]
+description = "Build K9k.app"
+run = "mise run build-app"
+
+[tasks.test-go]
+description = "Run Go unit tests"
+run = "cd Backend && go test ./..."
+
+[tasks.test-swift]
+description = "Build the app as a Swift smoke test"
+run = "xcodebuild -project K9k.xcodeproj -scheme K9k -configuration Debug -sdk macosx build CODE_SIGNING_ALLOWED=NO"
+
+[tasks.test]
+description = "Run K9k unit tests"
+run = "mise run test-go && mise run test-swift"
+
+[tasks.format]
+description = "Format Go sources"
+run = "cd Backend && gofmt -w $(find . -name '*.go' -not -path './vendor/*')"
+
+[tasks.lint]
+description = "Run static analysis"
+run = "cd Backend && go vet ./..."
+
+[tasks.check]
+description = "Run formatting, tests, and static analysis"
+run = "mise run format && mise run test && mise run lint"
+
+[tasks.run]
+description = "Build and open K9k"
+run = "mise run build && open DerivedData/Build/Products/Debug/K9k.app"
+
+[tasks."cluster:create"]
+description = "Create an isolated kind test cluster"
+run = "kind create cluster --name k9k-test --config TestCluster/kind.yaml"
+
+[tasks."cluster:seed"]
+description = "Seed the K9k test cluster"
+run = "kubectl apply -f TestCluster/fixtures.yaml"
+
+[tasks."cluster:destroy"]
+description = "Destroy the isolated kind test cluster"
+run = "kind delete cluster --name k9k-test"

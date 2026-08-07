@@ -1,0 +1,69 @@
+# K9s parity ledger
+
+This is the implementation ledger for K9k, a native macOS application whose behavioural reference is K9s. K9k replaces the TUI with native SwiftUI while keeping Kubernetes semantics in the bundled Go helper.
+
+## Reference pin
+
+| Item | Value |
+| --- | --- |
+| Upstream | `https://github.com/derailed/k9s` |
+| Reference revision | `b5d728c068b3584eb8530fb1f6cc51b13a67b39c` |
+| Revision date | 2026-08-02T09:08:42-06:00 |
+| Revision subject | `chore(deps): bump golang from 1.26.4-alpine3.24 to 1.26.5-alpine3.24 (#4115)` |
+| Upstream default branch at fetch | `master` at the reference revision |
+| Current release tag available in fetched repository | `v0.51.0` |
+| Source location | `.vendor/k9s` |
+| K9s module Go directive | `go 1.25.8` (`.vendor/k9s/go.mod`) |
+| K9s stated minimum | Go 1.23.x or later (`.vendor/k9s/README.md`) |
+| Kubernetes modules | `k8s.io/{api,apimachinery,client-go,metrics}` `v0.35.3`; `cli-runtime` and `kubectl` `v0.35.1`; `apiextensions-apiserver` `v0.35.3` |
+
+The fetched pin, rather than a README or release-era blog post, is the authority for every row below. K9k's backend uses the same `api`, `apimachinery`, and `client-go` `v0.35.3` family; it is not linked to or dependent on the K9s executable.
+
+## Status vocabulary and audit boundary
+
+**Complete** means the user-visible workflow is available through the native app and its bundled backend, with an automated test. **Partial** means a meaningful code path exists but is not the complete K9s workflow. **Blocked** means the required backend or UI operation does not yet exist. **N/A** means a K9s terminal-only presentation choice intentionally has no direct GUI feature.
+
+Statuses reflect the current early K9k baseline: `Backend/internal/api.Server` dispatches versioned NDJSON requests for context, namespace, discovery, generic resource, scale, cancellation, and watch operations; the SwiftUI app supplies a native context/namespace/resource browser. It is intentionally not treated as parity-complete: server behaviour has only protocol-type tests and substantial K9s workflows remain absent. Test entries name required validation; `—` means none exists in the baseline.
+
+## Capability matrix
+
+| Capability | K9s source | K9s behavior | K9k implementation | Status | Tests | Difference |
+| --- | --- | --- | --- | --- | --- | --- |
+| Kubeconfig, auth, and current context | `internal/client/config.go` (`Config`, `RESTConfig`, `SwitchContext`); `client.go` (`APIClient.SwitchContext`) | Resolves kubeconfig and active context, creates clients, and resets state when context changes. | `Backend/internal/kube/cluster.go` (`Cluster.New`, `reload`, `SelectContext`) uses `clientcmd` and creates typed, dynamic, and discovery clients. | Partial | Context-switch integration fixture. | Swift never reads kubeconfig or credentials. |
+| Context listing and management | `view/context.go` (`Context`, `useContext`); `client/config.go` (`Contexts`, `DelContext`, `RenameContext`) | Lists, selects, renames, and deletes contexts. | `context.list`/`context.select` are dispatched and a toolbar picker selects context; rename/delete are absent. | Partial | List/select IPC and UI tests. | GUI uses a context picker rather than `ctx`. |
+| Namespace selection | `view/ns.go`; `config/config.go` (`SetActiveNamespace`); `client/client.go` (`ValidNamespaceNames`) | Lists namespaces, supports all namespaces/favourites, and persists active namespace. | `namespace.list` feeds a toolbar picker and `All Namespaces` maps to an empty namespace; no persistence/favourites policy. | Partial | Namespace list/selection persistence. | Native picker replaces numeric namespace shortcuts. |
+| Discovery and GVR/GVK resolution | `client/gvr.go`, `gvrs.go`; `dao/registry.go` (`Meta.LoadResources`) | Discovers API resources, resolves aliases/GVRs, and handles built-in plus dynamic resources. | `discovery.list` returns group, version, resource, kind, scope, and short names to the native catalog; `parseGVR` preserves identity. | Partial | Fake discovery, including partial failure. | GUI groups discovered resources instead of command aliases. |
+| Generic resource list | `dao`, `watch`, `model`, `view/browser.go` (`Browser`) | Continuously lists and displays typed and dynamic resources with K9s column renderers. | `resource.list` dynamically lists a GVR; the native `Table` displays Name, Status, Age, and Kind. No K9s-equivalent renderers/paging. | Partial | Fake dynamic-client list and table UI. | Native `Table` replaces terminal table. |
+| Resource watch | `internal/watch`; `model`; `view/browser.go` | Maintains list/watch views and refreshes as objects change. | `resource.watch` emits add/modify/delete events and `ClusterStore` applies them; cancellation exists, but retry/relist/error recovery is absent. | Partial | Add/modify/delete stream lifecycle. | Watches stream to Swift, never from terminal output. |
+| Details, YAML, raw fidelity | `view/browser.go` (`viewCmd`); `view/yaml.go`; `model/yaml.go` | Opens structured YAML/raw object views without losing metadata. | `resource.get` returns raw object maps and summaries carry raw data; a basic resource inspector exists, but no YAML renderer/editor. | Partial | Get/YAML round-trip. | Native inspector/editor replaces K9s pages. |
+| Filter, label selector, search, sorting | `view/table.go`; `browser.go` (`SetFilter`, `SetLabelSelector`); `view/cmd` | Supports text filtering, labels, column sorting, marks, and history. | Native text search, table sort/multiselection, and a label-selector request field exist; saved queries and K9s column/custom-view parity do not. | Partial | Selector propagation and UI query tests. | Native search/multiselection replace command/filter modes. |
+| Generic mutation: patch/edit/delete | `view/browser.go` (`editCmd`, `deleteCmd`); `live_view.go`; `ui/dialog` | Opens editor, confirms destructive work, updates/deletes selection. | `resource.patch` and `resource.delete` are dispatched; delete is confirmation/read-only guarded in the toolbar. No editor, server-side apply, or permission preflight. | Partial | Patch/delete integration and confirmation UI. | Native sheets/alerts, not `$EDITOR`. |
+| Workload views | `view/{workload,dp,sts,ds,rs}.go`; `registrar.go` | Specialises Deployments, StatefulSets, DaemonSets, ReplicaSets, and aggregate workloads. | Generic discovery/list can represent these GVRs; no workload UI/actions. | Partial | Workload fixture/table tests. | Native grouped navigation replaces commands. |
+| Pods and containers | `view/{pod,container}.go`; `registrar.go` | Provides pod/container details, logs, shell, attach, transfer, image, ownership, and port-forward actions. | Generic dynamic pod access only; no pod/container UI or operations. | Partial | Pod summary/container extraction. | Actions become toolbar/context-menu commands. |
+| Logs | `view/log.go` (`Log`, `bindKeys`); `logs_extender.go`; `model/log.go`; `dao/log.go` | Streams logs with container choice, previous/follow/filter/timestamp/wrap/autoscroll/save/copy controls. | No log operation or stream implementation. | Blocked | `logs.open/data/close` cancellation integration. | Native log viewer preserves controls. |
+| Exec, shell, attach, debug | `view/exec.go`; `pod.go` (`shellCmd`, `attachCmd`); `container.go`; `xray.go` | Uses Kubernetes exec/attach and K9s shell/debug workflows. | No SPDY/WebSocket exec, attach, debug-container, terminal, or bidirectional streams. | Blocked | PTY stream, resize, cancellation, auth. | Native terminal surface; no TUI suspension. |
+| Port forwarding | `view/pf_extender.go`; `pf.go`; `internal/port` | Starts/stops forwards, tracks active ports/URLs, supports benchmark handoff. | No forwarding operation or lifecycle. | Blocked | Listener, reconnect, cleanup. | Native forward list/inspector. |
+| Metrics and pulse observation | `client/metrics.go` (`MetricsServer`); `view/{pulse,cluster_info}.go`; `model/pulse.go` | Reads metrics-server node/pod/container data and renders cluster load. | No metrics client or stream. | Blocked | Metrics available/unavailable and chart snapshots. | Swift Charts instead of terminal gauges. |
+| Events and diagnostics | `view/event.go`; `client/gvrs.go` (`EvGVR`); `watch` | Shows Kubernetes events and ties diagnostics to resources. | Event GVR is generically listable; no related-event query/watch/UI. | Partial | Related-events selector/watch. | Native inspector timeline. |
+| Scale, restart, rollout | `view/scale_extender.go`; `restart_extender.go`; workload viewers | Scales supported workloads and restarts with K9s semantics. | `resource.scale` is dispatched as a replicas patch; restart and native operation UI are absent. | Partial | Deployment scale/restart integration. | Native confirmations and RBAC errors. |
+| Node operations | `view/node.go` (`drainCmd`, `toggleCordonCmd`, `sshCmd`, `yamlCmd`) | Views node pods/YAML and manages cordon, drain, and shell/SSH. | Generic node access only; no actions. | Partial | Dry-run drain/cordon authorization. | Native progress, not terminal output. |
+| Ownership and reverse relationships | `view/owner_extender.go`; `reference.go`; resource-specific `refCmd`; `internal/xray` | Traverses owners, used-by references, and topology. | No relationship graph/query service. | Blocked | Owner traversal/cycle fixtures. | Native graph/inspector replaces tree navigation. |
+| XRay topology | `internal/xray/{generic,pod,dp,sts,ds,rs,svc,ns,sa,container}.go`; `view/xray.go` | Builds live supported-resource topology and node actions. | No topology model or UI. | Blocked | Topology snapshots. | Native outline/graph, not tview tree. |
+| Registered core/apps/batch/RBAC/CRD/Helm routes | `client/gvrs.go`; `view/registrar.go` | Registers specialised resource viewers and K9s virtual views. | Discovery/generic access cover server-advertised resources; specialised registration is absent. | Partial | Discovery fixtures for each API family. | Dynamic browser remains essential for CRDs. |
+| RBAC inspection and access checks | `client/client.go` (`CanI`); `view/{rbac,policy,user,group,sa}.go` | Evaluates access and shows roles, bindings, rules, subjects. | No access-review/rules operation or UI. | Blocked | Allowed/denied review tests. | Disable and explain native actions. |
+| Helm releases/history | `view/{helm_chart,helm_history}.go`; `internal/helm` | Uses Helm v3 for chart/release browsing and history. | No Helm dependency/service. | Blocked | Helm storage/history fixture. | Native release inspector. |
+| Image scan/vulnerabilities | `view/{img_scan,vul_extender}.go`; `internal/vul`; `config/scans.go` | Runs configured scanners and annotates workload/image views. | No scanner integration. | Blocked | Scanner adapter/report normalisation. | Native security inspector. |
+| Manifest directories | `view/dir.go`; `dao/dir.go` | Browses manifests and applies, deletes, edits, views, and follows resources. | No manifest service. | Blocked | Apply/delete dry-run and validation. | Native file picker/diff/confirmation. |
+| Aliases, hotkeys, custom views/jumps, plugins | `config/{alias,hotkey,views,jumps,plugin}.go`; `view/actions.go`; `custom_jump.go` | Loads per-context config, aliases, shortcuts, columns/views/jumps, and scoped plugins. | No compatibility parser or plugin lifecycle. | Blocked | Config compatibility and plugin-scope tests. | Native commands/settings; no terminal-key emulation requirement. |
+| Read-only/dangerous-action safety | `config/k9s.go` (`IsReadOnly`); `view/actions.go`; `ui/dialog` | Hides/blocks dangerous actions and confirms mutations. | An in-memory read-only toggle disables delete and a native confirmation protects selected deletion; it is not backend-enforced or persisted. | Partial | Policy unit and destructive-action UI tests. | Visible risk state, not hidden hotkeys. |
+| Exports and clipboard | `view/{screen_dump,table_helper,clipboard}.go`; `table.go` | Saves tables/logs/screens and copies selected data. | Copy selected resource name uses the macOS pasteboard; table/log/screenshot export is absent. | Partial | Export-format and pasteboard tests. | Native save panels/pasteboard. |
+| Benchmarks | `view/{pf,benchmark}.go`; `internal/perf`; `config/benchmark.go` | Runs/cancels port-forward benchmarks and shows results. | No benchmark service. | Blocked | Run/cancel/result tests. | Native progress/charts. |
+| Help, command navigation, history | `view/{app,command,help,page_stack,picker}.go`; `view/cmd` | Routes views, maintains history, and shows key hints/help. | `NavigationDestination` names GUI categories; no router/history/help parity. | Partial | Navigation state and keyboard-command tests. | Standard macOS navigation/menus/search supersede prompt. |
+
+## Resource registration trace
+
+`internal/view/registrar.go` is the terminal-view registration authority: namespaces, events, pods, services, nodes, secrets, priority classes, config maps, service accounts, PVCs, workloads, contexts, containers, scans, port forwards, screen dumps, benchmarks, aliases, references, pulse, users/groups, CronJobs/jobs, CRDs, and Helm. `internal/client/gvrs.go` additionally declares PV, endpoints, endpoint slices, HPA, network policies, storage classes, PDB, ingresses, metrics, XRay, policy, and RBAC bindings. K9k must retain discovery for extensions/CRs rather than limiting itself to this fixed list.
+
+## Parity acceptance rule
+
+A row moves to **Complete** only when it has: (1) a versioned helper operation with structured errors and cancellation where streamed; (2) direct Kubernetes libraries, not a required external `kubectl`; (3) an accessible native SwiftUI workflow; (4) read-only/RBAC/confirmation-aware mutation; and (5) automated success/error/cancellation validation.
