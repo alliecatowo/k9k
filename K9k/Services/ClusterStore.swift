@@ -303,6 +303,20 @@ final class ClusterStore {
         } catch { errorMessage = error.localizedDescription }
     }
 
+    /// Retrieves structural kubeconfig references only. The helper does not
+    /// send the cluster server, certificate data, tokens, exec auth, or any
+    /// other credential material over IPC.
+    func inspectKubeconfigContext(_ context: KubeContext) async -> KubeconfigContextInspection? {
+        do {
+            return try decode((try await client.request("context.inspect", parameters: .object([
+                "name": .string(context.name),
+            ])).result), as: KubeconfigContextInspection.self)
+        } catch {
+            errorMessage = "Kubeconfig reference inspection failed: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
     func refreshDiscovery() async {
         do {
             discoveredResources = try decodeArray((try await client.request("discovery.list")).result, as: ResourceType.self)
@@ -1061,6 +1075,26 @@ final class ClusterStore {
         }
     }
 
+    /// Reads the declarative RBAC bindings which directly name an arbitrary
+    /// subject. Unlike `checkAccess`, this never impersonates a subject and is
+    /// deliberately labelled as a partial static explanation in the UI.
+    func inspectEffectiveRBAC(subjectKind: String, subjectName: String, subjectNamespace: String, bindingNamespace: String) async -> EffectiveRBACAnalysis? {
+        var parameters: [String: JSONValue] = [
+            "subjectKind": .string(subjectKind.trimmingCharacters(in: .whitespacesAndNewlines)),
+            "subjectName": .string(subjectName.trimmingCharacters(in: .whitespacesAndNewlines)),
+        ]
+        let normalizedSubjectNamespace = subjectNamespace.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedBindingNamespace = bindingNamespace.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedSubjectNamespace.isEmpty { parameters["subjectNamespace"] = .string(normalizedSubjectNamespace) }
+        if !normalizedBindingNamespace.isEmpty { parameters["bindingNamespace"] = .string(normalizedBindingNamespace) }
+        do {
+            return try decode((try await client.request("rbac.effective", parameters: .object(parameters))).result, as: EffectiveRBACAnalysis.self)
+        } catch {
+            errorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
     func updateScaleAccess() async {
         scaleAccessGeneration &+= 1
         let generation = scaleAccessGeneration
@@ -1200,6 +1234,44 @@ final class ClusterStore {
             await loadResources()
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Runs the existing Deployment/ReplicaSet rollback protocol for a
+    /// revision first reviewed in Rollout History. The helper re-gets the
+    /// ReplicaSet, verifies its UID/inactive state/controller, and replaces
+    /// the template only after this fresh RBAC check and UI confirmation.
+    func rollbackDeploymentRevision(_ revision: RolloutRevision, history: RolloutHistory) async -> Bool {
+        guard !isReadOnly,
+              history.workloadKind == "Deployment",
+              revision.kind == "ReplicaSet",
+              revision.rollbackEligible,
+              !revision.uid.isEmpty,
+              let deploymentType = resourceType(forGVR: "apps/v1/deployments")
+        else { return false }
+        do {
+            let access = try decode(
+                (try await client.request("rbac.check", parameters: .object([
+                    "verb": .string("patch"), "gvr": .string(deploymentType.gvr),
+                    "namespace": .string(history.namespace), "name": .string(history.workloadName),
+                ]))).result,
+                as: AccessReview.self
+            )
+            guard access.allowed else {
+                errorMessage = access.reason ?? "The active Kubernetes identity is not authorized to roll back this Deployment."
+                return false
+            }
+            _ = try await client.request("deployment.rollback", parameters: .object([
+                "namespace": .string(history.namespace),
+                "replicaSet": .string(revision.name),
+                "expectedRSUID": .string(revision.uid),
+                "confirm": .bool(true),
+            ]))
+            await loadResources()
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
         }
     }
 

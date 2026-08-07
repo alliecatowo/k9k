@@ -27,6 +27,7 @@ struct K9kRootView: View {
     @State private var manifestImportPresented = false
     @State private var pulsePresented = false
     @State private var accessCheckPresented = false
+    @State private var effectiveRBACPresented = false
     @State private var navigationHelpPresented = false
     @State private var hostSSHPresented = false
 
@@ -82,6 +83,9 @@ struct K9kRootView: View {
             if let resource = store.resource(for: store.selectedResources.first) {
                 ImageScanView(resource: resource)
             }
+        }
+        .sheet(isPresented: $effectiveRBACPresented) {
+            EffectiveRBACView(initialResource: store.resource(for: store.selectedResources.first))
         }
     }
 
@@ -347,6 +351,7 @@ struct K9kRootView: View {
                 Divider()
                 Button("Check Access…") { accessCheckPresented = true }
                     .disabled(store.selectedResourceType == nil)
+                Button("Effective RBAC…") { effectiveRBACPresented = true }
                 Button("Pulse…") { pulsePresented = true }
                 Button("Helm Releases") { Task { await store.openHelmReleases() } }
                 Button("Active Port Forwards…") { portForwardListPresented = true }

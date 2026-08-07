@@ -14,6 +14,8 @@ struct KubeconfigContextManagerView: View {
     @State private var confirmCopy = false
     @State private var confirmDelete = false
     @State private var isWorking = false
+    @State private var inspection: KubeconfigContextInspection?
+    @State private var isInspecting = false
 
     private var selectedContext: KubeContext? {
         store.contexts.first(where: { $0.id == selectedContextID })
@@ -57,6 +59,11 @@ struct KubeconfigContextManagerView: View {
                                 LabeledContent("User", value: context.user)
                                 LabeledContent("Default namespace", value: context.namespace?.isEmpty == false ? context.namespace! : "Kubernetes default")
                             }
+                            Section("Reference relationships") {
+                                KubeconfigReferenceGraph(inspection: inspection, isLoading: isInspecting) {
+                                    refreshInspection()
+                                }
+                            }
                             Section("Rename") {
                                 TextField("Context name", text: $renamedContext)
                                 Button("Rename…") { confirmRename = true }
@@ -98,7 +105,9 @@ struct KubeconfigContextManagerView: View {
             renamedContext = selectedContext?.name ?? ""
             copiedContextName = ""
             copiedContextNamespace = selectedContext?.namespace ?? ""
+            inspection = nil
         }
+        .task(id: selectedContextID) { refreshInspection() }
         .confirmationDialog("Rename kubeconfig context?", isPresented: $confirmRename, titleVisibility: .visible) {
             Button("Rename") { rename() }
         } message: {
@@ -120,6 +129,18 @@ struct KubeconfigContextManagerView: View {
         selectedContextID = store.selectedContext?.id ?? store.contexts.first?.id
         renamedContext = selectedContext?.name ?? ""
         copiedContextNamespace = selectedContext?.namespace ?? ""
+    }
+
+    private func refreshInspection() {
+        guard let context = selectedContext else {
+            inspection = nil
+            return
+        }
+        isInspecting = true
+        Task {
+            defer { isInspecting = false }
+            inspection = await store.inspectKubeconfigContext(context)
+        }
     }
 
     private func rename() {
@@ -152,6 +173,73 @@ struct KubeconfigContextManagerView: View {
             if let copy = await store.copyKubeContext(context, to: copiedContextName, namespace: copiedContextNamespace) {
                 selectedContextID = copy.id
             }
+        }
+    }
+}
+
+/// A deliberately small relationship graph for one kubeconfig context. The
+/// graph visualizes only names and map-key integrity; no kubeconfig value is
+/// rendered here, so endpoint and credential fields stay opaque.
+private struct KubeconfigReferenceGraph: View {
+    let inspection: KubeconfigContextInspection?
+    let isLoading: Bool
+    let refresh: () -> Void
+
+    var body: some View {
+        if isLoading {
+            ProgressView("Checking saved references…")
+        } else if let inspection, let context = inspection.context {
+            VStack(alignment: .leading, spacing: 10) {
+                relationship(source: context.name, destination: inspection.cluster, label: "Cluster", symbol: "server.rack")
+                relationship(source: context.name, destination: inspection.authInfo, label: "User", symbol: "person.crop.circle")
+
+                if inspection.diagnostics.isEmpty {
+                    Label("All saved references resolve.", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .accessibilityLabel("All saved kubeconfig references resolve")
+                } else {
+                    ForEach(inspection.diagnostics) { diagnostic in
+                        Label(diagnostic.message, systemImage: diagnostic.symbolName)
+                            .foregroundStyle(diagnostic.severity == "error" ? .red : .orange)
+                    }
+                }
+
+                Button("Recheck References", action: refresh)
+                    .help("Read kubeconfig relationship names again without displaying credentials or endpoints")
+                Text("Only context, cluster, and user reference names are shown. Servers, certificates, tokens, and authentication settings stay in kubeconfig.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Reference details are unavailable.", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.secondary)
+                Button("Recheck References", action: refresh)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func relationship(source: String, destination: KubeconfigReference, label: String, symbol: String) -> some View {
+        HStack(spacing: 8) {
+            Label(source, systemImage: "circle")
+                .lineLimit(1)
+            Image(systemName: "arrow.right")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Label(destination.name.isEmpty ? "No \(label.lowercased()) reference" : destination.name, systemImage: symbol)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            Label(destination.exists ? "Resolved" : "Missing", systemImage: destination.exists ? "checkmark.circle" : "xmark.circle")
+                .foregroundStyle(destination.exists ? .green : .red)
+                .labelStyle(.titleAndIcon)
+        }
+        .accessibilityElement(children: .combine)
+        if destination.usedBy.count > 1 {
+            Text("Shared by \(destination.usedBy.joined(separator: ", "))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 24)
         }
     }
 }

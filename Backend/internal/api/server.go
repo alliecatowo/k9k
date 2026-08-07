@@ -40,6 +40,7 @@ const (
 // cluster.
 type ClusterClient interface {
 	Contexts() ([]Context, error)
+	InspectContext(name string) (KubeconfigContextInspection, error)
 	SelectContext(name string) error
 	UpdateContextNamespace(name, namespace string) error
 	RenameContext(name, newName string) error
@@ -49,6 +50,7 @@ type ClusterClient interface {
 	Discovery(context.Context) ([]ResourceType, error)
 	List(context.Context, schema.GroupVersionResource, string, bool, string, string) ([]ResourceSummary, error)
 	ListPage(context.Context, schema.GroupVersionResource, string, bool, ResourceListQuery) (ResourceListPage, error)
+	RolloutHistory(context.Context, RolloutHistoryRequest) (RolloutHistory, error)
 	Get(context.Context, schema.GroupVersionResource, string, string, bool) (*unstructured.Unstructured, error)
 	Watch(context.Context, schema.GroupVersionResource, string, bool, string, string, string) (watch.Interface, error)
 	Delete(context.Context, schema.GroupVersionResource, string, string, bool) error
@@ -72,6 +74,7 @@ type ClusterClient interface {
 	PlanHelmUpgrade(context.Context, HelmUpgradeRequest) (HelmUpgradePlan, error)
 	UpgradeHelm(context.Context, HelmUpgradeRequest) (HelmUpgradeResult, error)
 	CheckAccess(context.Context, AccessCheck) (AccessReview, error)
+	EffectiveRBAC(context.Context, EffectiveRBACRequest) (EffectiveRBACAnalysis, error)
 	PortForward(context.Context, PortForwardRequest, func(PortForwardBinding)) error
 	PodExec(context.Context, PodExecRequest, PodExecStreams) error
 }
@@ -445,6 +448,20 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(err)
 		}
 		return result, nil
+	case "context.inspect":
+		var params struct {
+			Name string `json:"name"`
+		}
+		if len(request.Params) != 0 && string(request.Params) != "null" {
+			if err := json.Unmarshal(request.Params, &params); err != nil {
+				return nil, invalidParams(fmt.Errorf("decode params: %w", err))
+			}
+		}
+		result, err := s.cluster.InspectContext(strings.TrimSpace(params.Name))
+		if err != nil {
+			return nil, kubeError(err)
+		}
+		return result, nil
 	case "context.select":
 		var params struct {
 			Name string `json:"name"`
@@ -577,6 +594,21 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 		result, listErr := s.cluster.ListPage(ctx, params.gvr(), params.Namespace, params.isNamespaced(), params.listQuery())
 		if listErr != nil {
 			return nil, kubeError(listErr)
+		}
+		return result, nil
+	case "rollout.history":
+		var params RolloutHistoryRequest
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		params.Group, params.Version, params.Resource = strings.TrimSpace(params.Group), strings.TrimSpace(params.Version), strings.TrimSpace(params.Resource)
+		params.Namespace, params.Name, params.ExpectedUID = strings.TrimSpace(params.Namespace), strings.TrimSpace(params.Name), strings.TrimSpace(params.ExpectedUID)
+		if params.Group != "apps" || params.Version != "v1" || !rolloutHistoryResource(params.Resource) || params.Namespace == "" || params.Name == "" || params.ExpectedUID == "" {
+			return nil, invalidParams(errors.New("apps/v1 workload namespace, name, and expectedUID are required"))
+		}
+		result, historyErr := s.cluster.RolloutHistory(ctx, params)
+		if historyErr != nil {
+			return nil, kubeError(historyErr)
 		}
 		return result, nil
 	case "resource.get":
@@ -1005,6 +1037,19 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 		result, reviewErr := s.cluster.CheckAccess(ctx, params.accessCheck())
 		if reviewErr != nil {
 			return nil, kubeError(reviewErr)
+		}
+		return result, nil
+	case "rbac.effective":
+		var params EffectiveRBACRequest
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		if err := validateEffectiveRBACRequest(&params); err != nil {
+			return nil, invalidParams(err)
+		}
+		result, analysisErr := s.cluster.EffectiveRBAC(ctx, params)
+		if analysisErr != nil {
+			return nil, kubeError(analysisErr)
 		}
 		return result, nil
 	case "resource.patch":
@@ -2767,6 +2812,35 @@ func (p accessCheckParams) accessCheck() AccessCheck {
 	}
 }
 
+func validateEffectiveRBACRequest(request *EffectiveRBACRequest) error {
+	if request == nil {
+		return errors.New("RBAC subject is required")
+	}
+	request.SubjectKind = strings.TrimSpace(request.SubjectKind)
+	request.SubjectName = strings.TrimSpace(request.SubjectName)
+	request.SubjectNamespace = strings.TrimSpace(request.SubjectNamespace)
+	request.BindingNamespace = strings.TrimSpace(request.BindingNamespace)
+	if request.SubjectName == "" {
+		return errors.New("subjectName is required")
+	}
+	switch request.SubjectKind {
+	case "User", "Group":
+		if request.SubjectNamespace != "" {
+			return errors.New("subjectNamespace is valid only for ServiceAccount")
+		}
+	case "ServiceAccount":
+		if request.SubjectNamespace == "" {
+			return errors.New("subjectNamespace is required for ServiceAccount")
+		}
+		if request.BindingNamespace != "" && request.BindingNamespace != request.SubjectNamespace {
+			return errors.New("bindingNamespace must match the ServiceAccount namespace")
+		}
+	default:
+		return errors.New("subjectKind must be User, Group, or ServiceAccount")
+	}
+	return nil
+}
+
 func (p *scaleParams) validate() error {
 	if err := p.validateResource(); err != nil {
 		return err
@@ -2921,6 +2995,15 @@ func watchEventName(eventType watch.EventType) string {
 		return "resource.deleted"
 	default:
 		return ""
+	}
+}
+
+func rolloutHistoryResource(resource string) bool {
+	switch resource {
+	case "deployments", "statefulsets", "daemonsets", "replicasets":
+		return true
+	default:
+		return false
 	}
 }
 

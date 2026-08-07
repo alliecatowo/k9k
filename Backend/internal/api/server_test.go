@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -28,63 +29,70 @@ import (
 type fakeCluster struct {
 	mu sync.Mutex
 
-	contexts   []Context
-	namespaces []string
-	discovery  []ResourceType
-	list       []ResourceSummary
-	listPage   ResourceListPage
-	object     *unstructured.Unstructured
-	objects    map[string]*unstructured.Unstructured
-	watcher    *contextWatch
+	contexts       []Context
+	inspection     KubeconfigContextInspection
+	namespaces     []string
+	discovery      []ResourceType
+	list           []ResourceSummary
+	listPage       ResourceListPage
+	rolloutHistory RolloutHistory
+	effectiveRBAC  EffectiveRBACAnalysis
+	object         *unstructured.Unstructured
+	objects        map[string]*unstructured.Unstructured
+	watcher        *contextWatch
 
-	contextsErr, selectErr, namespacesErr, discoveryErr error
-	updateContextErr                                    error
-	renameContextErr                                    error
-	copyContextErr                                      error
-	deleteContextErr                                    error
-	listErr, getErr, watchErr, deleteErr, patchErr      error
-	accessErr, portForwardErr                           error
-	metricsErr                                          error
-	drainErr                                            error
-	nodeShellErr                                        error
-	debugErr                                            error
-	triggerCronJobErr                                   error
-	rollbackDeploymentErr                               error
-	helmRollbackErr, helmUninstallErr                   error
-	helmUpgradePlanErr, helmUpgradeErr                  error
-	execErr                                             error
-	manifestErr, applyManifestErr                       error
-	manifestDeleteErr                                   error
+	contextsErr, inspectContextErr, selectErr, namespacesErr, discoveryErr error
+	updateContextErr                                                       error
+	renameContextErr                                                       error
+	copyContextErr                                                         error
+	deleteContextErr                                                       error
+	listErr, getErr, watchErr, deleteErr, patchErr                         error
+	rolloutHistoryErr, effectiveRBACErr                                    error
+	accessErr, portForwardErr                                              error
+	metricsErr                                                             error
+	drainErr                                                               error
+	nodeShellErr                                                           error
+	debugErr                                                               error
+	triggerCronJobErr                                                      error
+	rollbackDeploymentErr                                                  error
+	helmRollbackErr, helmUninstallErr                                      error
+	helmUpgradePlanErr, helmUpgradeErr                                     error
+	execErr                                                                error
+	manifestErr, applyManifestErr                                          error
+	manifestDeleteErr                                                      error
 
-	selected         []string
-	contextUpdates   []Context
-	contextRenames   [][2]string
-	contextCopies    [][3]string
-	contextDeletes   []string
-	lists            []resourceCall
-	gets             []resourceCall
-	watches          []resourceCall
-	deletes          []resourceCall
-	patches          []patchCall
-	accesses         []AccessCheck
-	forwards         []PortForwardRequest
-	metrics          []MetricsQuery
-	metricItems      []ResourceMetrics
-	drains           []NodeDrainRequest
-	nodeShells       []NodeShellTarget
-	debugs           []PodDebugRequest
-	cronJobTriggers  []CronJobTriggerRequest
-	rollbacks        []DeploymentRollbackRequest
-	helmRollbacks    []HelmRollbackRequest
-	helmUninstalls   []HelmUninstallRequest
-	helmUpgradePlans []HelmUpgradeRequest
-	helmUpgrades     []HelmUpgradeRequest
-	execs            []PodExecRequest
-	execFn           func(context.Context, PodExecRequest, PodExecStreams) error
-	manifests        []resourceCall
-	applyManifests   []ManifestApplyRequest
-	manifestDeletes  []ManifestIdentity
-	accessFn         func(AccessCheck) AccessReview
+	selected          []string
+	inspectedContexts []string
+	contextUpdates    []Context
+	contextRenames    [][2]string
+	contextCopies     [][3]string
+	contextDeletes    []string
+	lists             []resourceCall
+	gets              []resourceCall
+	watches           []resourceCall
+	deletes           []resourceCall
+	patches           []patchCall
+	accesses          []AccessCheck
+	forwards          []PortForwardRequest
+	metrics           []MetricsQuery
+	metricItems       []ResourceMetrics
+	drains            []NodeDrainRequest
+	nodeShells        []NodeShellTarget
+	debugs            []PodDebugRequest
+	cronJobTriggers   []CronJobTriggerRequest
+	rollbacks         []DeploymentRollbackRequest
+	rolloutHistories  []RolloutHistoryRequest
+	effectiveRBACs    []EffectiveRBACRequest
+	helmRollbacks     []HelmRollbackRequest
+	helmUninstalls    []HelmUninstallRequest
+	helmUpgradePlans  []HelmUpgradeRequest
+	helmUpgrades      []HelmUpgradeRequest
+	execs             []PodExecRequest
+	execFn            func(context.Context, PodExecRequest, PodExecStreams) error
+	manifests         []resourceCall
+	applyManifests    []ManifestApplyRequest
+	manifestDeletes   []ManifestIdentity
+	accessFn          func(AccessCheck) AccessReview
 }
 
 type resourceCall struct {
@@ -108,6 +116,13 @@ func (f *fakeCluster) Contexts() ([]Context, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]Context(nil), f.contexts...), f.contextsErr
+}
+
+func (f *fakeCluster) InspectContext(name string) (KubeconfigContextInspection, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.inspectedContexts = append(f.inspectedContexts, name)
+	return f.inspection, f.inspectContextErr
 }
 
 func (f *fakeCluster) SelectContext(name string) error {
@@ -176,6 +191,31 @@ func (f *fakeCluster) ListPage(_ context.Context, gvr schema.GroupVersionResourc
 		page.ResourceVersion = "fake-resource-version"
 	}
 	return page, f.listErr
+}
+
+func (f *fakeCluster) RolloutHistory(_ context.Context, request RolloutHistoryRequest) (RolloutHistory, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rolloutHistories = append(f.rolloutHistories, request)
+	result := f.rolloutHistory
+	if result.Revisions == nil {
+		result.Revisions = []RolloutRevision{}
+	}
+	return result, f.rolloutHistoryErr
+}
+
+func (f *fakeCluster) EffectiveRBAC(_ context.Context, request EffectiveRBACRequest) (EffectiveRBACAnalysis, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.effectiveRBACs = append(f.effectiveRBACs, request)
+	result := f.effectiveRBAC
+	if result.Bindings == nil {
+		result.Bindings = []EffectiveRBACBinding{}
+	}
+	if result.Warnings == nil {
+		result.Warnings = []string{}
+	}
+	return result, f.effectiveRBACErr
 }
 
 func (f *fakeCluster) Get(_ context.Context, gvr schema.GroupVersionResource, namespace, name string, namespaced bool) (*unstructured.Unstructured, error) {
@@ -635,6 +675,34 @@ func TestServerContextAndReadOperations(t *testing.T) {
 	}
 }
 
+func TestServerContextInspectionIsReadOnlyAndAllowsActiveDefault(t *testing.T) {
+	client := &fakeCluster{inspection: KubeconfigContextInspection{
+		Context:     &Context{Name: "production", Cluster: "prod", User: "deploy", Active: true},
+		Cluster:     KubeconfigReference{Name: "prod", Exists: true, UsedBy: []string{"production"}},
+		AuthInfo:    KubeconfigReference{Name: "deploy", Exists: true, UsedBy: []string{"production", "staging"}},
+		Diagnostics: []KubeconfigDiagnostic{{Code: "namespace_invalid", Severity: "warning", Message: "invalid namespace"}},
+	}}
+	responses := runRequests(t, client,
+		request("active", "context.inspect", nil),
+		request("named", "context.inspect", map[string]any{"name": " staging "}),
+	)
+	if got := envelopeByID(t, responses, "active").Error; got != nil {
+		t.Errorf("active inspect = %#v", got)
+	}
+	result := mustObject(t, envelopeByID(t, responses, "named").Result)
+	if context := mustObject(t, result["context"]); context["name"] != "production" || context["cluster"] != "prod" || context["user"] != "deploy" {
+		t.Errorf("inspection context = %#v", context)
+	}
+	if cluster := mustObject(t, result["cluster"]); cluster["exists"] != true || cluster["name"] != "prod" {
+		t.Errorf("inspection cluster = %#v", cluster)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if got, want := client.inspectedContexts, []string{"", "staging"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("inspected contexts = %#v, want %#v", got, want)
+	}
+}
+
 func TestServerResourceListPageIsBoundedAndReturnsWatchRevision(t *testing.T) {
 	remaining := int64(73)
 	client := &fakeCluster{listPage: ResourceListPage{
@@ -659,6 +727,31 @@ func TestServerResourceListPageIsBoundedAndReturnsWatchRevision(t *testing.T) {
 	defer client.mu.Unlock()
 	if len(client.lists) != 1 || client.lists[0].limit != 250 || client.lists[0].continueToken != "prior-token" {
 		t.Errorf("list page call = %#v", client.lists)
+	}
+}
+
+func TestServerRolloutHistoryRequiresExactAppsWorkloadIdentity(t *testing.T) {
+	client := &fakeCluster{rolloutHistory: RolloutHistory{
+		WorkloadKind: "Deployment", WorkloadName: "web", Namespace: "demo",
+		Revisions: []RolloutRevision{{Kind: "ReplicaSet", Name: "web-old", UID: "rs-uid", Revision: "3", Status: "Inactive", RollbackEligible: true}},
+	}}
+	responses := runRequests(t, client,
+		request("valid", "rollout.history", map[string]any{"group": "apps", "version": "v1", "resource": "deployments", "namespace": "demo", "name": "web", "expectedUID": "deployment-uid"}),
+		request("bad", "rollout.history", map[string]any{"group": "", "version": "v1", "resource": "deployments", "namespace": "demo", "name": "web", "expectedUID": "deployment-uid"}),
+	)
+	if response := envelopeByID(t, responses, "bad"); response.Error == nil || response.Error.Code != "invalid_params" {
+		t.Fatalf("invalid rollout request = %#v", response)
+	}
+	response := envelopeByID(t, responses, "valid")
+	if response.Error != nil {
+		t.Fatalf("rollout.history error = %#v", response.Error)
+	}
+	if len(client.rolloutHistories) != 1 || client.rolloutHistories[0].ExpectedUID != "deployment-uid" {
+		t.Fatalf("history requests = %#v", client.rolloutHistories)
+	}
+	result := decodeResult[RolloutHistory](t, response.Result)
+	if len(result.Revisions) != 1 || !result.Revisions[0].RollbackEligible {
+		t.Fatalf("history = %#v", result)
 	}
 }
 
@@ -1344,6 +1437,43 @@ func TestServerRBACCheckPropagatesKubernetesErrors(t *testing.T) {
 	response := envelopeByID(t, runRequests(t, client, request("check", "rbac.check", map[string]any{"verb": "get", "resource": "pods"})), "check")
 	if response.Error == nil || response.Error.Code != "kubernetes_error" {
 		t.Errorf("error = %#v", response.Error)
+	}
+}
+
+func TestServerEffectiveRBACValidatesSubjectAndReturnsStaticExplanation(t *testing.T) {
+	client := &fakeCluster{effectiveRBAC: EffectiveRBACAnalysis{
+		Subject: EffectiveRBACSubject{Kind: "ServiceAccount", Name: "api", Namespace: "demo"},
+		Bindings: []EffectiveRBACBinding{{Kind: "RoleBinding", Name: "api-read", Namespace: "demo", RoleKind: "Role", RoleName: "read-pods", RoleResolved: true,
+			Rules: []EffectiveRBACRule{{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "list"}}}}},
+		Warnings: []string{"Static RBAC explanation only"},
+	}}
+	responses := runRequests(t, client,
+		request("service-account", "rbac.effective", map[string]any{"subjectKind": "ServiceAccount", "subjectName": "api", "subjectNamespace": "demo"}),
+		request("user-scope", "rbac.effective", map[string]any{"subjectKind": "User", "subjectName": "alice", "bindingNamespace": "team-a"}),
+		request("missing-sa-namespace", "rbac.effective", map[string]any{"subjectKind": "ServiceAccount", "subjectName": "api"}),
+		request("invalid-kind", "rbac.effective", map[string]any{"subjectKind": "Robot", "subjectName": "api"}),
+	)
+	for _, id := range []string{"service-account", "user-scope"} {
+		if response := envelopeByID(t, responses, id); response.Error != nil {
+			t.Fatalf("%s error = %#v", id, response.Error)
+		}
+	}
+	for _, id := range []string{"missing-sa-namespace", "invalid-kind"} {
+		if response := envelopeByID(t, responses, id); response.Error == nil || response.Error.Code != "invalid_params" {
+			t.Errorf("%s error = %#v", id, response.Error)
+		}
+	}
+	result := decodeResult[EffectiveRBACAnalysis](t, envelopeByID(t, responses, "service-account").Result)
+	if len(result.Bindings) != 1 || result.Bindings[0].RoleName != "read-pods" || len(result.Bindings[0].Rules) != 1 {
+		t.Errorf("analysis = %#v", result)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if got, want := client.effectiveRBACs, []EffectiveRBACRequest{
+		{SubjectKind: "ServiceAccount", SubjectName: "api", SubjectNamespace: "demo"},
+		{SubjectKind: "User", SubjectName: "alice", BindingNamespace: "team-a"},
+	}; !reflect.DeepEqual(got, want) {
+		t.Errorf("effective requests = %#v, want %#v", got, want)
 	}
 }
 

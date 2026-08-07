@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
@@ -29,6 +31,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/transport/spdy"
@@ -102,10 +105,98 @@ func (c *Cluster) Contexts() ([]api.Context, error) {
 	}
 	result := make([]api.Context, 0, len(raw.Contexts))
 	for name, value := range raw.Contexts {
+		if value == nil {
+			// A malformed context should not make the settings UI crash. The
+			// inspection operation reports its structural diagnostic in detail.
+			result = append(result, api.Context{Name: name, Active: name == active})
+			continue
+		}
 		result = append(result, api.Context{Name: name, Cluster: value.Cluster, User: value.AuthInfo, Namespace: value.Namespace, Active: name == active})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result, nil
+}
+
+// InspectContext returns only the names and integrity of a context's
+// kubeconfig relationships. It never reads Cluster or AuthInfo fields, so a
+// graphical inspector cannot disclose endpoints, TLS material, tokens, exec
+// authentication configuration, or credentials.
+func (c *Cluster) InspectContext(name string) (api.KubeconfigContextInspection, error) {
+	c.mu.RLock()
+	config := c.config
+	selected := c.context
+	c.mu.RUnlock()
+
+	inspection := api.KubeconfigContextInspection{Diagnostics: []api.KubeconfigDiagnostic{}}
+	if config == nil {
+		inspection.Diagnostics = append(inspection.Diagnostics, kubeconfigDiagnostic("kubeconfig_unavailable", "error", "K9k could not load kubeconfig relationships."))
+		return inspection, nil
+	}
+	raw, err := config.RawConfig()
+	if err != nil {
+		return inspection, err
+	}
+
+	active := raw.CurrentContext
+	if selected != "" {
+		active = selected
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = active
+	}
+	if name == "" {
+		inspection.Diagnostics = append(inspection.Diagnostics, kubeconfigDiagnostic("active_context_missing", "warning", "No active kubeconfig context is selected."))
+		return inspection, nil
+	}
+
+	contextValue, exists := raw.Contexts[name]
+	if !exists || contextValue == nil {
+		inspection.Diagnostics = append(inspection.Diagnostics, kubeconfigDiagnostic("context_reference_missing", "error", fmt.Sprintf("Context %q is not defined in kubeconfig.", name)))
+		return inspection, nil
+	}
+	inspection.Context = &api.Context{Name: name, Cluster: contextValue.Cluster, User: contextValue.AuthInfo, Namespace: contextValue.Namespace, Active: name == active}
+	inspection.Cluster = kubeconfigReference(raw.Contexts, raw.Clusters, contextValue.Cluster, func(context *clientcmdapi.Context) string { return context.Cluster })
+	inspection.AuthInfo = kubeconfigReference(raw.Contexts, raw.AuthInfos, contextValue.AuthInfo, func(context *clientcmdapi.Context) string { return context.AuthInfo })
+
+	if inspection.Cluster.Name == "" {
+		inspection.Diagnostics = append(inspection.Diagnostics, kubeconfigDiagnostic("cluster_reference_empty", "error", fmt.Sprintf("Context %q has no cluster reference.", name)))
+	} else if !inspection.Cluster.Exists {
+		inspection.Diagnostics = append(inspection.Diagnostics, kubeconfigDiagnostic("cluster_reference_missing", "error", fmt.Sprintf("Context %q references missing cluster %q.", name, inspection.Cluster.Name)))
+	}
+	if inspection.AuthInfo.Name == "" {
+		inspection.Diagnostics = append(inspection.Diagnostics, kubeconfigDiagnostic("auth_reference_empty", "warning", fmt.Sprintf("Context %q has no named user reference; authentication may be provided out of band.", name)))
+	} else if !inspection.AuthInfo.Exists {
+		inspection.Diagnostics = append(inspection.Diagnostics, kubeconfigDiagnostic("auth_reference_missing", "error", fmt.Sprintf("Context %q references missing user %q.", name, inspection.AuthInfo.Name)))
+	}
+	if contextValue.Namespace != "" && len(validation.IsDNS1123Label(contextValue.Namespace)) != 0 {
+		inspection.Diagnostics = append(inspection.Diagnostics, kubeconfigDiagnostic("namespace_invalid", "warning", fmt.Sprintf("Context %q has an invalid default namespace name %q.", name, contextValue.Namespace)))
+	}
+	if raw.CurrentContext != "" {
+		if current, exists := raw.Contexts[raw.CurrentContext]; !exists || current == nil {
+			inspection.Diagnostics = append(inspection.Diagnostics, kubeconfigDiagnostic("current_context_missing", "warning", fmt.Sprintf("kubeconfig current-context %q is not defined.", raw.CurrentContext)))
+		}
+	}
+	return inspection, nil
+}
+
+func kubeconfigReference[T any](contexts map[string]*clientcmdapi.Context, entries map[string]*T, name string, extract func(*clientcmdapi.Context) string) api.KubeconfigReference {
+	reference := api.KubeconfigReference{Name: name, UsedBy: []string{}}
+	if name != "" {
+		entry, exists := entries[name]
+		reference.Exists = exists && entry != nil
+	}
+	for contextName, contextValue := range contexts {
+		if contextValue != nil && extract(contextValue) == name {
+			reference.UsedBy = append(reference.UsedBy, contextName)
+		}
+	}
+	sort.Strings(reference.UsedBy)
+	return reference
+}
+
+func kubeconfigDiagnostic(code, severity, message string) api.KubeconfigDiagnostic {
+	return api.KubeconfigDiagnostic{Code: code, Severity: severity, Message: message}
 }
 
 func (c *Cluster) SelectContext(name string) error {
@@ -352,6 +443,210 @@ func (c *Cluster) ListPage(ctx context.Context, gvr schema.GroupVersionResource,
 		page.Items = append(page.Items, summary)
 	}
 	return page, nil
+}
+
+const (
+	rolloutHistoryPageSize = 100
+	maxRolloutHistoryScan  = 500
+	maxRolloutHistoryItems = 128
+)
+
+// RolloutHistory returns bounded, metadata-only controller history. It starts
+// by reading and UID-verifying the exact workload the inspector selected, then
+// lists only its Kubernetes-owned revision objects. No historical PodTemplate
+// is returned: those can contain Secret references or literal credentials and
+// are unnecessary for reviewing the guarded rollback source.
+func (c *Cluster) RolloutHistory(ctx context.Context, request api.RolloutHistoryRequest) (api.RolloutHistory, error) {
+	c.mu.RLock()
+	typed := c.typed
+	c.mu.RUnlock()
+	if typed == nil {
+		return api.RolloutHistory{}, fmt.Errorf("no usable Kubernetes context is selected")
+	}
+	switch request.Resource {
+	case "deployments":
+		deployment, err := typed.AppsV1().Deployments(request.Namespace).Get(ctx, request.Name, metav1.GetOptions{})
+		if err != nil {
+			return api.RolloutHistory{}, err
+		}
+		if string(deployment.UID) != request.ExpectedUID {
+			return api.RolloutHistory{}, api.ErrManifestIdentityMismatch
+		}
+		return c.deploymentRolloutHistory(ctx, typed, deployment)
+	case "replicasets":
+		replicaSet, err := typed.AppsV1().ReplicaSets(request.Namespace).Get(ctx, request.Name, metav1.GetOptions{})
+		if err != nil {
+			return api.RolloutHistory{}, err
+		}
+		if string(replicaSet.UID) != request.ExpectedUID {
+			return api.RolloutHistory{}, api.ErrManifestIdentityMismatch
+		}
+		owner, ok := rolloutControllerOwner(replicaSet.OwnerReferences, "Deployment")
+		if !ok {
+			return api.RolloutHistory{}, fmt.Errorf("ReplicaSet %s/%s is not controlled by a Deployment", request.Namespace, request.Name)
+		}
+		deployment, err := typed.AppsV1().Deployments(request.Namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+		if err != nil {
+			return api.RolloutHistory{}, err
+		}
+		if string(deployment.UID) != string(owner.UID) {
+			return api.RolloutHistory{}, fmt.Errorf("ReplicaSet controller no longer matches the Deployment")
+		}
+		return c.deploymentRolloutHistory(ctx, typed, deployment)
+	case "statefulsets":
+		workload, err := typed.AppsV1().StatefulSets(request.Namespace).Get(ctx, request.Name, metav1.GetOptions{})
+		if err != nil {
+			return api.RolloutHistory{}, err
+		}
+		if string(workload.UID) != request.ExpectedUID {
+			return api.RolloutHistory{}, api.ErrManifestIdentityMismatch
+		}
+		return c.controllerRevisionHistory(ctx, typed, "StatefulSet", workload.Name, workload.Namespace, string(workload.UID), workload.Status.CurrentRevision, workload.Status.UpdateRevision)
+	case "daemonsets":
+		workload, err := typed.AppsV1().DaemonSets(request.Namespace).Get(ctx, request.Name, metav1.GetOptions{})
+		if err != nil {
+			return api.RolloutHistory{}, err
+		}
+		if string(workload.UID) != request.ExpectedUID {
+			return api.RolloutHistory{}, api.ErrManifestIdentityMismatch
+		}
+		// DaemonSetStatus exposes counts but no ControllerRevision names. The
+		// history remains useful and read-only; it deliberately marks no entry
+		// as current rather than guessing from a ReplicaSet-style annotation.
+		return c.controllerRevisionHistory(ctx, typed, "DaemonSet", workload.Name, workload.Namespace, string(workload.UID), "", "")
+	default:
+		return api.RolloutHistory{}, fmt.Errorf("rollout history is unsupported for %q", request.Resource)
+	}
+}
+
+func (c *Cluster) deploymentRolloutHistory(ctx context.Context, typed kubernetes.Interface, deployment *appsv1.Deployment) (api.RolloutHistory, error) {
+	history := api.RolloutHistory{
+		WorkloadKind: "Deployment", WorkloadName: deployment.Name, Namespace: deployment.Namespace,
+		CurrentRevision: deployment.Annotations["deployment.kubernetes.io/revision"], Revisions: []api.RolloutRevision{},
+	}
+	continueToken := ""
+	scanned := 0
+	for scanned < maxRolloutHistoryScan && len(history.Revisions) < maxRolloutHistoryItems {
+		limit := int64(rolloutHistoryPageSize)
+		if remaining := maxRolloutHistoryScan - scanned; remaining < rolloutHistoryPageSize {
+			limit = int64(remaining)
+		}
+		list, err := typed.AppsV1().ReplicaSets(deployment.Namespace).List(ctx, metav1.ListOptions{Limit: limit, Continue: continueToken})
+		if err != nil {
+			return api.RolloutHistory{}, err
+		}
+		scanned += len(list.Items)
+		for index := range list.Items {
+			item := &list.Items[index]
+			owner, controlled := rolloutControllerOwner(item.OwnerReferences, "Deployment")
+			if !controlled || owner.Name != deployment.Name || owner.UID != deployment.UID {
+				continue
+			}
+			revision := item.Annotations["deployment.kubernetes.io/revision"]
+			active := item.Status.Replicas > 0
+			status := "Inactive"
+			if active {
+				status = "Active"
+			}
+			history.Revisions = append(history.Revisions, api.RolloutRevision{
+				Kind: "ReplicaSet", Name: item.Name, UID: string(item.UID), Revision: revision,
+				CreatedAt: item.CreationTimestamp.Time, Age: humanDuration(item.CreationTimestamp.Time), Status: status, Active: active,
+				RollbackEligible: !active && item.Spec.Template.Spec.Containers != nil,
+			})
+			if len(history.Revisions) >= maxRolloutHistoryItems {
+				history.Truncated = true
+				break
+			}
+		}
+		continueToken = list.Continue
+		if continueToken == "" {
+			break
+		}
+	}
+	if continueToken != "" {
+		history.Truncated = true
+	}
+	sort.SliceStable(history.Revisions, func(i, j int) bool {
+		left, right := rolloutRevisionNumber(history.Revisions[i].Revision), rolloutRevisionNumber(history.Revisions[j].Revision)
+		if left != right {
+			return left > right
+		}
+		return history.Revisions[i].CreatedAt.After(history.Revisions[j].CreatedAt)
+	})
+	return history, nil
+}
+
+func (c *Cluster) controllerRevisionHistory(ctx context.Context, typed kubernetes.Interface, kind, name, namespace, uid, current, updated string) (api.RolloutHistory, error) {
+	history := api.RolloutHistory{WorkloadKind: kind, WorkloadName: name, Namespace: namespace, CurrentRevision: current, UpdatedRevision: updated, Revisions: []api.RolloutRevision{}}
+	continueToken := ""
+	scanned := 0
+	for scanned < maxRolloutHistoryScan && len(history.Revisions) < maxRolloutHistoryItems {
+		limit := int64(rolloutHistoryPageSize)
+		if remaining := maxRolloutHistoryScan - scanned; remaining < rolloutHistoryPageSize {
+			limit = int64(remaining)
+		}
+		list, err := typed.AppsV1().ControllerRevisions(namespace).List(ctx, metav1.ListOptions{Limit: limit, Continue: continueToken})
+		if err != nil {
+			return api.RolloutHistory{}, err
+		}
+		scanned += len(list.Items)
+		for index := range list.Items {
+			item := &list.Items[index]
+			owner, controlled := rolloutControllerOwner(item.OwnerReferences, kind)
+			if !controlled || owner.Name != name || string(owner.UID) != uid {
+				continue
+			}
+			active := item.Name == current || item.Name == updated
+			status := "Historical"
+			if item.Name == current && item.Name == updated {
+				status = "Current"
+			} else if item.Name == current {
+				status = "Current"
+			} else if item.Name == updated {
+				status = "Updating"
+			}
+			history.Revisions = append(history.Revisions, api.RolloutRevision{
+				Kind: "ControllerRevision", Name: item.Name, UID: string(item.UID), Revision: strconv.FormatInt(item.Revision, 10),
+				CreatedAt: item.CreationTimestamp.Time, Age: humanDuration(item.CreationTimestamp.Time), Status: status, Active: active,
+			})
+			if len(history.Revisions) >= maxRolloutHistoryItems {
+				history.Truncated = true
+				break
+			}
+		}
+		continueToken = list.Continue
+		if continueToken == "" {
+			break
+		}
+	}
+	if continueToken != "" {
+		history.Truncated = true
+	}
+	sort.SliceStable(history.Revisions, func(i, j int) bool {
+		left, right := rolloutRevisionNumber(history.Revisions[i].Revision), rolloutRevisionNumber(history.Revisions[j].Revision)
+		if left != right {
+			return left > right
+		}
+		return history.Revisions[i].CreatedAt.After(history.Revisions[j].CreatedAt)
+	})
+	return history, nil
+}
+
+func rolloutControllerOwner(owners []metav1.OwnerReference, kind string) (metav1.OwnerReference, bool) {
+	for _, owner := range owners {
+		if owner.Controller != nil && *owner.Controller && owner.APIVersion == "apps/v1" && owner.Kind == kind {
+			return owner, true
+		}
+	}
+	return metav1.OwnerReference{}, false
+}
+
+func rolloutRevisionNumber(value string) int64 {
+	revision, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil {
+		return -1
+	}
+	return revision
 }
 func (c *Cluster) Get(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string, namespaced bool) (*unstructured.Unstructured, error) {
 	resource, err := c.resource(gvr, namespace, namespaced)

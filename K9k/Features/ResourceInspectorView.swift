@@ -149,6 +149,9 @@ struct ResourceInspectorView: View {
             nodeDetails(resource)
             configurationDetails(resource)
             rolloutDetails(resource)
+            if let type, ["deployments", "statefulsets", "daemonsets", "replicasets"].contains(type.resource), resource.namespace?.isEmpty == false {
+                RolloutHistorySection(resource: resource, type: type)
+            }
             rbacDetails(resource)
             if resource.labels?["owner"] == "helm", let release = helmReleaseName(resource), let namespace = resource.namespace, !namespace.isEmpty {
                 HelmReleaseHistorySection(release: release, namespace: namespace)

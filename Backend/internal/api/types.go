@@ -23,6 +23,35 @@ type Context struct {
 	Active    bool   `json:"active"`
 }
 
+// KubeconfigReference is a name-only relationship from a context to either a
+// Cluster or AuthInfo kubeconfig entry. It intentionally excludes the entry's
+// contents: server URLs, certificate data, tokens, exec configuration, and
+// every other credential-bearing field remain inside kubeconfig.
+type KubeconfigReference struct {
+	Name   string   `json:"name"`
+	Exists bool     `json:"exists"`
+	UsedBy []string `json:"usedBy"`
+}
+
+// KubeconfigDiagnostic describes a structural kubeconfig issue that can be
+// safely shown in the native settings UI. It contains only names and
+// relationship state, never endpoint or authentication material.
+type KubeconfigDiagnostic struct {
+	Code     string `json:"code"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+}
+
+// KubeconfigContextInspection is a read-only, credential-free view of one
+// context and the named Cluster/AuthInfo entries it references. UsedBy helps
+// an operator see shared references before changing any context metadata.
+type KubeconfigContextInspection struct {
+	Context     *Context               `json:"context,omitempty"`
+	Cluster     KubeconfigReference    `json:"cluster"`
+	AuthInfo    KubeconfigReference    `json:"authInfo"`
+	Diagnostics []KubeconfigDiagnostic `json:"diagnostics"`
+}
+
 type ResourceType struct {
 	Group      string   `json:"group"`
 	Version    string   `json:"version"`
@@ -81,6 +110,42 @@ type ResourceListPage struct {
 	ResourceVersion    string            `json:"resourceVersion"`
 	Continue           string            `json:"continue,omitempty"`
 	RemainingItemCount *int64            `json:"remainingItemCount,omitempty"`
+}
+
+// RolloutHistoryRequest names one exact workload object. ExpectedUID prevents
+// a stale inspector from browsing revisions for a delete/recreate replacement.
+type RolloutHistoryRequest struct {
+	Group       string `json:"group"`
+	Version     string `json:"version"`
+	Resource    string `json:"resource"`
+	Namespace   string `json:"namespace"`
+	Name        string `json:"name"`
+	ExpectedUID string `json:"expectedUID"`
+}
+
+// RolloutHistory is deliberately metadata-only. Historical templates can
+// contain credentials and are not needed to review the identity/status of a
+// revision before the separately guarded deployment rollback operation.
+type RolloutHistory struct {
+	WorkloadKind    string            `json:"workloadKind"`
+	WorkloadName    string            `json:"workloadName"`
+	Namespace       string            `json:"namespace"`
+	CurrentRevision string            `json:"currentRevision,omitempty"`
+	UpdatedRevision string            `json:"updatedRevision,omitempty"`
+	Revisions       []RolloutRevision `json:"revisions"`
+	Truncated       bool              `json:"truncated"`
+}
+
+type RolloutRevision struct {
+	Kind             string    `json:"kind"`
+	Name             string    `json:"name"`
+	UID              string    `json:"uid"`
+	Revision         string    `json:"revision,omitempty"`
+	CreatedAt        time.Time `json:"createdAt"`
+	Age              string    `json:"age"`
+	Status           string    `json:"status"`
+	Active           bool      `json:"active"`
+	RollbackEligible bool      `json:"rollbackEligible"`
 }
 
 // HelmReleaseHistory is a bounded, metadata-only view of a Helm v3 release's
@@ -366,6 +431,55 @@ type AccessReview struct {
 	Denied          bool   `json:"denied"`
 	Reason          string `json:"reason,omitempty"`
 	EvaluationError string `json:"evaluationError,omitempty"`
+}
+
+// EffectiveRBACRequest asks K9k to explain the RBAC objects that directly
+// mention one subject. It is intentionally a static, read-only inspection: it
+// never impersonates the subject or claims to be an authorization decision.
+// BindingNamespace narrows User/Group inspection to one namespace when set.
+type EffectiveRBACRequest struct {
+	SubjectKind      string `json:"subjectKind"`
+	SubjectName      string `json:"subjectName"`
+	SubjectNamespace string `json:"subjectNamespace,omitempty"`
+	BindingNamespace string `json:"bindingNamespace,omitempty"`
+}
+
+// EffectiveRBACAnalysis is a bounded snapshot of direct RoleBinding and
+// ClusterRoleBinding declarations. The API server's authorizer remains the
+// only authority for an actual allow/deny decision (rbac.check).
+type EffectiveRBACAnalysis struct {
+	Subject   EffectiveRBACSubject   `json:"subject"`
+	Bindings  []EffectiveRBACBinding `json:"bindings"`
+	Warnings  []string               `json:"warnings"`
+	Truncated bool                   `json:"truncated"`
+}
+
+type EffectiveRBACSubject struct {
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// EffectiveRBACBinding retains only the fields needed to explain one direct
+// grant. Rules are copies of the referenced Role/ClusterRole rules and do not
+// evaluate external authorizers, admission policy, or group membership.
+type EffectiveRBACBinding struct {
+	Kind         string              `json:"kind"`
+	Name         string              `json:"name"`
+	Namespace    string              `json:"namespace,omitempty"`
+	RoleKind     string              `json:"roleKind"`
+	RoleName     string              `json:"roleName"`
+	Rules        []EffectiveRBACRule `json:"rules"`
+	RoleResolved bool                `json:"roleResolved"`
+	Warning      string              `json:"warning,omitempty"`
+}
+
+type EffectiveRBACRule struct {
+	APIGroups       []string `json:"apiGroups"`
+	Resources       []string `json:"resources"`
+	Verbs           []string `json:"verbs"`
+	ResourceNames   []string `json:"resourceNames"`
+	NonResourceURLs []string `json:"nonResourceURLs"`
 }
 
 // NodeDrainRequest is the deliberately narrow drain contract exposed to the

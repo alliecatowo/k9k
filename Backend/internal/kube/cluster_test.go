@@ -2,8 +2,11 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +15,7 @@ import (
 	authorizationv1 "k8s.io/api/authorization/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -71,6 +75,55 @@ func TestCheckAccessRequiresSelectedContext(t *testing.T) {
 	_, err := (&Cluster{}).CheckAccess(context.Background(), api.AccessCheck{Verb: "get", Resource: "pods"})
 	if err == nil || err.Error() != "no usable Kubernetes context is selected" {
 		t.Errorf("error = %v", err)
+	}
+}
+
+func TestEffectiveRBACResolvesOnlyDirectMatchingBindingsAndRules(t *testing.T) {
+	objects := []runtime.Object{
+		&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: "pod-read", Namespace: "demo"}, Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"list", "get"}}}},
+		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "events-read"}, Rules: []rbacv1.PolicyRule{{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"watch"}}}},
+		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "api-reader", Namespace: "demo"}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "pod-read"}, Subjects: []rbacv1.Subject{{Kind: "ServiceAccount", Name: "api"}}},
+		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "other-namespace", Namespace: "other"}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "pod-read"}, Subjects: []rbacv1.Subject{{Kind: "ServiceAccount", Name: "api", Namespace: "other"}}},
+		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "api-events"}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "events-read"}, Subjects: []rbacv1.Subject{{Kind: "ServiceAccount", Name: "api", Namespace: "demo"}}},
+		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "wrong-subject"}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "events-read"}, Subjects: []rbacv1.Subject{{Kind: "User", Name: "api"}}},
+	}
+	cluster := &Cluster{typed: fake.NewSimpleClientset(objects...)}
+	analysis, err := cluster.EffectiveRBAC(context.Background(), api.EffectiveRBACRequest{SubjectKind: "ServiceAccount", SubjectName: "api", SubjectNamespace: "demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if analysis.Truncated || len(analysis.Bindings) != 2 {
+		t.Fatalf("analysis = %#v", analysis)
+	}
+	if got, want := analysis.Bindings[0].Name, "api-events"; got != want {
+		t.Errorf("first binding = %q, want %q", got, want)
+	}
+	if got, want := analysis.Bindings[1].Name, "api-reader"; got != want {
+		t.Errorf("second binding = %q, want %q", got, want)
+	}
+	for _, binding := range analysis.Bindings {
+		if !binding.RoleResolved || len(binding.Rules) != 1 {
+			t.Errorf("binding = %#v", binding)
+		}
+	}
+	if got := analysis.Bindings[1].Rules[0].Verbs; !reflect.DeepEqual(got, []string{"get", "list"}) {
+		t.Errorf("sorted verbs = %#v", got)
+	}
+}
+
+func TestEffectiveRBACKeepsPartialRoleReadFailuresVisible(t *testing.T) {
+	typed := fake.NewSimpleClientset(&rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "broken"}, RoleRef: rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "unreadable"}, Subjects: []rbacv1.Subject{{Kind: "User", Name: "alice"}},
+	})
+	typed.PrependReactor("get", "clusterroles", func(clientgotesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("forbidden")
+	})
+	analysis, err := (&Cluster{typed: typed}).EffectiveRBAC(context.Background(), api.EffectiveRBACRequest{SubjectKind: "User", SubjectName: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(analysis.Bindings) != 1 || analysis.Bindings[0].RoleResolved || !strings.Contains(analysis.Bindings[0].Warning, "forbidden") {
+		t.Errorf("partial analysis = %#v", analysis)
 	}
 }
 
@@ -197,6 +250,34 @@ func TestRollbackDeploymentRejectsActiveOrStaleReplicaSet(t *testing.T) {
 	}
 }
 
+func TestRolloutHistoryReturnsOnlyBoundedDeploymentOwnedReplicaSets(t *testing.T) {
+	controller := true
+	deployment := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name: "web", Namespace: "demo", UID: types.UID("deployment-uid"), Annotations: map[string]string{"deployment.kubernetes.io/revision": "4"},
+	}}
+	owner := metav1.OwnerReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "web", UID: deployment.UID, Controller: &controller}
+	active := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "web-current", Namespace: "demo", UID: types.UID("rs-current"), Annotations: map[string]string{"deployment.kubernetes.io/revision": "4"}, OwnerReferences: []metav1.OwnerReference{owner}}, Status: appsv1.ReplicaSetStatus{Replicas: 1}}
+	inactive := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "web-old", Namespace: "demo", UID: types.UID("rs-old"), Annotations: map[string]string{"deployment.kubernetes.io/revision": "3"}, OwnerReferences: []metav1.OwnerReference{owner}}, Spec: appsv1.ReplicaSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "nginx"}}}}}}
+	unrelated := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "demo", UID: types.UID("other")}}
+	cluster := &Cluster{typed: fake.NewSimpleClientset(deployment, active, inactive, unrelated)}
+	history, err := cluster.RolloutHistory(context.Background(), api.RolloutHistoryRequest{Group: "apps", Version: "v1", Resource: "deployments", Namespace: "demo", Name: "web", ExpectedUID: "deployment-uid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history.WorkloadName != "web" || history.CurrentRevision != "4" || len(history.Revisions) != 2 {
+		t.Fatalf("history = %#v", history)
+	}
+	if history.Revisions[0].Name != "web-current" || history.Revisions[0].RollbackEligible {
+		t.Errorf("current revision = %#v", history.Revisions[0])
+	}
+	if history.Revisions[1].Name != "web-old" || !history.Revisions[1].RollbackEligible || history.Revisions[1].Active {
+		t.Errorf("inactive revision = %#v", history.Revisions[1])
+	}
+	if _, err := cluster.RolloutHistory(context.Background(), api.RolloutHistoryRequest{Group: "apps", Version: "v1", Resource: "deployments", Namespace: "demo", Name: "web", ExpectedUID: "stale"}); err == nil {
+		t.Fatal("stale workload UID was accepted")
+	}
+}
+
 func TestContextRenameAndDeleteModifyOnlyInactiveContextEntries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config")
 	raw := clientcmdapi.Config{
@@ -270,6 +351,55 @@ func TestCopyContextPreservesReferencesAndChangesOnlyNamespace(t *testing.T) {
 	}
 	if err := cluster.CopyContext("production", "staging", ""); err == nil {
 		t.Fatal("duplicate context name was accepted")
+	}
+}
+
+func TestInspectContextReportsOnlyReferenceNamesAndStructuralDiagnostics(t *testing.T) {
+	raw := clientcmdapi.Config{
+		CurrentContext: "production",
+		Contexts: map[string]*clientcmdapi.Context{
+			"production": {Cluster: "prod-cluster", AuthInfo: "deploy-user", Namespace: "production"},
+			"staging":    {Cluster: "prod-cluster", AuthInfo: "deploy-user", Namespace: "stage"},
+			"broken":     {Cluster: "missing-cluster", AuthInfo: "missing-user", Namespace: "INVALID_NAMESPACE"},
+		},
+		Clusters: map[string]*clientcmdapi.Cluster{
+			"prod-cluster": {Server: "https://kubernetes.production.example", CertificateAuthorityData: []byte("private-ca")},
+		},
+		AuthInfos: map[string]*clientcmdapi.AuthInfo{
+			"deploy-user": {Token: "secret-token", ClientCertificateData: []byte("private-cert")},
+		},
+	}
+	cluster := &Cluster{config: clientcmd.NewDefaultClientConfig(raw, &clientcmd.ConfigOverrides{})}
+
+	inspection, err := cluster.InspectContext("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Context == nil || inspection.Context.Name != "production" || !inspection.Context.Active {
+		t.Errorf("context = %#v", inspection.Context)
+	}
+	if got, want := inspection.Cluster, (api.KubeconfigReference{Name: "prod-cluster", Exists: true, UsedBy: []string{"production", "staging"}}); !reflect.DeepEqual(got, want) {
+		t.Errorf("cluster reference = %#v, want %#v", got, want)
+	}
+	if got, want := inspection.AuthInfo, (api.KubeconfigReference{Name: "deploy-user", Exists: true, UsedBy: []string{"production", "staging"}}); !reflect.DeepEqual(got, want) {
+		t.Errorf("auth reference = %#v, want %#v", got, want)
+	}
+	encoded, err := json.Marshal(inspection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sensitive := range []string{"https://kubernetes.production.example", "private-ca", "secret-token", "private-cert"} {
+		if strings.Contains(string(encoded), sensitive) {
+			t.Errorf("inspection leaked sensitive kubeconfig value %q: %s", sensitive, encoded)
+		}
+	}
+
+	broken, err := cluster.InspectContext("broken")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if broken.Cluster.Exists || broken.AuthInfo.Exists || len(broken.Diagnostics) != 3 {
+		t.Errorf("broken inspection = %#v", broken)
 	}
 }
 

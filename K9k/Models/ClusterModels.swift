@@ -9,6 +9,39 @@ struct KubeContext: Codable, Identifiable, Hashable {
     var id: String { name }
 }
 
+/// A credential-free structural inspection returned by `context.inspect`.
+/// K9k intentionally receives only kubeconfig reference names, their presence,
+/// and context sharing; the helper never serializes endpoints or auth values.
+struct KubeconfigContextInspection: Codable, Hashable {
+    let context: KubeContext?
+    let cluster: KubeconfigReference
+    let authInfo: KubeconfigReference
+    let diagnostics: [KubeconfigDiagnostic]
+
+    var hasErrors: Bool { diagnostics.contains { $0.severity == "error" } }
+}
+
+struct KubeconfigReference: Codable, Hashable {
+    let name: String
+    let exists: Bool
+    let usedBy: [String]
+}
+
+struct KubeconfigDiagnostic: Codable, Hashable, Identifiable {
+    let code: String
+    let severity: String
+    let message: String
+    var id: String { code }
+
+    var symbolName: String {
+        switch severity {
+        case "error": "exclamationmark.triangle.fill"
+        case "warning": "exclamationmark.triangle"
+        default: "info.circle"
+        }
+    }
+}
+
 // K9sConfigSummary is intentionally metadata-only. K9k can use familiar
 // resource aliases without importing executable plugin behaviour.
 struct K9sConfigSummary: Codable, Hashable {
@@ -145,6 +178,33 @@ struct ResourceListPage: Codable, Hashable {
     let resourceVersion: String
     let `continue`: String?
     let remainingItemCount: Int?
+}
+
+/// Bounded, metadata-only workload history. Templates are intentionally not
+/// transferred: a historical Pod template may contain sensitive values and
+/// the direct helper re-verifies any rollback source independently.
+struct RolloutHistory: Codable, Hashable {
+    let workloadKind: String
+    let workloadName: String
+    let namespace: String
+    let currentRevision: String?
+    let updatedRevision: String?
+    let revisions: [RolloutRevision]
+    let truncated: Bool
+}
+
+struct RolloutRevision: Codable, Hashable, Identifiable {
+    let kind: String
+    let name: String
+    let uid: String
+    let revision: String?
+    let createdAt: Date
+    let age: String
+    let status: String
+    let active: Bool
+    let rollbackEligible: Bool
+
+    var id: String { uid.isEmpty ? "\(kind)/\(name)" : uid }
 }
 
 /// A verified existing shell Pod. It is produced only after the backend has
