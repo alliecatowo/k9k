@@ -18,6 +18,7 @@ struct K9kRootView: View {
     @State private var debugPresented = false
     @State private var portForwardListPresented = false
     @State private var resourceSelectorsPresented = false
+    @State private var pluginToRun: K9sPlugin?
 
     var body: some View {
         @Bindable var store = store
@@ -92,6 +93,9 @@ struct K9kRootView: View {
         .sheet(isPresented: $resourceSelectorsPresented) {
             ResourceSelectorsView(isPresented: $resourceSelectorsPresented)
         }
+        .sheet(item: $pluginToRun) { plugin in
+            if let resource = store.resource(for: store.selectedResources.first) { K9sPluginRunnerView(plugin: plugin, resource: resource) }
+        }
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
         } message: { Text(store.errorMessage ?? "") }
@@ -134,6 +138,14 @@ struct K9kRootView: View {
                         Menu("Custom Jump") {
                             ForEach(jumps) { jump in
                                 Button("\(jump.targetGVR)") { Task { await store.performCustomJump(jump, from: resource, type: type) } }
+                            }
+                        }
+                    }
+                    let plugins = store.plugins(for: type)
+                    if !plugins.isEmpty {
+                        Menu("K9s Plugins") {
+                            ForEach(plugins) { plugin in
+                                Button(plugin.name) { pluginToRun = plugin }
                             }
                         }
                     }

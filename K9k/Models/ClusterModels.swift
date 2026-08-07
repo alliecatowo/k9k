@@ -55,6 +55,9 @@ struct K9sPlugin: Codable, Identifiable, Hashable {
     let shortcut: String
     let description: String
     let command: String
+    let args: [String]
+    let background: Bool
+    let confirm: Bool?
     let dangerous: Bool
     var id: String { name }
 }

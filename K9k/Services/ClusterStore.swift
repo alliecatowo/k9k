@@ -257,6 +257,13 @@ final class ClusterStore {
         k9sConfig?.jumps.filter { $0.sourceGVR.lowercased() == type.gvr.lowercased() || $0.sourceGVR.lowercased() == type.resource.lowercased() } ?? []
     }
 
+    func plugins(for type: ResourceType) -> [K9sPlugin] {
+        let aliases = [type.resource, type.kind.lowercased(), type.gvr.lowercased()]
+        return k9sConfig?.plugins.filter { plugin in
+            plugin.scopes.contains("all") || plugin.scopes.contains(where: { aliases.contains($0.lowercased()) })
+        } ?? []
+    }
+
     func performCustomJump(_ jump: K9sJump, from resource: ResourceSummary, type: ResourceType) async {
         guard let target = resourceType(forGVR: jump.targetGVR) else {
             errorMessage = "K9k could not find the custom-jump target \(jump.targetGVR) in this cluster's discovery results."
