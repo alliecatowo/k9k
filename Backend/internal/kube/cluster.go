@@ -927,6 +927,24 @@ func workloadStatus(item *unstructured.Unstructured) string {
 			return "Failed"
 		}
 		return "Running"
+	case "CronJob":
+		if active, found, _ := unstructured.NestedSlice(item.Object, "status", "active"); found && len(active) > 0 {
+			return "Active"
+		}
+		if lastSchedule, _, _ := unstructured.NestedString(item.Object, "status", "lastScheduleTime"); lastSchedule != "" {
+			return "Scheduled"
+		}
+		return "Idle"
+	case "Node":
+		conditions, _, _ := unstructured.NestedSlice(item.Object, "status", "conditions")
+		for _, condition := range conditions {
+			if value, ok := condition.(map[string]any); ok && value["type"] == "Ready" {
+				if value["status"] == "True" {
+					return "Ready"
+				}
+				return "NotReady"
+			}
+		}
 	}
 	return ""
 }
