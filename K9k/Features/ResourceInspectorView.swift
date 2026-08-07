@@ -71,6 +71,7 @@ struct ResourceInspectorView: View {
                 Section("Access") { LabeledContent("Delete") { ProgressView().controlSize(.small) } }
             }
             metrics(resource)
+            rolloutDetails(resource)
             rbacDetails(resource)
             if resource.kind == "Pod", let containers = resource.raw?.objectValue?["spec"]?.objectValue?["containers"]?.arrayValue, !containers.isEmpty {
                 Section("Containers") {
@@ -170,6 +171,55 @@ struct ResourceInspectorView: View {
             default:
                 EmptyView()
             }
+        }
+    }
+
+    @ViewBuilder private func rolloutDetails(_ resource: ResourceSummary) -> some View {
+        if ["Deployment", "StatefulSet", "DaemonSet"].contains(resource.kind),
+           let object = resource.raw?.objectValue,
+           let status = object["status"]?.objectValue {
+        let desired = object["spec"]?.objectValue?["replicas"]?.intValue
+        let ready = status["readyReplicas"]?.intValue ?? 0
+        let updated = status["updatedReplicas"]?.intValue ?? 0
+        let available = status["availableReplicas"]?.intValue ?? 0
+        let unavailable = status["unavailableReplicas"]?.intValue ?? 0
+        let desiredNodes = status["desiredNumberScheduled"]?.intValue ?? 0
+        let daemonSetHealthy = desiredNodes > 0 && (status["numberAvailable"]?.intValue ?? 0) >= desiredNodes && (status["updatedNumberScheduled"]?.intValue ?? 0) >= desiredNodes
+        let replicaWorkloadHealthy = desired != nil && desired == ready && desired == updated && unavailable == 0
+        let isComplete = resource.kind == "DaemonSet" ? daemonSetHealthy : replicaWorkloadHealthy
+        Section("Rollout") {
+            HStack {
+                Label(isComplete ? "Healthy" : "Progressing", systemImage: isComplete ? "checkmark.circle.fill" : "arrow.triangle.2.circlepath.circle.fill")
+                    .foregroundStyle(isComplete ? .green : .orange)
+                    .fontWeight(.medium)
+                Spacer()
+                if let desired { Text("Desired \(desired)").foregroundStyle(.secondary) }
+            }
+            if resource.kind == "DaemonSet" {
+                LabeledContent("Scheduled", value: "\(status["currentNumberScheduled"]?.intValue ?? 0) current · \(status["desiredNumberScheduled"]?.intValue ?? 0) desired")
+                LabeledContent("Updated", value: "\(status["updatedNumberScheduled"]?.intValue ?? 0)")
+                LabeledContent("Available", value: "\(status["numberAvailable"]?.intValue ?? 0)")
+            } else {
+                LabeledContent("Ready", value: "\(ready)")
+                LabeledContent("Updated", value: "\(updated)")
+                LabeledContent("Available", value: "\(available)")
+                if unavailable > 0 { LabeledContent("Unavailable", value: "\(unavailable)") }
+            }
+            if let revision = status["currentRevision"]?.stringValue { LabeledContent("Current revision", value: revision) }
+            if let revision = status["updateRevision"]?.stringValue, revision != status["currentRevision"]?.stringValue { LabeledContent("Update revision", value: revision) }
+            let conditions = status["conditions"]?.arrayValue ?? []
+            ForEach(Array(conditions.enumerated()), id: \.offset) { _, condition in
+                if let value = condition.objectValue,
+                   let type = value["type"]?.stringValue,
+                   let conditionStatus = value["status"]?.stringValue {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(type): \(conditionStatus)").font(.caption).fontWeight(.medium)
+                        if let reason = value["reason"]?.stringValue, !reason.isEmpty { Text(reason).font(.caption).foregroundStyle(.secondary) }
+                        if let message = value["message"]?.stringValue, !message.isEmpty { Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                    }
+                }
+            }
+        }
         }
     }
 
