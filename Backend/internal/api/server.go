@@ -1623,24 +1623,29 @@ func (p *manifestApplyParams) validate() error {
 	p.ExpectedUID = strings.TrimSpace(p.ExpectedUID)
 	p.Kind = strings.TrimSpace(p.Kind)
 	p.Manifest = strings.TrimSpace(p.Manifest)
-	if p.Name == "" || p.Kind == "" {
-		return errors.New("name and kind are required")
-	}
-	if p.Create && p.ExpectedUID != "" {
-		return errors.New("create manifest must not include expectedUID")
-	}
-	if !p.Create && p.ExpectedUID == "" {
-		return errors.New("expectedUID is required when updating an existing manifest")
-	}
-	if p.isNamespaced() && p.Namespace == "" {
-		return errors.New("namespace is required for a namespaced resource")
-	}
 	if p.Manifest == "" {
 		return errors.New("manifest is required")
 	}
 	object, err := parseManifestYAML(p.Manifest)
 	if err != nil {
 		return err
+	}
+	if p.Create {
+		if p.ExpectedUID != "" {
+			return errors.New("create manifest must not include expectedUID")
+		}
+		p.Name = object.GetName()
+		if p.isNamespaced() {
+			p.Namespace = object.GetNamespace()
+		}
+	} else if p.Name == "" || p.ExpectedUID == "" {
+		return errors.New("name and expectedUID are required when updating an existing manifest")
+	}
+	if p.Kind == "" {
+		return errors.New("kind is required")
+	}
+	if p.isNamespaced() && p.Namespace == "" {
+		return errors.New("namespace is required for a namespaced resource")
 	}
 	if object.GetAPIVersion() != p.gvr().GroupVersion().String() || object.GetKind() != p.Kind {
 		return fmt.Errorf("manifest apiVersion and kind must remain %s and %s", p.gvr().GroupVersion().String(), p.Kind)

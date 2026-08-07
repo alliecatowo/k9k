@@ -19,6 +19,7 @@ struct K9kRootView: View {
     @State private var portForwardListPresented = false
     @State private var resourceSelectorsPresented = false
     @State private var pluginToRun: K9sPlugin?
+    @State private var manifestImportPresented = false
 
     var body: some View {
         @Bindable var store = store
@@ -96,6 +97,7 @@ struct K9kRootView: View {
         .sheet(item: $pluginToRun) { plugin in
             if let resource = store.resource(for: store.selectedResources.first) { K9sPluginRunnerView(plugin: plugin, resource: resource) }
         }
+        .sheet(isPresented: $manifestImportPresented) { if let type = store.selectedResourceType { ManifestImportView(type: type) } }
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
         } message: { Text(store.errorMessage ?? "") }
@@ -136,6 +138,8 @@ struct K9kRootView: View {
             }
             Button { resourceSelectorsPresented = true } label: { Label("Filter Resources", systemImage: "line.3.horizontal.decrease.circle") }
                 .help("Filter the current Kubernetes resource list with label or field selectors")
+            Button { manifestImportPresented = true } label: { Label("Import Manifest", systemImage: "square.and.arrow.down") }
+                .disabled(store.selectedResourceType == nil || store.isReadOnly)
             Button { paletteIsPresented = true } label: { Label("Open Command Palette", systemImage: "command") }
                 .keyboardShortcut("k", modifiers: .command)
                 .help("Open Command Palette")

@@ -753,6 +753,15 @@ final class ClusterStore {
         try await submitManifest(type: type, document: document, source: source, confirm: true)
     }
 
+    func importManifest(type: ResourceType, source: String, confirm: Bool) async throws -> ManifestApplyResult {
+        var parameters = type.requestParameters.objectValue ?? [:]
+        parameters["manifest"] = .string(source)
+        parameters["kind"] = .string(type.kind)
+        parameters["create"] = .bool(true)
+        parameters["confirm"] = .bool(confirm)
+        return try decode((try await client.request("manifest.apply", parameters: .object(parameters))).result, as: ManifestApplyResult.self)
+    }
+
     func copySelectedName() {
         guard let resource = resources.first(where: { selectedResources.contains($0.id) }) else { return }
         NSPasteboard.general.clearContents()
