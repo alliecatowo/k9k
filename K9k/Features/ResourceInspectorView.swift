@@ -70,6 +70,16 @@ struct ResourceInspectorView: View {
                 Section("Access") { LabeledContent("Delete") { ProgressView().controlSize(.small) } }
             }
             metrics(resource)
+            if resource.kind == "Pod", let containers = resource.raw?.objectValue?["spec"]?.objectValue?["containers"]?.arrayValue, !containers.isEmpty {
+                Section("Containers") {
+                    ForEach(Array(containers.enumerated()), id: \.offset) { _, container in
+                        if let object = container.objectValue {
+                            LabeledContent(object["name"]?.stringValue ?? "Container", value: object["image"]?.stringValue ?? "—")
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+            }
             if let labels = resource.labels, !labels.isEmpty {
                 Section("Labels") { ForEach(labels.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in LabeledContent(key, value: value).textSelection(.enabled) } }
             }
