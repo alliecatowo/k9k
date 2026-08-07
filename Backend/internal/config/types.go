@@ -68,6 +68,17 @@ type View struct {
 	SortColumn string   `json:"sortColumn"`
 }
 
+// Jump mirrors K9s jumps.yaml. SourceGVR identifies the selected resource;
+// target and selectors are applied by the native browser when the user invokes
+// the configured jump.
+type Jump struct {
+	SourceGVR       string `json:"sourceGVR"`
+	TargetGVR       string `json:"targetGVR"`
+	LabelSelector   string `json:"labelSelector"`
+	FieldSelector   string `json:"fieldSelector"`
+	TargetNamespace string `json:"targetNamespace"`
+}
+
 // HasColumns reports whether the view overrides visible columns.
 func (v View) HasColumns() bool { return len(v.Columns) != 0 }
 

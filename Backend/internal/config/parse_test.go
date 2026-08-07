@@ -157,3 +157,17 @@ func TestParseViewsRequiresColumns(t *testing.T) {
 		t.Fatalf("ParseViews() error = %v, want missing columns error", err)
 	}
 }
+
+func TestParseJumps(t *testing.T) {
+	jumps, err := ParseJumps([]byte("jumps:\n  stable.example.io/v1/widgets:\n    targetGVR: v1/pods\n    labelSelector: app={{.metadata.labels.app}}\n    targetNamespace: all\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := jumps["stable.example.io/v1/widgets"]
+	if got.TargetGVR != "v1/pods" || got.LabelSelector != "app={{.metadata.labels.app}}" || got.TargetNamespace != "all" {
+		t.Errorf("jump = %#v", got)
+	}
+	if _, err := ParseJumps([]byte("jumps:\n  v1/pods: {}\n")); err == nil {
+		t.Fatal("expected missing target error")
+	}
+}

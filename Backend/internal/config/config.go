@@ -44,3 +44,11 @@ func LoadViews(path string) (map[string]View, error) {
 	}
 	return ParseViews(data)
 }
+
+func LoadJumps(path string) (map[string]Jump, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read jumps %q: %w", path, err)
+	}
+	return ParseJumps(data)
+}

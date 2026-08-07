@@ -147,6 +147,35 @@ func ParseViews(data []byte) (map[string]View, error) {
 	return views, nil
 }
 
+// ParseJumps parses K9s' jumps.yaml mapping. Validation intentionally keeps
+// source-target rules useful to a GUI: targetGVR is required, while a jump
+// without selectors simply opens the matching target collection.
+func ParseJumps(data []byte) (map[string]Jump, error) {
+	var input struct {
+		Jumps map[string]struct {
+			TargetGVR       string `yaml:"targetGVR"`
+			LabelSelector   string `yaml:"labelSelector"`
+			FieldSelector   string `yaml:"fieldSelector"`
+			TargetNamespace string `yaml:"targetNamespace"`
+		} `yaml:"jumps"`
+	}
+	if err := yaml.Unmarshal(data, &input); err != nil {
+		return nil, fmt.Errorf("parse jumps: %w", err)
+	}
+	if input.Jumps == nil {
+		return nil, errors.New("parse jumps: jumps is required")
+	}
+	result := make(map[string]Jump, len(input.Jumps))
+	for source, rule := range input.Jumps {
+		source, target := strings.TrimSpace(source), strings.TrimSpace(rule.TargetGVR)
+		if source == "" || target == "" {
+			return nil, fmt.Errorf("parse jump %q: targetGVR is required", source)
+		}
+		result[source] = Jump{SourceGVR: source, TargetGVR: target, LabelSelector: strings.TrimSpace(rule.LabelSelector), FieldSelector: strings.TrimSpace(rule.FieldSelector), TargetNamespace: strings.TrimSpace(rule.TargetNamespace)}
+	}
+	return result, nil
+}
+
 type rawHotkey struct {
 	Shortcut    string `yaml:"shortCut"`
 	Override    bool   `yaml:"override"`

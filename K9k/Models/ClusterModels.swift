@@ -18,6 +18,7 @@ struct K9sConfigSummary: Codable, Hashable {
     let hotkeys: [K9sHotkey]
     let plugins: [K9sPlugin]
     let views: [K9sCustomView]
+    let jumps: [K9sJump]
 }
 
 struct K9sConfigFile: Codable, Hashable {
@@ -63,6 +64,15 @@ struct K9sCustomView: Codable, Identifiable, Hashable {
     let columns: [String]
     let sortColumn: String
     var id: String { key }
+}
+
+struct K9sJump: Codable, Identifiable, Hashable {
+    let sourceGVR: String
+    let targetGVR: String
+    let labelSelector: String
+    let fieldSelector: String
+    let targetNamespace: String
+    var id: String { sourceGVR }
 }
 
 struct ResourceType: Codable, Identifiable, Hashable {

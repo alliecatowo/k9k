@@ -201,6 +201,29 @@ final class ClusterStore {
         await loadResources()
     }
 
+    func customJumps(for type: ResourceType) -> [K9sJump] {
+        k9sConfig?.jumps.filter { $0.sourceGVR.lowercased() == type.gvr.lowercased() || $0.sourceGVR.lowercased() == type.resource.lowercased() } ?? []
+    }
+
+    func performCustomJump(_ jump: K9sJump, from resource: ResourceSummary, type: ResourceType) async {
+        guard let target = resourceType(forGVR: jump.targetGVR) else {
+            errorMessage = "K9k could not find the custom-jump target \(jump.targetGVR) in this cluster's discovery results."
+            return
+        }
+        guard jump.fieldSelector.isEmpty else {
+            errorMessage = "This custom jump uses a field selector, which the selected Kubernetes API resource does not expose through K9k yet."
+            return
+        }
+        let namespace = resolvedJumpValue(jump.targetNamespace, resource: resource)
+        if namespace.lowercased() == "all" { selectedNamespace = "All Namespaces" }
+        else if !namespace.isEmpty, namespaces.contains(namespace) { selectedNamespace = namespace }
+        else if jump.targetNamespace.isEmpty, let sourceNamespace = resource.namespace, namespaces.contains(sourceNamespace) { selectedNamespace = sourceNamespace }
+        labelSelector = resolvedJumpValue(jump.labelSelector, resource: resource)
+        selectedResources.removeAll()
+        selectedResourceType = target
+        await loadResources()
+    }
+
     func loadRelationships(for resource: ResourceSummary?, type: ResourceType?) async {
         guard let resource, let type else { relationshipGraph = nil; return }
         isLoadingRelationships = true
@@ -801,6 +824,24 @@ final class ClusterStore {
     }
 
     private func preferredResource(named name: String) -> ResourceType? { discoveredResources.first { $0.resource == name && $0.group.isEmpty } }
+    private func resourceType(forGVR value: String) -> ResourceType? {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return discoveredResources.first { $0.gvr.lowercased() == normalized || $0.resource.lowercased() == normalized }
+    }
+    private func resolvedJumpValue(_ source: String, resource: ResourceSummary) -> String {
+        var value = source
+        let raw = resource.raw?.objectValue ?? [:]
+        let metadata = raw["metadata"]?.objectValue ?? [:]
+        value = value.replacingOccurrences(of: "{{.metadata.name}}", with: resource.name)
+        value = value.replacingOccurrences(of: "{{.metadata.namespace}}", with: resource.namespace ?? "")
+        for (key, item) in metadata["labels"]?.objectValue ?? [:] {
+            value = value.replacingOccurrences(of: "{{.metadata.labels.\(key)}}", with: item.stringValue ?? "")
+        }
+        for (key, item) in metadata["annotations"]?.objectValue ?? [:] {
+            value = value.replacingOccurrences(of: "{{.metadata.annotations.\(key)}}", with: item.stringValue ?? "")
+        }
+        return value
+    }
     private func operationParameters(type: ResourceType, resource: ResourceSummary, additional: [String: JSONValue] = [:]) -> JSONValue {
         var values = type.requestParameters.objectValue ?? [:]
         values["namespace"] = .string(resource.namespace ?? "")

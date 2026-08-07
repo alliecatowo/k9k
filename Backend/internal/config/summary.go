@@ -15,6 +15,7 @@ const (
 	hotkeysFile = "hotkeys.yaml"
 	pluginsFile = "plugins.yaml"
 	viewsFile   = "views.yaml"
+	jumpsFile   = "jumps.yaml"
 )
 
 type Document struct {
@@ -90,7 +91,7 @@ func document(name, path string, exists bool, data []byte) Document {
 	return Document{Name: name, Path: path, Exists: exists, Content: string(data), SHA256: fmt.Sprintf("%x", sha256.Sum256(data))}
 }
 func validDocument(name string) bool {
-	return name == "aliases" || name == "hotkeys" || name == "plugins" || name == "views"
+	return name == "aliases" || name == "hotkeys" || name == "plugins" || name == "views" || name == "jumps"
 }
 func validateDocument(name string, data []byte) error {
 	var err error
@@ -103,6 +104,8 @@ func validateDocument(name string, data []byte) error {
 		_, err = ParsePlugins(data, "plugins.yaml")
 	case "views":
 		_, err = ParseViews(data)
+	case "jumps":
+		_, err = ParseJumps(data)
 	}
 	return err
 }
@@ -125,6 +128,7 @@ type Summary struct {
 	Hotkeys   []Hotkey              `json:"hotkeys"`
 	Plugins   []Plugin              `json:"plugins"`
 	Views     []View                `json:"views"`
+	Jumps     []Jump                `json:"jumps"`
 }
 
 // DefaultDirectory resolves the K9s configuration directory without reading
@@ -164,8 +168,9 @@ func LoadSummary(directory string) (Summary, error) {
 			"hotkeys": fileStatus(directory, hotkeysFile),
 			"plugins": fileStatus(directory, pluginsFile),
 			"views":   fileStatus(directory, viewsFile),
+			"jumps":   fileStatus(directory, jumpsFile),
 		},
-		Aliases: []Alias{}, Hotkeys: []Hotkey{}, Plugins: []Plugin{}, Views: []View{},
+		Aliases: []Alias{}, Hotkeys: []Hotkey{}, Plugins: []Plugin{}, Views: []View{}, Jumps: []Jump{},
 	}
 
 	if summary.Files["aliases"].Present {
@@ -194,6 +199,13 @@ func LoadSummary(directory string) (Summary, error) {
 			summary.setFileError("views", err)
 		} else {
 			summary.Views = sortedViews(values)
+		}
+	}
+	if summary.Files["jumps"].Present {
+		if values, err := LoadJumps(summary.Files["jumps"].Path); err != nil {
+			summary.setFileError("jumps", err)
+		} else {
+			summary.Jumps = sortedJumps(values)
 		}
 	}
 	return summary, nil
@@ -250,5 +262,14 @@ func sortedViews(values map[string]View) []View {
 		result = append(result, value)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Key < result[j].Key })
+	return result
+}
+
+func sortedJumps(values map[string]Jump) []Jump {
+	result := make([]Jump, 0, len(values))
+	for _, value := range values {
+		result = append(result, value)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].SourceGVR < result[j].SourceGVR })
 	return result
 }

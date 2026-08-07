@@ -122,6 +122,16 @@ struct K9kRootView: View {
                     .disabled(!store.hasSelectedManifest)
                 Button("View Relationships…") { relationshipsPresented = true }
                     .disabled(store.selectedResources.count != 1 || store.selectedResourceType == nil)
+                if let type = store.selectedResourceType, let resource = store.resource(for: store.selectedResources.first) {
+                    let jumps = store.customJumps(for: type)
+                    if !jumps.isEmpty {
+                        Menu("Custom Jump") {
+                            ForEach(jumps) { jump in
+                                Button("\(jump.targetGVR)") { Task { await store.performCustomJump(jump, from: resource, type: type) } }
+                            }
+                        }
+                    }
+                }
                 if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Pod" {
                     Button("View Logs") { logsPresented = true }
                     Button("Port Forward…") { portForwardPresented = true }
@@ -205,6 +215,7 @@ struct SettingsView: View {
                     LabeledContent("Aliases", value: "\(config.aliases.count)")
                     LabeledContent("Hotkeys", value: "\(config.hotkeys.count)")
                     LabeledContent("Custom views", value: "\(config.views.count)")
+                    LabeledContent("Custom jumps", value: "\(config.jumps.count)")
                     LabeledContent("Plugin declarations", value: "\(config.plugins.count)")
                     ForEach(config.files.keys.sorted(), id: \.self) { key in
                         if let file = config.files[key] {
