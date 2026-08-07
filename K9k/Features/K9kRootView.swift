@@ -90,7 +90,10 @@ struct K9kRootView: View {
         .navigationSplitViewStyle(.balanced)
         .inspector(isPresented: $inspectorIsPresented) {
             ResourceInspectorView(resource: store.resource(for: store.selectedResources.first), type: store.selectedResourceType, events: store.events)
-                .inspectorColumnWidth(min: 280, ideal: 340, max: 480)
+                // Inspector Forms include operationally important RBAC reasons,
+                // metrics diagnostics, and resource identities. A narrow
+                // column forces those values into unreadable fragments.
+                .inspectorColumnWidth(min: 360, ideal: 420, max: 560)
         }
     }
 
