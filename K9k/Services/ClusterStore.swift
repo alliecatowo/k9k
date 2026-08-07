@@ -42,6 +42,7 @@ final class ClusterStore {
     var isCheckingScaleAccess = false
     var restartAccess: AccessReview?
     var isCheckingRestartAccess = false
+    var nodePatchAccess: AccessReview?
     var relationshipGraph: RelationshipGraph?
     var isLoadingRelationships = false
     private var deleteAccessGeneration = 0
@@ -213,6 +214,9 @@ final class ClusterStore {
 
     var isSelectedResourceRestartable: Bool { selectedRestartableResource != nil }
 
+    var selectedNodeResource: ResourceSummary? { guard selectedResources.count == 1, let resource = selectedSelectedResource, resource.kind == "Node" else { return nil }; return resource }
+    var canPatchSelectedNode: Bool { !isReadOnly && selectedNodeResource != nil && nodePatchAccess?.allowed == true }
+
     var canOpenExec: Bool {
         !isReadOnly && selectedPodResource != nil && execAccess?.allowed == true
     }
@@ -361,6 +365,22 @@ final class ClusterStore {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func updateNodePatchAccess() async {
+        guard let type = selectedResourceType, let node = selectedNodeResource else { nodePatchAccess = nil; return }
+        do { nodePatchAccess = try decode((try await client.request("rbac.check", parameters: operationParameters(type: type, resource: node, additional: ["verb": .string("patch")]))).result, as: AccessReview.self) }
+        catch { nodePatchAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify node patch permission: \(error.localizedDescription)", evaluationError: nil) }
+    }
+
+    func setSelectedNodeUnschedulable(_ unschedulable: Bool) async {
+        guard let type = selectedResourceType, let node = selectedNodeResource, !isReadOnly else { return }
+        await updateNodePatchAccess()
+        guard canPatchSelectedNode else { errorMessage = nodePatchAccess?.reason ?? "The active Kubernetes identity is not authorized to cordon this node."; return }
+        do {
+            _ = try await client.request("resource.patch", parameters: operationParameters(type: type, resource: node, additional: ["patch": .object(["spec": .object(["unschedulable": .bool(unschedulable)])])]))
+            await loadResources()
+        } catch { errorMessage = error.localizedDescription }
     }
 
     func updateExecAccess() async {

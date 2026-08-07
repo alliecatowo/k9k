@@ -12,6 +12,7 @@ struct K9kRootView: View {
     @State private var terminalPresented = false
     @State private var manifestEditorPresented = false
     @State private var relationshipsPresented = false
+    @State private var nodeCordonConfirmation = false
 
     var body: some View {
         @Bindable var store = store
@@ -40,6 +41,7 @@ struct K9kRootView: View {
                 await store.updateRestartAccess()
                 await store.updateExecAccess()
                 await store.updateManifestAccess()
+                await store.updateNodePatchAccess()
             }
         }
         .confirmationDialog("Delete selected resources?", isPresented: $destructiveConfirmation, titleVisibility: .visible) {
@@ -48,6 +50,9 @@ struct K9kRootView: View {
         .confirmationDialog("Restart selected workload?", isPresented: $restartConfirmation, titleVisibility: .visible) {
             Button("Restart", role: .destructive) { Task { await store.restartSelected() } }
         } message: { Text("K9k updates the Pod template restart timestamp, which rolls this workload's Pods.") }
+        .confirmationDialog("Cordon selected node?", isPresented: $nodeCordonConfirmation, titleVisibility: .visible) {
+            Button("Cordon", role: .destructive) { Task { await store.setSelectedNodeUnschedulable(true) } }
+        } message: { Text("New Pods will not schedule onto this node. Existing Pods are not evicted.") }
         .sheet(isPresented: $paletteIsPresented) { CommandPaletteView(isPresented: $paletteIsPresented) }
         .sheet(isPresented: $logsPresented) {
             if let resource = store.resource(for: store.selectedResources.first) { LogStreamView(resource: resource) }
@@ -116,6 +121,13 @@ struct K9kRootView: View {
                 if store.isSelectedResourceRestartable {
                     Button("Restart…", role: .destructive) { restartConfirmation = true }
                         .disabled(!store.canRestartSelected)
+                }
+                if let node = store.selectedNodeResource {
+                    if node.raw?.objectValue?["spec"]?.objectValue?["unschedulable"]?.boolValue == true {
+                        Button("Uncordon") { Task { await store.setSelectedNodeUnschedulable(false) } }.disabled(!store.canPatchSelectedNode)
+                    } else {
+                        Button("Cordon…", role: .destructive) { nodeCordonConfirmation = true }.disabled(!store.canPatchSelectedNode)
+                    }
                 }
                 Divider()
                 Toggle("Read-only Mode", isOn: Binding(get: { store.isReadOnly }, set: { store.isReadOnly = $0 }))
