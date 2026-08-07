@@ -318,6 +318,39 @@ func (c *Cluster) List(ctx context.Context, gvr schema.GroupVersionResource, nam
 	}
 	return result, nil
 }
+
+func (c *Cluster) ListPage(ctx context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, query api.ResourceListQuery) (api.ResourceListPage, error) {
+	resource, err := c.resource(gvr, namespace, namespaced)
+	if err != nil {
+		return api.ResourceListPage{}, err
+	}
+	list, err := resource.List(ctx, metav1.ListOptions{
+		LabelSelector: query.Selector, FieldSelector: query.FieldSelector,
+		Limit: query.Limit, Continue: query.Continue,
+	})
+	if err != nil {
+		return api.ResourceListPage{}, err
+	}
+	page := api.ResourceListPage{
+		Items: make([]api.ResourceSummary, 0, len(list.Items)), ResourceVersion: list.GetResourceVersion(), Continue: list.GetContinue(),
+		RemainingItemCount: list.GetRemainingItemCount(),
+	}
+	for i := range list.Items {
+		summary := Summarize(&list.Items[i])
+		summary.ResourceVersion = list.Items[i].GetResourceVersion()
+		summary.Raw = nil
+		if len(query.Columns) > 0 {
+			summary.Columns = make(map[string]string, len(query.Columns))
+			for _, path := range query.Columns {
+				if value := projectedValue(list.Items[i].Object, path); value != "" {
+					summary.Columns[path] = value
+				}
+			}
+		}
+		page.Items = append(page.Items, summary)
+	}
+	return page, nil
+}
 func (c *Cluster) Get(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string, namespaced bool) (*unstructured.Unstructured, error) {
 	resource, err := c.resource(gvr, namespace, namespaced)
 	if err != nil {
@@ -325,12 +358,12 @@ func (c *Cluster) Get(ctx context.Context, gvr schema.GroupVersionResource, name
 	}
 	return resource.Get(ctx, name, metav1.GetOptions{})
 }
-func (c *Cluster) Watch(ctx context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector, fieldSelector string) (watch.Interface, error) {
+func (c *Cluster) Watch(ctx context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector, fieldSelector, resourceVersion string) (watch.Interface, error) {
 	resource, err := c.resource(gvr, namespace, namespaced)
 	if err != nil {
 		return nil, err
 	}
-	return resource.Watch(ctx, metav1.ListOptions{LabelSelector: selector, FieldSelector: fieldSelector})
+	return resource.Watch(ctx, metav1.ListOptions{LabelSelector: selector, FieldSelector: fieldSelector, ResourceVersion: resourceVersion, AllowWatchBookmarks: true})
 }
 func (c *Cluster) Delete(ctx context.Context, gvr schema.GroupVersionResource, namespace, name string, namespaced bool) error {
 	resource, err := c.resource(gvr, namespace, namespaced)
@@ -894,7 +927,34 @@ func Summarize(item *unstructured.Unstructured) api.ResourceSummary {
 	if !created.IsZero() {
 		age = humanDuration(created)
 	}
-	return api.ResourceSummary{APIVersion: item.GetAPIVersion(), Kind: item.GetKind(), Namespace: item.GetNamespace(), Name: item.GetName(), UID: string(item.GetUID()), CreatedAt: created, Age: age, Status: status, Labels: item.GetLabels(), Raw: item.Object}
+	return api.ResourceSummary{APIVersion: item.GetAPIVersion(), Kind: item.GetKind(), Namespace: item.GetNamespace(), Name: item.GetName(), UID: string(item.GetUID()), ResourceVersion: item.GetResourceVersion(), CreatedAt: created, Age: age, Status: status, Labels: item.GetLabels(), Raw: item.Object}
+}
+
+func projectedValue(object map[string]any, path string) string {
+	var current any = object
+	for _, component := range strings.Split(path, ".") {
+		values, ok := current.(map[string]any)
+		if !ok {
+			return ""
+		}
+		current = values[component]
+	}
+	switch value := current.(type) {
+	case string:
+		return value
+	case bool:
+		return fmt.Sprintf("%t", value)
+	case int:
+		return fmt.Sprintf("%d", value)
+	case int32:
+		return fmt.Sprintf("%d", value)
+	case int64:
+		return fmt.Sprintf("%d", value)
+	case float64:
+		return fmt.Sprintf("%v", value)
+	default:
+		return ""
+	}
 }
 
 // workloadStatus keeps the high-frequency browser useful for controller

@@ -125,14 +125,26 @@ struct ResourceSummary: Codable, Identifiable, Hashable {
     let namespace: String?
     let name: String
     let uid: String
+    let resourceVersion: String?
     let createdAt: Date
     let age: String
     let status: String
     let labels: [String: String]?
+    let columns: [String: String]?
     let raw: JSONValue?
 
     var id: String { uid.isEmpty ? "\(apiVersion)/\(namespace ?? "")/\(name)" : uid }
     var subtitle: String { namespace?.isEmpty == false ? namespace! : "Cluster-scoped" }
+}
+
+/// Bounded resource-browser snapshot. Its list revision is handed straight to
+/// the watch request so an update cannot disappear between listing and
+/// watching a production-scale resource collection.
+struct ResourceListPage: Codable, Hashable {
+    let items: [ResourceSummary]
+    let resourceVersion: String
+    let `continue`: String?
+    let remainingItemCount: Int?
 }
 
 /// A metadata-only Helm v3 release timeline. K9k derives it from Helm's

@@ -14,17 +14,24 @@ struct ResourceInspectorView: View {
         Group {
             if let resource {
                 VStack(spacing: 0) {
+                    inspectorHeader(resource)
+                    Divider()
                     Picker("Inspector section", selection: $section) { ForEach(InspectorSection.allCases) { Text($0.rawValue).tag($0) } }
                         .pickerStyle(.segmented)
-                        .padding()
+                        .labelsHidden()
+                        .accessibilityLabel("Inspector section")
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
                     Divider()
-                    ScrollView {
-                        switch section {
-                        case .overview: overview(resource)
-                        case .events: eventList
-                        case .raw: rawJSON(resource)
-                        case .metadata: metadata(resource)
-                        }
+                    switch section {
+                    case .overview:
+                        overview(resource)
+                    case .events:
+                        ScrollView { eventList }
+                    case .raw:
+                        rawJSON(resource)
+                    case .metadata:
+                        metadata(resource)
                     }
                 }
                 .navigationTitle(resource.name)
@@ -42,6 +49,28 @@ struct ResourceInspectorView: View {
                 try? await Task.sleep(for: .seconds(5))
             }
         }
+    }
+
+    private func inspectorHeader(_ resource: ResourceSummary) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol(for: resource.kind))
+                .foregroundStyle(.secondary)
+                .frame(width: 22, height: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(resource.name).font(.headline).lineLimit(1)
+                Text(resource.namespace?.isEmpty == false ? "\(resource.kind) · \(resource.namespace!)" : resource.kind)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Text(resource.status)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(statusColor(resource.status))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
     }
 
     @ViewBuilder private var eventList: some View {
@@ -103,7 +132,7 @@ struct ResourceInspectorView: View {
             }
         }
         .formStyle(.grouped)
-        .padding(.bottom)
+        .scrollContentBackground(.hidden)
     }
 
     @ViewBuilder private func metrics(_ resource: ResourceSummary) -> some View {
@@ -274,6 +303,7 @@ struct ResourceInspectorView: View {
             }
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
     }
 
     @ViewBuilder private func rawJSON(_ resource: ResourceSummary) -> some View {
@@ -315,5 +345,24 @@ struct ResourceInspectorView: View {
     private func helmReleaseName(_ resource: ResourceSummary) -> String? {
         if let name = resource.labels?["name"], !name.isEmpty { return name }
         return resource.raw?.objectValue?["metadata"]?.objectValue?["annotations"]?.objectValue?["meta.helm.sh/release-name"]?.stringValue
+    }
+
+    private func statusColor(_ status: String) -> Color {
+        switch status.lowercased() {
+        case "running", "active", "bound", "ready", "healthy": .green
+        case "failed", "error", "unknown", "notready": .red
+        case "pending", "terminating", "progressing": .orange
+        default: .secondary
+        }
+    }
+
+    private func symbol(for kind: String) -> String {
+        switch kind {
+        case "Pod": "shippingbox"
+        case "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "CronJob": "cube.box"
+        case "Service", "Ingress": "point.3.connected.trianglepath.dotted"
+        case "Node": "server.rack"
+        default: "cube"
+        }
     }
 }

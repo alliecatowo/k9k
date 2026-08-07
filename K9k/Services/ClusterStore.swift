@@ -28,6 +28,8 @@ final class ClusterStore {
         }
     }
     var resources: [ResourceSummary] = []
+    var loadedResourceCount = 0
+    var remainingResourceCount: Int?
     var selectedResources = Set<ResourceSummary.ID>()
     var searchText = ""
     var labelSelector = ""
@@ -95,6 +97,8 @@ final class ClusterStore {
     // and watch start carries this generation so a late Pod response can never
     // replace the table after the user has already selected Deployments.
     private var resourceLoadGeneration = 0
+    private var resourceIndexByID: [ResourceSummary.ID: Int] = [:]
+    private let resourcePageLimit = 250
     private var navigationHistory: [ResourceNavigationEntry] = []
     private var navigationHistoryIndex: Int?
     private var isRestoringNavigation = false
@@ -323,14 +327,47 @@ final class ClusterStore {
             params["namespace"] = .string(namespace)
             params["selector"] = .string(labelSelector)
             params["fieldSelector"] = .string(fieldSelector)
-            params["streamID"] = .string(streamID)
-            let list = try decodeArray((try await client.request("resource.list", parameters: .object(params))).result, as: ResourceSummary.self)
+            params["limit"] = .number(Double(resourcePageLimit))
+            params["columns"] = .array(customColumnPaths(for: type).map(JSONValue.string))
+            var continuation: String?
+            var snapshot: [ResourceSummary] = []
+            var snapshotResourceVersion = ""
+            repeat {
+                if let continuation, !continuation.isEmpty { params["continue"] = .string(continuation) }
+                else { params.removeValue(forKey: "continue") }
+                let page = try decode((try await client.request("resource.listPage", parameters: .object(params))).result, as: ResourceListPage.self)
+                guard generation == resourceLoadGeneration, selectedResourceType?.id == type.id else { return }
+                if snapshotResourceVersion.isEmpty { snapshotResourceVersion = page.resourceVersion }
+                snapshot.append(contentsOf: page.items)
+                installResources(snapshot)
+                loadedResourceCount = snapshot.count
+                remainingResourceCount = page.remainingItemCount
+                continuation = page.continue
+            } while continuation?.isEmpty == false
             guard generation == resourceLoadGeneration, selectedResourceType?.id == type.id else { return }
-            resources = list
             watchReconnectAttempts = 0
             activeStreamID = streamID
+            params.removeValue(forKey: "continue")
+            params["streamID"] = .string(streamID)
+            params["resourceVersion"] = .string(snapshotResourceVersion)
+            params["compact"] = .bool(true)
             _ = try? await client.request("resource.watch", parameters: .object(params))
         } catch { errorMessage = error.localizedDescription }
+    }
+
+    private func customColumnPaths(for type: ResourceType) -> [String] {
+        guard let view = k9sConfig?.views.first(where: { $0.key.lowercased() == type.gvr.lowercased() || $0.key.lowercased() == type.resource.lowercased() }) else { return [] }
+        return Array(Set(view.columns.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
+    }
+
+    private func installResources(_ values: [ResourceSummary]) {
+        resources = values
+        resourceIndexByID = Dictionary(uniqueKeysWithValues: values.enumerated().map { ($0.element.id, $0.offset) })
+    }
+
+    func sortResources(using order: [KeyPathComparator<ResourceSummary>]) {
+        resources.sort(using: order)
+        resourceIndexByID = Dictionary(uniqueKeysWithValues: resources.enumerated().map { ($0.element.id, $0.offset) })
     }
 
     func selectResourceType(_ type: ResourceType) async {
@@ -519,6 +556,58 @@ final class ClusterStore {
         }
     }
 
+    /// Opens an object from the bounded Relationships/XRay snapshot in the
+    /// normal resource browser.  Relationship nodes include an API version,
+    /// rather than a guessed alias, so this keeps a Pod → ReplicaSet →
+    /// Deployment investigation on the exact discovered GVR that Kubernetes
+    /// advertised for the active cluster.
+    ///
+    /// The name field selector deliberately makes this a focused list rather
+    /// than a one-off detail request: the destination still has the complete
+    /// browser action surface, live watch, and normal Back/Forward history.
+    @discardableResult
+    func openRelationshipNode(_ node: RelationshipNode) async -> Bool {
+        guard node.resolved else {
+            errorMessage = "\(node.kind)/\(node.name) could not be resolved from this relationship snapshot."
+            return false
+        }
+        guard let type = resourceType(apiVersion: node.apiVersion, kind: node.kind) else {
+            errorMessage = "\(node.apiVersion) \(node.kind) is not available in this cluster's API discovery."
+            return false
+        }
+        guard !type.namespaced || !(node.namespace ?? "").isEmpty else {
+            errorMessage = "K9k cannot open \(node.kind)/\(node.name) because its namespace is unknown."
+            return false
+        }
+
+        // Suppress the didSet history entry until all destination scope is in
+        // place; otherwise Back could restore this GVR with the source
+        // resource's selectors or namespace.
+        isRestoringNavigation = true
+        selectedNamespace = type.namespaced ? (node.namespace ?? "All Namespaces") : "All Namespaces"
+        labelSelector = ""
+        fieldSelector = "metadata.name=\(node.name)"
+        selectorResourceTypeID = type.id
+        selectedResources.removeAll()
+        selectedResourceType = type
+        isRestoringNavigation = false
+        recordNavigation(to: type)
+
+        // Match the normal browser lifecycle so any existing watch is
+        // cancelled and the focused result starts its own watch. The list
+        // generation gate makes a concurrent sidebar action win safely.
+        await loadResources()
+        guard selectedResourceType?.id == type.id else { return false }
+        guard let target = resources.first(where: {
+            $0.name == node.name && (!type.namespaced || $0.namespace == node.namespace)
+        }) else {
+            errorMessage = "\(node.kind)/\(node.name) is no longer available in \(type.namespaced ? (node.namespace ?? "this namespace") : "this cluster")."
+            return false
+        }
+        selectedResources = [target.id]
+        return true
+    }
+
     /// Keeps selection changes lightweight enough for the system inspector's
     /// show/hide animation. Historically every row click started ten-plus
     /// independent access reviews and an event list request, even though the
@@ -541,11 +630,14 @@ final class ClusterStore {
         debugAccess = nil
         manifestAccess = nil
 
-        guard let resource = resource(for: selection) else {
+        guard let initialResource = resource(for: selection) else {
             deleteAccess = nil
             isCheckingDeleteAccess = false
             return
         }
+
+        let resource = await hydrateResourceIfNeeded(initialResource)
+        guard selectedResources.contains(resource.id) else { return }
 
         // These are the only dynamic values present in the default Overview
         // tab. Run them concurrently so inspector presentation is never held
@@ -553,6 +645,24 @@ final class ClusterStore {
         async let deleteReview: Void = updateDeleteAccess()
         async let metrics: Void = loadMetrics(for: resource)
         _ = await (deleteReview, metrics)
+    }
+
+    private func hydrateResourceIfNeeded(_ resource: ResourceSummary) async -> ResourceSummary {
+        guard resource.raw == nil, let type = selectedResourceType else { return resource }
+        do {
+            let raw = try decode((try await client.request("resource.get", parameters: operationParameters(type: type, resource: resource))).result, as: JSONValue.self)
+            guard let index = resourceIndexByID[resource.id], resources.indices.contains(index), resources[index].id == resource.id else { return resource }
+            let hydrated = ResourceSummary(
+                apiVersion: resource.apiVersion, kind: resource.kind, namespace: resource.namespace, name: resource.name, uid: resource.uid,
+                resourceVersion: resource.resourceVersion, createdAt: resource.createdAt, age: resource.age, status: resource.status,
+                labels: resource.labels, columns: resource.columns, raw: raw
+            )
+            resources[index] = hydrated
+            return hydrated
+        } catch {
+            errorMessage = error.localizedDescription
+            return resource
+        }
     }
 
     func deleteSelected() async {
@@ -1390,6 +1500,16 @@ final class ClusterStore {
         let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return discoveredResources.first { $0.gvr.lowercased() == normalized || $0.resource.lowercased() == normalized }
     }
+    private func resourceType(apiVersion: String, kind: String) -> ResourceType? {
+        let components = apiVersion.split(separator: "/", omittingEmptySubsequences: true)
+        guard let version = components.last else { return nil }
+        let group = components.dropLast().joined(separator: "/")
+        return discoveredResources.first {
+            $0.group.caseInsensitiveCompare(group) == .orderedSame &&
+                $0.version.caseInsensitiveCompare(String(version)) == .orderedSame &&
+                $0.kind.caseInsensitiveCompare(kind) == .orderedSame
+        }
+    }
     private func resolvedJumpValue(_ source: String, resource: ResourceSummary) -> String {
         var value = source
         let raw = resource.raw?.objectValue ?? [:]
@@ -1463,9 +1583,19 @@ final class ClusterStore {
         }
         guard event.streamID == activeStreamID, let result = event.result else { return }
         if event.type == "resource.deleted", let summary = try? decode(result, as: ResourceSummary.self) {
-            resources.removeAll { $0.id == summary.id }
+            if let index = resourceIndexByID[summary.id], resources.indices.contains(index) {
+                resources.remove(at: index)
+                resourceIndexByID.removeValue(forKey: summary.id)
+                for offset in index..<resources.count { resourceIndexByID[resources[offset].id] = offset }
+            }
         } else if ["resource.added", "resource.modified"].contains(event.type), let summary = try? decode(result, as: ResourceSummary.self) {
-            if let index = resources.firstIndex(where: { $0.id == summary.id }) { resources[index] = summary } else { resources.append(summary) }
+            if let index = resourceIndexByID[summary.id], resources.indices.contains(index) {
+                resources[index] = summary
+            } else {
+                resourceIndexByID[summary.id] = resources.count
+                resources.append(summary)
+            }
+            if selectedResources.contains(summary.id) { Task { _ = await self.hydrateResourceIfNeeded(summary) } }
         }
     }
 

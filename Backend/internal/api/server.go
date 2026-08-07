@@ -46,8 +46,9 @@ type ClusterClient interface {
 	Namespaces(context.Context) ([]string, error)
 	Discovery(context.Context) ([]ResourceType, error)
 	List(context.Context, schema.GroupVersionResource, string, bool, string, string) ([]ResourceSummary, error)
+	ListPage(context.Context, schema.GroupVersionResource, string, bool, ResourceListQuery) (ResourceListPage, error)
 	Get(context.Context, schema.GroupVersionResource, string, string, bool) (*unstructured.Unstructured, error)
-	Watch(context.Context, schema.GroupVersionResource, string, bool, string, string) (watch.Interface, error)
+	Watch(context.Context, schema.GroupVersionResource, string, bool, string, string, string) (watch.Interface, error)
 	Delete(context.Context, schema.GroupVersionResource, string, string, bool) error
 	Patch(context.Context, schema.GroupVersionResource, string, string, bool, []byte) (*unstructured.Unstructured, error)
 	Manifest(context.Context, schema.GroupVersionResource, string, string, bool) (ManifestDocument, error)
@@ -552,6 +553,16 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, invalidParams(err)
 		}
 		result, listErr := s.cluster.List(ctx, params.gvr(), params.Namespace, params.isNamespaced(), params.Selector, params.FieldSelector)
+		if listErr != nil {
+			return nil, kubeError(listErr)
+		}
+		return result, nil
+	case "resource.listPage":
+		params, err := decodeResourceListPageParams(request.Params)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		result, listErr := s.cluster.ListPage(ctx, params.gvr(), params.Namespace, params.isNamespaced(), params.listQuery())
 		if listErr != nil {
 			return nil, kubeError(listErr)
 		}
@@ -1526,7 +1537,7 @@ func (s *Server) startWatch(ctx context.Context, request protocol.Request) {
 		return
 	}
 
-	watcher, watchErr := s.cluster.Watch(watchContext, params.gvr(), params.Namespace, params.isNamespaced(), params.Selector, params.FieldSelector)
+	watcher, watchErr := s.cluster.Watch(watchContext, params.gvr(), params.Namespace, params.isNamespaced(), params.Selector, params.FieldSelector, params.ResourceVersion)
 	if watchErr != nil {
 		s.unregisterStream(streamID)
 		cancel()
@@ -1541,13 +1552,21 @@ func (s *Server) startWatch(ctx context.Context, request protocol.Request) {
 		defer s.unregisterStream(streamID)
 		defer cancel()
 		defer watcher.Stop()
-		s.write(protocol.Event(streamID, "resource.watch.started", map[string]any{"gvr": params.gvrString(), "namespace": params.Namespace}))
+		s.write(protocol.Event(streamID, "resource.watch.started", map[string]any{"gvr": params.gvrString(), "namespace": params.Namespace, "resourceVersion": params.ResourceVersion}))
 
 		for event := range watcher.ResultChan() {
 			if object, ok := event.Object.(*unstructured.Unstructured); ok {
 				name := watchEventName(event.Type)
 				if name != "" {
-					s.write(protocol.Event(streamID, name, summarize(object)))
+					if params.Compact {
+						s.write(protocol.Event(streamID, name, summarizeProjected(object, params.Columns)))
+					} else {
+						s.write(protocol.Event(streamID, name, summarize(object)))
+					}
+					continue
+				}
+				if event.Type == watch.Bookmark {
+					s.write(protocol.Event(streamID, "resource.watch.bookmark", map[string]any{"resourceVersion": object.GetResourceVersion()}))
 					continue
 				}
 			}
@@ -1643,16 +1662,53 @@ func decodeParams(raw json.RawMessage, destination any) error {
 }
 
 type resourceParams struct {
-	Group         string `json:"group"`
-	Version       string `json:"version"`
-	Resource      string `json:"resource"`
-	GVR           string `json:"gvr"`
-	Namespace     string `json:"namespace"`
-	Namespaced    *bool  `json:"namespaced"`
-	Selector      string `json:"selector"`
-	FieldSelector string `json:"fieldSelector"`
-	Name          string `json:"name"`
-	StreamID      string `json:"streamID"`
+	Group           string   `json:"group"`
+	Version         string   `json:"version"`
+	Resource        string   `json:"resource"`
+	GVR             string   `json:"gvr"`
+	Namespace       string   `json:"namespace"`
+	Namespaced      *bool    `json:"namespaced"`
+	Selector        string   `json:"selector"`
+	FieldSelector   string   `json:"fieldSelector"`
+	Name            string   `json:"name"`
+	StreamID        string   `json:"streamID"`
+	ResourceVersion string   `json:"resourceVersion"`
+	Limit           int64    `json:"limit"`
+	Continue        string   `json:"continue"`
+	Columns         []string `json:"columns"`
+	Compact         bool     `json:"compact"`
+}
+
+const defaultResourcePageLimit int64 = 250
+const maxResourcePageLimit int64 = 500
+
+func decodeResourceListPageParams(raw json.RawMessage) (resourceParams, error) {
+	params, err := decodeResourceParams(raw, false)
+	if err != nil {
+		return params, err
+	}
+	if params.Limit == 0 {
+		params.Limit = defaultResourcePageLimit
+	}
+	if params.Limit < 1 || params.Limit > maxResourcePageLimit {
+		return params, fmt.Errorf("limit must be between 1 and %d", maxResourcePageLimit)
+	}
+	if len(params.Continue) > 4096 {
+		return params, errors.New("continue token is too long")
+	}
+	if len(params.Columns) > 32 {
+		return params, errors.New("at most 32 projected columns are supported")
+	}
+	for _, column := range params.Columns {
+		if err := validateProjectionPath(column); err != nil {
+			return params, err
+		}
+	}
+	return params, nil
+}
+
+func (p resourceParams) listQuery() ResourceListQuery {
+	return ResourceListQuery{Selector: p.Selector, FieldSelector: p.FieldSelector, Limit: p.Limit, Continue: p.Continue, Columns: p.Columns}
 }
 
 func decodeResourceParams(raw json.RawMessage, nameRequired bool) (resourceParams, error) {
@@ -2074,13 +2130,7 @@ func (p *scaleParams) validate() error {
 }
 
 func summarize(item *unstructured.Unstructured) ResourceSummary {
-	status, _, _ := unstructured.NestedString(item.Object, "status", "phase")
-	if status == "" {
-		status, _, _ = unstructured.NestedString(item.Object, "status", "state")
-	}
-	if status == "" {
-		status = "Unknown"
-	}
+	status := summaryStatus(item)
 	created := item.GetCreationTimestamp().Time
 	age := "—"
 	if !created.IsZero() {
@@ -2088,9 +2138,123 @@ func summarize(item *unstructured.Unstructured) ResourceSummary {
 	}
 	return ResourceSummary{
 		APIVersion: item.GetAPIVersion(), Kind: item.GetKind(), Namespace: item.GetNamespace(), Name: item.GetName(),
-		UID: string(item.GetUID()), CreatedAt: created, Age: age, Status: status,
+		UID: string(item.GetUID()), ResourceVersion: item.GetResourceVersion(), CreatedAt: created, Age: age, Status: status,
 		Labels: item.GetLabels(), Raw: item.Object,
 	}
+}
+
+func summarizeProjected(item *unstructured.Unstructured, paths []string) ResourceSummary {
+	summary := summarize(item)
+	summary.Raw = nil
+	if len(paths) == 0 {
+		return summary
+	}
+	summary.Columns = make(map[string]string, len(paths))
+	for _, path := range paths {
+		if value := projectedValue(item.Object, path); value != "" {
+			summary.Columns[path] = value
+		}
+	}
+	return summary
+}
+
+func validateProjectionPath(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" || len(path) > 256 {
+		return errors.New("column path must be between 1 and 256 characters")
+	}
+	components := strings.Split(path, ".")
+	if len(components) > 12 {
+		return errors.New("column path is too deep")
+	}
+	for _, component := range components {
+		if component == "" || len(component) > 128 {
+			return errors.New("column path contains an invalid component")
+		}
+	}
+	return nil
+}
+
+func projectedValue(object map[string]any, path string) string {
+	var current any = object
+	for _, component := range strings.Split(path, ".") {
+		values, ok := current.(map[string]any)
+		if !ok {
+			return ""
+		}
+		current = values[component]
+	}
+	switch value := current.(type) {
+	case string:
+		return value
+	case bool:
+		return fmt.Sprintf("%t", value)
+	case int:
+		return fmt.Sprintf("%d", value)
+	case int32:
+		return fmt.Sprintf("%d", value)
+	case int64:
+		return fmt.Sprintf("%d", value)
+	case float64:
+		return fmt.Sprintf("%v", value)
+	default:
+		return ""
+	}
+}
+
+func summaryStatus(item *unstructured.Unstructured) string {
+	if status, _, _ := unstructured.NestedString(item.Object, "status", "phase"); status != "" {
+		return status
+	}
+	if status, _, _ := unstructured.NestedString(item.Object, "status", "state"); status != "" {
+		return status
+	}
+	desired, _, _ := unstructured.NestedInt64(item.Object, "spec", "replicas")
+	ready, _, _ := unstructured.NestedInt64(item.Object, "status", "readyReplicas")
+	switch item.GetKind() {
+	case "Deployment", "StatefulSet", "ReplicaSet", "ReplicationController":
+		if desired == 0 {
+			return "Scaled to 0"
+		}
+		if ready >= desired {
+			return "Ready"
+		}
+		return "Progressing"
+	case "DaemonSet":
+		desired, _, _ = unstructured.NestedInt64(item.Object, "status", "desiredNumberScheduled")
+		available, _, _ := unstructured.NestedInt64(item.Object, "status", "numberAvailable")
+		if desired > 0 && available >= desired {
+			return "Ready"
+		}
+		return "Progressing"
+	case "Job":
+		if complete, _, _ := unstructured.NestedInt64(item.Object, "status", "succeeded"); complete > 0 {
+			return "Succeeded"
+		}
+		if failed, _, _ := unstructured.NestedInt64(item.Object, "status", "failed"); failed > 0 {
+			return "Failed"
+		}
+		return "Running"
+	case "CronJob":
+		if active, found, _ := unstructured.NestedSlice(item.Object, "status", "active"); found && len(active) > 0 {
+			return "Active"
+		}
+		if lastSchedule, _, _ := unstructured.NestedString(item.Object, "status", "lastScheduleTime"); lastSchedule != "" {
+			return "Scheduled"
+		}
+		return "Idle"
+	case "Node":
+		conditions, _, _ := unstructured.NestedSlice(item.Object, "status", "conditions")
+		for _, condition := range conditions {
+			if value, ok := condition.(map[string]any); ok && value["type"] == "Ready" {
+				if value["status"] == "True" {
+					return "Ready"
+				}
+				return "NotReady"
+			}
+		}
+	}
+	return "Unknown"
 }
 
 func watchEventName(eventType watch.EventType) string {

@@ -27,13 +27,16 @@ struct ResourceBrowserView: View {
                         .width(min: 110, ideal: 150)
                     if let view = customView(for: type) {
                         TableColumn("View") { resource in
-                            Text(view.columns.map { value(for: $0, in: resource.raw) }.filter { !$0.isEmpty }.joined(separator: " · "))
+                            Text(view.columns.map { resource.columns?[$0] ?? value(for: $0, in: resource.raw) }.filter { !$0.isEmpty }.joined(separator: " · "))
                                 .foregroundStyle(.secondary)
                         }
                         .width(min: 160, ideal: 260)
                     }
                 }
-                .onChange(of: sortOrder) { _, newOrder in store.resources.sort(using: newOrder) }
+                .tableStyle(.inset)
+                .alternatingRowBackgrounds(.disabled)
+                .scrollContentBackground(.hidden)
+                .onChange(of: sortOrder) { _, newOrder in store.sortResources(using: newOrder) }
                 .contextMenu(forSelectionType: ResourceSummary.ID.self) { selection in
                     Button("Copy Name") { store.copySelectedName() }
                     Divider()

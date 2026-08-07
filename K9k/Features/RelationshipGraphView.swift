@@ -84,7 +84,19 @@ struct RelationshipGraphView: View {
             }
             Spacer()
             if let relation { Text(relation).font(.caption).padding(.horizontal, 7).padding(.vertical, 3).background(.quaternary, in: Capsule()) }
+            if relation != nil {
+                Button("Open") {
+                    Task {
+                        if await store.openRelationshipNode(node) { dismiss() }
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!node.resolved)
+                .help(node.resolved ? "Open \(node.kind)/\(node.name) in the resource browser" : "This relationship could not be resolved with the active Kubernetes identity")
+            }
         }
+        .accessibilityElement(children: .contain)
         .accessibilityLabel("\(relation ?? "selected") \(node.kind) \(node.name)")
     }
 

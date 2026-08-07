@@ -32,6 +32,7 @@ type fakeCluster struct {
 	namespaces []string
 	discovery  []ResourceType
 	list       []ResourceSummary
+	listPage   ResourceListPage
 	object     *unstructured.Unstructured
 	watcher    *contextWatch
 
@@ -75,12 +76,15 @@ type fakeCluster struct {
 }
 
 type resourceCall struct {
-	gvr           schema.GroupVersionResource
-	namespace     string
-	name          string
-	namespaced    bool
-	selector      string
-	fieldSelector string
+	gvr             schema.GroupVersionResource
+	namespace       string
+	name            string
+	namespaced      bool
+	selector        string
+	fieldSelector   string
+	limit           int64
+	continueToken   string
+	resourceVersion string
 }
 
 type patchCall struct {
@@ -148,6 +152,20 @@ func (f *fakeCluster) List(_ context.Context, gvr schema.GroupVersionResource, n
 	return append([]ResourceSummary(nil), f.list...), f.listErr
 }
 
+func (f *fakeCluster) ListPage(_ context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, query ResourceListQuery) (ResourceListPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lists = append(f.lists, resourceCall{gvr: gvr, namespace: namespace, namespaced: namespaced, selector: query.Selector, fieldSelector: query.FieldSelector, limit: query.Limit, continueToken: query.Continue})
+	page := f.listPage
+	if page.Items == nil {
+		page.Items = append([]ResourceSummary(nil), f.list...)
+	}
+	if page.ResourceVersion == "" {
+		page.ResourceVersion = "fake-resource-version"
+	}
+	return page, f.listErr
+}
+
 func (f *fakeCluster) Get(_ context.Context, gvr schema.GroupVersionResource, namespace, name string, namespaced bool) (*unstructured.Unstructured, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -155,9 +173,9 @@ func (f *fakeCluster) Get(_ context.Context, gvr schema.GroupVersionResource, na
 	return f.object, f.getErr
 }
 
-func (f *fakeCluster) Watch(ctx context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector, fieldSelector string) (watch.Interface, error) {
+func (f *fakeCluster) Watch(ctx context.Context, gvr schema.GroupVersionResource, namespace string, namespaced bool, selector, fieldSelector, resourceVersion string) (watch.Interface, error) {
 	f.mu.Lock()
-	f.watches = append(f.watches, resourceCall{gvr: gvr, namespace: namespace, namespaced: namespaced, selector: selector, fieldSelector: fieldSelector})
+	f.watches = append(f.watches, resourceCall{gvr: gvr, namespace: namespace, namespaced: namespaced, selector: selector, fieldSelector: fieldSelector, resourceVersion: resourceVersion})
 	if f.watchErr != nil {
 		f.mu.Unlock()
 		return nil, f.watchErr
@@ -538,6 +556,33 @@ func TestServerContextAndReadOperations(t *testing.T) {
 	}
 	if len(client.gets) != 1 || client.gets[0].gvr != (schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}) || client.gets[0].name != "api" {
 		t.Errorf("get call = %#v", client.gets)
+	}
+}
+
+func TestServerResourceListPageIsBoundedAndReturnsWatchRevision(t *testing.T) {
+	remaining := int64(73)
+	client := &fakeCluster{listPage: ResourceListPage{
+		Items:           []ResourceSummary{{APIVersion: "apps/v1", Kind: "Deployment", Namespace: "demo", Name: "api", UID: "uid-1", ResourceVersion: "42", Status: "Ready", Columns: map[string]string{"spec.replicas": "3"}}},
+		ResourceVersion: "list-rv-42", Continue: "next-token", RemainingItemCount: &remaining,
+	}}
+	responses := runRequests(t, client,
+		request("page", "resource.listPage", map[string]any{"gvr": "apps/v1/deployments", "namespace": "demo", "limit": 250, "continue": "prior-token", "columns": []string{"spec.replicas"}}),
+		request("too-large", "resource.listPage", map[string]any{"gvr": "apps/v1/deployments", "limit": 501}),
+	)
+	if got := envelopeByID(t, responses, "too-large").Error; got == nil || got.Code != "invalid_params" {
+		t.Errorf("large page limit = %#v", got)
+	}
+	page := decodeResult[ResourceListPage](t, envelopeByID(t, responses, "page").Result)
+	if page.ResourceVersion != "list-rv-42" || page.Continue != "next-token" || page.RemainingItemCount == nil || *page.RemainingItemCount != remaining {
+		t.Errorf("page metadata = %#v", page)
+	}
+	if len(page.Items) != 1 || page.Items[0].Raw != nil || page.Items[0].Columns["spec.replicas"] != "3" {
+		t.Errorf("page items = %#v", page.Items)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.lists) != 1 || client.lists[0].limit != 250 || client.lists[0].continueToken != "prior-token" {
+		t.Errorf("list page call = %#v", client.lists)
 	}
 }
 
@@ -1099,6 +1144,57 @@ func TestServerWatchEmitsEventsAndCancellationClosesStream(t *testing.T) {
 		if value.Type == "resource.watch.closed" && mustObject(t, value.Result)["reason"] != "cancelled" {
 			t.Errorf("close result = %#v", value.Result)
 		}
+	}
+}
+
+func TestServerCompactWatchUsesListResourceVersionAndLeanSummaries(t *testing.T) {
+	client := &fakeCluster{watcher: newContextWatch()}
+	inputReader, inputWriter := io.Pipe()
+	var output lockedBuffer
+	server := NewServer(client, inputReader, &output)
+	done := make(chan error, 1)
+	go func() { done <- server.Run(context.Background()) }()
+
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "watch", Operation: "resource.watch", StreamID: "deployments", Params: json.RawMessage(`{"gvr":"apps/v1/deployments","namespace":"demo","resourceVersion":"list-rv-42","compact":true,"columns":["spec.replicas"]}`)})
+	waitFor(t, &output, func(values []protocol.Envelope) bool { return hasEnvelope(values, "watch", "response") })
+	client.watcher.send(watch.Event{Type: watch.Modified, Object: &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1", "kind": "Deployment", "metadata": map[string]any{"name": "api", "namespace": "demo", "resourceVersion": "43"},
+		"spec": map[string]any{"replicas": int64(3)}, "status": map[string]any{"readyReplicas": int64(3)},
+	}}})
+	waitFor(t, &output, func(values []protocol.Envelope) bool { return hasEnvelope(values, "", "resource.modified") })
+	values := decodeEnvelopes(t, output.String())
+	var updated protocol.Envelope
+	for _, value := range values {
+		if value.Type == "resource.modified" {
+			updated = value
+			break
+		}
+	}
+	if updated.Type == "" {
+		t.Fatalf("resource.modified event missing from %#v", values)
+	}
+	summary := decodeResult[ResourceSummary](t, updated.Result)
+	if summary.Status != "Ready" || summary.Raw != nil || summary.Columns["spec.replicas"] != "3" || summary.ResourceVersion != "43" {
+		t.Errorf("compact summary = %#v", summary)
+	}
+	client.mu.Lock()
+	if len(client.watches) != 1 || client.watches[0].resourceVersion != "list-rv-42" {
+		client.mu.Unlock()
+		t.Errorf("watch call = %#v", client.watches)
+	} else {
+		client.mu.Unlock()
+	}
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "cancel", Operation: "stream.cancel", StreamID: "deployments"})
+	if err := inputWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop")
 	}
 }
 

@@ -44,16 +44,39 @@ func (r ResourceType) MarshalJSON() ([]byte, error) {
 }
 
 type ResourceSummary struct {
-	APIVersion string            `json:"apiVersion"`
-	Kind       string            `json:"kind"`
-	Namespace  string            `json:"namespace,omitempty"`
-	Name       string            `json:"name"`
-	UID        string            `json:"uid"`
-	CreatedAt  time.Time         `json:"createdAt"`
-	Age        string            `json:"age"`
-	Status     string            `json:"status"`
-	Labels     map[string]string `json:"labels,omitempty"`
-	Raw        map[string]any    `json:"raw,omitempty"`
+	APIVersion      string            `json:"apiVersion"`
+	Kind            string            `json:"kind"`
+	Namespace       string            `json:"namespace,omitempty"`
+	Name            string            `json:"name"`
+	UID             string            `json:"uid"`
+	ResourceVersion string            `json:"resourceVersion,omitempty"`
+	CreatedAt       time.Time         `json:"createdAt"`
+	Age             string            `json:"age"`
+	Status          string            `json:"status"`
+	Labels          map[string]string `json:"labels,omitempty"`
+	Columns         map[string]string `json:"columns,omitempty"`
+	Raw             map[string]any    `json:"raw,omitempty"`
+}
+
+// ResourceListQuery is the bounded, continuation-aware read shape used by
+// resource.listPage. It deliberately keeps the browser projection separate
+// from a selected object's full raw representation.
+type ResourceListQuery struct {
+	Selector      string
+	FieldSelector string
+	Limit         int64
+	Continue      string
+	Columns       []string
+}
+
+// ResourceListPage is an additive v1 protocol response. ResourceVersion is
+// the exact list snapshot revision callers must pass into resource.watch to
+// avoid the list-to-watch event-loss window.
+type ResourceListPage struct {
+	Items              []ResourceSummary `json:"items"`
+	ResourceVersion    string            `json:"resourceVersion"`
+	Continue           string            `json:"continue,omitempty"`
+	RemainingItemCount *int64            `json:"remainingItemCount,omitempty"`
 }
 
 // HelmReleaseHistory is a bounded, metadata-only view of a Helm v3 release's

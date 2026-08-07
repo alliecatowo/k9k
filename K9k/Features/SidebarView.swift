@@ -10,6 +10,9 @@ struct SidebarView: View {
             Section("Cluster") {
                 Label(store.selectedContext?.name ?? "Connecting…", systemImage: "server.rack")
                     .font(.headline)
+                Label(store.isReadOnly ? "Read-only" : "Connected", systemImage: store.isReadOnly ? "lock.fill" : "checkmark.shield")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 resourceRows(["pods", "nodes", "namespaces", "events"])
             }
             Section("Workloads") {
@@ -36,17 +39,6 @@ struct SidebarView: View {
         }
         .listStyle(.sidebar)
         .navigationTitle("K9k")
-        .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 6) {
-                Image(systemName: store.isReadOnly ? "lock.fill" : "checkmark.shield")
-                Text(store.isReadOnly ? "Read-only" : "Connected")
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-        }
     }
 
     /// Sidebar selection is routed through the store rather than assigning the
