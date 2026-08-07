@@ -16,6 +16,7 @@ struct K9kRootView: View {
     @State private var nodeCordonConfirmation = false
     @State private var nodeDrainPresented = false
     @State private var debugPresented = false
+    @State private var portForwardListPresented = false
 
     var body: some View {
         @Bindable var store = store
@@ -66,6 +67,7 @@ struct K9kRootView: View {
         .sheet(isPresented: $portForwardPresented) {
             if let resource = store.resource(for: store.selectedResources.first) { PortForwardView(resource: resource, isPresented: $portForwardPresented) }
         }
+        .sheet(isPresented: $portForwardListPresented) { PortForwardListView(isPresented: $portForwardListPresented) }
         .sheet(isPresented: $scalePresented) { ScaleWorkloadView(isPresented: $scalePresented) }
         .sheet(isPresented: $terminalPresented) {
             if let resource = store.resource(for: store.selectedResources.first) { TerminalSessionView(resource: resource, initialMode: terminalMode) }
@@ -148,6 +150,7 @@ struct K9kRootView: View {
                         .disabled(!store.canDrainSelectedNode || node.raw?.objectValue?["spec"]?.objectValue?["unschedulable"]?.boolValue != true)
                 }
                 Divider()
+                Button("Active Port Forwards…") { portForwardListPresented = true }
                 Toggle("Read-only Mode", isOn: Binding(get: { store.isReadOnly }, set: { store.isReadOnly = $0 }))
                 Button("Delete…", role: .destructive) { destructiveConfirmation = true }
                     .disabled(!store.canDeleteSelected)

@@ -191,6 +191,12 @@ struct PortForwardBinding: Codable, Hashable {
     var endpoint: String { "\(localAddress):\(localPort) → \(pod):\(remotePort)" }
 }
 
+struct ActivePortForward: Identifiable, Hashable {
+    let streamID: String
+    let binding: PortForwardBinding
+    var id: String { streamID }
+}
+
 struct MetricsListResponse: Codable, Hashable {
     let apiVersion: String
     let resource: String

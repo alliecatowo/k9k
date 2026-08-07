@@ -26,8 +26,7 @@ final class ClusterStore {
     var events: [ClusterEvent] = []
     var logLines: [String] = []
     var activeLogStreamID: String?
-    var activePortForward: PortForwardBinding?
-    var activePortForwardStreamID: String?
+    var activePortForwards: [ActivePortForward] = []
     var activeExecStreamID: String?
     var execAccess: AccessReview?
     var attachAccess: AccessReview?
@@ -725,7 +724,6 @@ final class ClusterStore {
             errorMessage = "Ports must be between 1 and 65535 (or use 0 for an automatic local port)."
             return
         }
-        await closePortForward()
         let streamID = UUID().uuidString
         do {
             let result = try await client.request("portforward.open", parameters: .object([
@@ -736,19 +734,17 @@ final class ClusterStore {
                 "localPort": .number(Double(localPort)),
                 "localAddress": .string("127.0.0.1")
             ]))
-            activePortForward = try decode(result.result, as: PortForwardBinding.self)
-            activePortForwardStreamID = streamID
+            let binding = try decode(result.result, as: PortForwardBinding.self)
+            activePortForwards.removeAll { $0.streamID == streamID }
+            activePortForwards.append(ActivePortForward(streamID: streamID, binding: binding))
         } catch {
-            activePortForward = nil
-            activePortForwardStreamID = nil
             errorMessage = error.localizedDescription
         }
     }
 
-    func closePortForward() async {
-        if let activePortForwardStreamID { await client.cancel(streamID: activePortForwardStreamID) }
-        activePortForward = nil
-        activePortForwardStreamID = nil
+    func closePortForward(streamID: String) async {
+        await client.cancel(streamID: streamID)
+        activePortForwards.removeAll { $0.streamID == streamID }
     }
 
     func resource(for id: ResourceSummary.ID?) -> ResourceSummary? { guard let id else { return nil }; return resources.first(where: { $0.id == id }) }
@@ -843,9 +839,8 @@ final class ClusterStore {
             if logLines.count > 10_000 { logLines.removeFirst(logLines.count - 10_000) }
             return
         }
-        if event.streamID == activePortForwardStreamID, event.type == "portforward.closed" {
-            activePortForward = nil
-            activePortForwardStreamID = nil
+        if event.type == "portforward.closed", let streamID = event.streamID {
+            activePortForwards.removeAll { $0.streamID == streamID }
             return
         }
         if event.streamID == activeStreamID, event.type == "resource.watch.closed" {

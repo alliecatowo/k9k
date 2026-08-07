@@ -16,11 +16,11 @@ struct PortForwardView: View {
             Text("\(resource.name) · \(resource.namespace ?? "default")")
                 .foregroundStyle(.secondary)
 
-            if let binding = store.activePortForward {
+            if let forward = store.activePortForwards.last(where: { $0.binding.namespace == resource.namespace && $0.binding.pod == resource.name }) {
                 GroupBox("Active loopback tunnel") {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(binding.endpoint).font(.system(.body, design: .monospaced))
-                        Text("Available only on this Mac. Close this sheet to stop it.")
+                        Text(forward.binding.endpoint).font(.system(.body, design: .monospaced))
+                        Text("Available only on this Mac. It remains active after this sheet closes.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -29,14 +29,14 @@ struct PortForwardView: View {
                 HStack {
                     Button("Copy Endpoint") {
                         NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString("http://\(binding.localAddress):\(binding.localPort)", forType: .string)
+                        NSPasteboard.general.setString("http://\(forward.binding.localAddress):\(forward.binding.localPort)", forType: .string)
                     }
                     Button("Open in Browser") {
-                        NSWorkspace.shared.open(URL(string: "http://\(binding.localAddress):\(binding.localPort)")!)
+                        NSWorkspace.shared.open(URL(string: "http://\(forward.binding.localAddress):\(forward.binding.localPort)")!)
                     }
                     Spacer()
                     Button("Stop Forward", role: .destructive) {
-                        Task { await store.closePortForward() }
+                        Task { await store.closePortForward(streamID: forward.streamID) }
                     }
                     Button("Done") { isPresented = false }
                         .keyboardShortcut(.defaultAction)
@@ -59,7 +59,6 @@ struct PortForwardView: View {
         }
         .padding(24)
         .frame(width: 460)
-        .onDisappear { Task { await store.closePortForward() } }
     }
 
     private func start() {
