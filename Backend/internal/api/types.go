@@ -10,11 +10,11 @@ type Context struct {
 }
 
 type ResourceType struct {
-	Group      string `json:"group"`
-	Version    string `json:"version"`
-	Resource   string `json:"resource"`
-	Kind       string `json:"kind"`
-	Namespaced bool   `json:"namespaced"`
+	Group      string   `json:"group"`
+	Version    string   `json:"version"`
+	Resource   string   `json:"resource"`
+	Kind       string   `json:"kind"`
+	Namespaced bool     `json:"namespaced"`
 	ShortNames []string `json:"shortNames"`
 }
 
@@ -31,3 +31,15 @@ type ResourceSummary struct {
 	Raw        map[string]any    `json:"raw,omitempty"`
 }
 
+// ClusterEvent is a normalized Kubernetes Event, retaining the fields users
+// need for diagnosis without exposing Swift to core/v1 API details.
+type ClusterEvent struct {
+	Namespace string    `json:"namespace"`
+	Type      string    `json:"type"`
+	Reason    string    `json:"reason"`
+	Message   string    `json:"message"`
+	Count     int32     `json:"count"`
+	FirstSeen time.Time `json:"firstSeen"`
+	LastSeen  time.Time `json:"lastSeen"`
+	Source    string    `json:"source,omitempty"`
+}

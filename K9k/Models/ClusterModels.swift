@@ -39,6 +39,18 @@ struct ResourceSummary: Codable, Identifiable, Hashable {
     var subtitle: String { namespace?.isEmpty == false ? namespace! : "Cluster-scoped" }
 }
 
+struct ClusterEvent: Codable, Identifiable, Hashable {
+    let namespace: String
+    let type: String
+    let reason: String
+    let message: String
+    let count: Int
+    let firstSeen: Date
+    let lastSeen: Date
+    let source: String?
+    var id: String { "\(namespace)/\(reason)/\(message)/\(lastSeen.timeIntervalSince1970)" }
+}
+
 enum JSONValue: Codable, Hashable {
     case string(String), number(Double), bool(Bool), object([String: JSONValue]), array([JSONValue]), null
 

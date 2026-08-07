@@ -20,6 +20,10 @@ final class ClusterStore {
     var isReadOnly = false
     var activeStreamID: String?
 
+    var events: [ClusterEvent] = []
+    var logLines: [String] = []
+    var activeLogStreamID: String?
+
     private let client = CoreClient()
 
     init() {
@@ -114,6 +118,31 @@ final class ClusterStore {
         NSPasteboard.general.setString(resource.name, forType: .string)
     }
 
+    func loadEvents(for resource: ResourceSummary?) async {
+        guard let resource, let namespace = resource.namespace, !namespace.isEmpty else { events = []; return }
+        do {
+            events = try decodeArray((try await client.request("resource.events", parameters: .object(["namespace": .string(namespace), "uid": .string(resource.uid)]))).result, as: ClusterEvent.self)
+        } catch { events = [] }
+    }
+
+    func openLogs(for resource: ResourceSummary) async {
+        guard resource.kind == "Pod", let namespace = resource.namespace else { return }
+        if let activeLogStreamID { await client.cancel(streamID: activeLogStreamID) }
+        let streamID = UUID().uuidString
+        logLines = []
+        activeLogStreamID = streamID
+        do {
+            _ = try await client.request("logs.open", parameters: .object([
+                "streamID": .string(streamID), "namespace": .string(namespace), "pod": .string(resource.name), "follow": .bool(true), "timestamps": .bool(true), "tailLines": .number(500)
+            ]))
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func closeLogs() async {
+        if let activeLogStreamID { await client.cancel(streamID: activeLogStreamID) }
+        activeLogStreamID = nil
+    }
+
     func resource(for id: ResourceSummary.ID?) -> ResourceSummary? { guard let id else { return nil }; return resources.first(where: { $0.id == id }) }
 
     private func preferredResource(named name: String) -> ResourceType? { discoveredResources.first { $0.resource == name && $0.group.isEmpty } }
@@ -126,6 +155,11 @@ final class ClusterStore {
     }
 
     private func apply(event: CoreEnvelope) {
+        if event.streamID == activeLogStreamID, event.type == "logs.data", let line = event.result?.objectValue?["line"]?.stringValue {
+            logLines.append(line)
+            if logLines.count > 10_000 { logLines.removeFirst(logLines.count - 10_000) }
+            return
+        }
         guard event.streamID == activeStreamID, let result = event.result else { return }
         if event.type == "resource.deleted", let summary = try? decode(result, as: ResourceSummary.self) {
             resources.removeAll { $0.id == summary.id }

@@ -6,6 +6,7 @@ struct K9kRootView: View {
     @State private var inspectorIsPresented = true
     @State private var paletteIsPresented = false
     @State private var destructiveConfirmation = false
+    @State private var logsPresented = false
 
     var body: some View {
         @Bindable var store = store
@@ -18,17 +19,21 @@ struct K9kRootView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .inspector(isPresented: $inspectorIsPresented) {
-            ResourceInspectorView(resource: store.resource(for: store.selectedResources.first), type: store.selectedResourceType)
+            ResourceInspectorView(resource: store.resource(for: store.selectedResources.first), type: store.selectedResourceType, events: store.events)
                 .inspectorColumnWidth(min: 280, ideal: 340, max: 480)
         }
         .toolbar { toolbar }
         .task { await store.connect() }
         .onChange(of: store.selectedResourceType) { _, newValue in if let newValue { Task { await store.selectResourceType(newValue) } } }
         .onChange(of: store.selectedNamespace) { _, _ in Task { await store.loadResources() } }
+        .onChange(of: store.selectedResources) { _, selection in Task { await store.loadEvents(for: store.resource(for: selection.first)) } }
         .confirmationDialog("Delete selected resources?", isPresented: $destructiveConfirmation, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { Task { await store.deleteSelected() } }
         } message: { Text("This changes resources in \(store.selectedContext?.name ?? "the active context").") }
         .sheet(isPresented: $paletteIsPresented) { CommandPaletteView(isPresented: $paletteIsPresented) }
+        .sheet(isPresented: $logsPresented) {
+            if let resource = store.resource(for: store.selectedResources.first) { LogStreamView(resource: resource) }
+        }
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
         } message: { Text(store.errorMessage ?? "") }
@@ -59,6 +64,9 @@ struct K9kRootView: View {
                 .help("Show or hide inspector")
             Menu {
                 Button("Copy Name", action: store.copySelectedName).disabled(store.selectedResources.isEmpty)
+                if let resource = store.resource(for: store.selectedResources.first), resource.kind == "Pod" {
+                    Button("View Logs") { logsPresented = true }
+                }
                 Divider()
                 Toggle("Read-only Mode", isOn: Binding(get: { store.isReadOnly }, set: { store.isReadOnly = $0 }))
                 Button("Delete…", role: .destructive) { destructiveConfirmation = true }

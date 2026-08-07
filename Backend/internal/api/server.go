@@ -32,6 +32,8 @@ type ClusterClient interface {
 	Watch(context.Context, schema.GroupVersionResource, string, bool, string) (watch.Interface, error)
 	Delete(context.Context, schema.GroupVersionResource, string, string, bool) error
 	Patch(context.Context, schema.GroupVersionResource, string, string, bool, []byte) (*unstructured.Unstructured, error)
+	PodLogs(context.Context, string, string, string, bool, bool, bool, int64) (io.ReadCloser, error)
+	Events(context.Context, string, string) ([]ClusterEvent, error)
 }
 
 // Server dispatches K9k's newline-delimited JSON protocol. Concurrent request
@@ -128,6 +130,10 @@ func (s *Server) dispatch(ctx context.Context, request protocol.Request) {
 		s.startWatch(ctx, request)
 		return
 	}
+	if request.Operation == "logs.open" {
+		s.startLogs(ctx, request)
+		return
+	}
 
 	result, opErr := s.handle(ctx, request)
 	if opErr != nil {
@@ -204,6 +210,22 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(getErr)
 		}
 		return result.Object, nil
+	case "resource.events":
+		var params struct {
+			Namespace string `json:"namespace"`
+			UID       string `json:"uid"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		if params.Namespace == "" {
+			return nil, invalidParams(errors.New("namespace is required for event lookup"))
+		}
+		result, eventsErr := s.cluster.Events(ctx, params.Namespace, params.UID)
+		if eventsErr != nil {
+			return nil, kubeError(eventsErr)
+		}
+		return result, nil
 	case "resource.patch":
 		var params patchParams
 		if err := decodeParams(request.Params, &params); err != nil {
@@ -226,10 +248,14 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, invalidParams(err)
 		}
 		if err := params.validateResource(); err != nil || params.Name == "" || (params.isNamespaced() && params.Namespace == "") {
-			if err != nil { return nil, invalidParams(err) }
+			if err != nil {
+				return nil, invalidParams(err)
+			}
 			return nil, invalidParams(errors.New("name and namespaced resource namespace are required"))
 		}
-		if !params.Confirm { return nil, &operationError{code: "confirmation_required", err: errors.New("resource deletion requires confirm: true")} }
+		if !params.Confirm {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("resource deletion requires confirm: true")}
+		}
 		if deleteErr := s.cluster.Delete(ctx, params.gvr(), params.Namespace, params.Name, params.isNamespaced()); deleteErr != nil {
 			return nil, kubeError(deleteErr)
 		}
@@ -266,6 +292,84 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 	default:
 		return nil, &operationError{code: "unknown_operation", err: fmt.Errorf("unknown operation %q", request.Operation)}
 	}
+}
+
+type logParams struct {
+	StreamID   string `json:"streamID"`
+	Namespace  string `json:"namespace"`
+	Pod        string `json:"pod"`
+	Container  string `json:"container"`
+	Previous   bool   `json:"previous"`
+	Follow     bool   `json:"follow"`
+	Timestamps bool   `json:"timestamps"`
+	TailLines  int64  `json:"tailLines"`
+}
+
+func (p logParams) validate() error {
+	if p.Namespace == "" || p.Pod == "" {
+		return errors.New("namespace and pod are required")
+	}
+	if p.TailLines < 0 {
+		return errors.New("tailLines cannot be negative")
+	}
+	return nil
+}
+
+// startLogs keeps log backpressure outside Swift and couples the stream to a
+// cancellable protocol ID. The frontend can always discard old lines locally.
+func (s *Server) startLogs(ctx context.Context, request protocol.Request) {
+	var params logParams
+	if err := decodeParams(request.Params, &params); err != nil {
+		s.writeFailure(request.ID, "invalid_params", err, nil)
+		return
+	}
+	if err := params.validate(); err != nil {
+		s.writeFailure(request.ID, "invalid_params", err, nil)
+		return
+	}
+	streamID := request.StreamID
+	if streamID == "" {
+		streamID = params.StreamID
+	}
+	if streamID == "" {
+		s.writeFailure(request.ID, "invalid_params", errors.New("streamID is required"), nil)
+		return
+	}
+	streamContext, cancel := context.WithCancel(ctx)
+	if !s.registerStream(streamID, cancel) {
+		cancel()
+		s.writeFailure(request.ID, "stream_exists", fmt.Errorf("stream %q already exists", streamID), nil)
+		return
+	}
+	stream, err := s.cluster.PodLogs(streamContext, params.Namespace, params.Pod, params.Container, params.Previous, params.Follow, params.Timestamps, params.TailLines)
+	if err != nil {
+		s.unregisterStream(streamID)
+		cancel()
+		s.writeFailure(request.ID, "kubernetes_error", err, nil)
+		return
+	}
+	s.write(protocol.Response(request.ID, map[string]any{"streamID": streamID, "status": "started"}))
+	s.work.Add(1)
+	go func() {
+		defer s.work.Done()
+		defer s.unregisterStream(streamID)
+		defer cancel()
+		defer stream.Close()
+		scanner := bufio.NewScanner(stream)
+		scanner.Buffer(make([]byte, 64*1024), maxRequestBytes)
+		for scanner.Scan() {
+			s.write(protocol.Event(streamID, "logs.data", map[string]any{"line": scanner.Text()}))
+		}
+		reason := "completed"
+		if streamContext.Err() != nil {
+			reason = "cancelled"
+		}
+		if err := scanner.Err(); err != nil && streamContext.Err() == nil {
+			s.write(protocol.Event(streamID, "logs.error", map[string]any{"message": err.Error()}))
+			reason = "error"
+		}
+		s.write(protocol.Event(streamID, "logs.closed", map[string]any{"reason": reason}))
+	}()
 }
 
 func (s *Server) startWatch(ctx context.Context, request protocol.Request) {

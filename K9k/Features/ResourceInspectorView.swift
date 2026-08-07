@@ -3,9 +3,10 @@ import SwiftUI
 struct ResourceInspectorView: View {
     let resource: ResourceSummary?
     let type: ResourceType?
+    let events: [ClusterEvent]
     @State private var section: InspectorSection = .overview
 
-    enum InspectorSection: String, CaseIterable, Identifiable { case overview = "Overview", yaml = "YAML", metadata = "Metadata"; var id: String { rawValue } }
+    enum InspectorSection: String, CaseIterable, Identifiable { case overview = "Overview", events = "Events", yaml = "YAML", metadata = "Metadata"; var id: String { rawValue } }
 
     var body: some View {
         if let resource {
@@ -17,6 +18,7 @@ struct ResourceInspectorView: View {
                 ScrollView {
                     switch section {
                     case .overview: overview(resource)
+                    case .events: eventList
                     case .yaml: yaml(resource)
                     case .metadata: metadata(resource)
                     }
@@ -25,6 +27,25 @@ struct ResourceInspectorView: View {
             .navigationTitle(resource.name)
         } else {
             ContentUnavailableView("No Selection", systemImage: "sidebar.right", description: Text("Select a \(type?.kind ?? "resource") to inspect its status, metadata, and raw Kubernetes object."))
+        }
+    }
+
+    @ViewBuilder private var eventList: some View {
+        if events.isEmpty {
+            ContentUnavailableView("No Events", systemImage: "bell.slash", description: Text("There are no Kubernetes events for this resource."))
+                .padding(.top, 48)
+        } else {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(events) { event in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack { Text(event.type).font(.caption).fontWeight(.semibold).foregroundStyle(event.type == "Warning" ? .orange : .secondary); Text(event.reason).fontWeight(.medium); Spacer(); Text(event.lastSeen.formatted(date: .omitted, time: .shortened)).font(.caption).foregroundStyle(.secondary) }
+                        Text(event.message).font(.callout).textSelection(.enabled)
+                        if event.count > 1 { Text("Count: \(event.count)").font(.caption).foregroundStyle(.secondary) }
+                    }
+                    .padding()
+                    Divider()
+                }
+            }
         }
     }
 
