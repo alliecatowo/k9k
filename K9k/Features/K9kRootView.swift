@@ -28,6 +28,7 @@ struct K9kRootView: View {
     @State private var pulsePresented = false
     @State private var accessCheckPresented = false
     @State private var navigationHelpPresented = false
+    @State private var hostSSHPresented = false
 
     var body: some View {
         @Bindable var store = store
@@ -66,7 +67,8 @@ struct K9kRootView: View {
             pulsePresented: $pulsePresented,
             accessCheckPresented: $accessCheckPresented,
             navigationHelpPresented: $navigationHelpPresented,
-            imageScanPresented: $imageScanPresented
+            imageScanPresented: $imageScanPresented,
+            hostSSHPresented: $hostSSHPresented
         ))
         .sheet(isPresented: $podFileTransferPresented) {
             if let resource = store.resource(for: store.selectedResources.first) {
@@ -105,7 +107,7 @@ struct K9kRootView: View {
         paletteIsPresented: Binding<Bool>, logsPresented: Binding<Bool>, portForwardPresented: Binding<Bool>, portForwardListPresented: Binding<Bool>,
         scalePresented: Binding<Bool>, terminalPresented: Binding<Bool>, terminalMode: Binding<PodTerminalMode>, manifestEditorPresented: Binding<Bool>,
         relationshipsPresented: Binding<Bool>, nodeDrainPresented: Binding<Bool>, nodeShellPresented: Binding<Bool>, debugPresented: Binding<Bool>, resourceSelectorsPresented: Binding<Bool>,
-        pluginToRun: Binding<K9sPlugin?>, manifestImportPresented: Binding<Bool>, pulsePresented: Binding<Bool>, accessCheckPresented: Binding<Bool>, navigationHelpPresented: Binding<Bool>, imageScanPresented: Binding<Bool>
+        pluginToRun: Binding<K9sPlugin?>, manifestImportPresented: Binding<Bool>, pulsePresented: Binding<Bool>, accessCheckPresented: Binding<Bool>, navigationHelpPresented: Binding<Bool>, imageScanPresented: Binding<Bool>, hostSSHPresented: Binding<Bool>
     ) -> some ViewModifier {
         RootPresentations(
             destructiveConfirmation: destructiveConfirmation, restartConfirmation: restartConfirmation, rollbackConfirmation: rollbackConfirmation, cronJobTriggerConfirmation: cronJobTriggerConfirmation,
@@ -114,7 +116,7 @@ struct K9kRootView: View {
             terminalPresented: terminalPresented, terminalMode: terminalMode, manifestEditorPresented: manifestEditorPresented,
             relationshipsPresented: relationshipsPresented, nodeDrainPresented: nodeDrainPresented, nodeShellPresented: nodeShellPresented, debugPresented: debugPresented,
             resourceSelectorsPresented: resourceSelectorsPresented, pluginToRun: pluginToRun, manifestImportPresented: manifestImportPresented, pulsePresented: pulsePresented,
-            accessCheckPresented: accessCheckPresented, navigationHelpPresented: navigationHelpPresented, imageScanPresented: imageScanPresented
+            accessCheckPresented: accessCheckPresented, navigationHelpPresented: navigationHelpPresented, imageScanPresented: imageScanPresented, hostSSHPresented: hostSSHPresented
         )
     }
 
@@ -145,6 +147,7 @@ struct K9kRootView: View {
         @Binding var accessCheckPresented: Bool
         @Binding var navigationHelpPresented: Bool
         @Binding var imageScanPresented: Bool
+        @Binding var hostSSHPresented: Bool
 
         func body(content: Content) -> some View {
             content
@@ -206,6 +209,7 @@ struct K9kRootView: View {
             AccessCheckView(initialType: store.selectedResourceType, initialResource: store.resource(for: store.selectedResources.first))
         }
         .sheet(isPresented: $navigationHelpPresented) { NavigationHelpView(isPresented: $navigationHelpPresented) }
+        .sheet(isPresented: $hostSSHPresented) { HostSSHTerminalView() }
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
         } message: { Text(store.errorMessage ?? "") }
@@ -341,6 +345,7 @@ struct K9kRootView: View {
                 Button("Pulse…") { pulsePresented = true }
                 Button("Helm Releases") { Task { await store.openHelmReleases() } }
                 Button("Active Port Forwards…") { portForwardListPresented = true }
+                Button("Host SSH…") { hostSSHPresented = true }
                 Toggle("Read-only Mode", isOn: Binding(get: { store.isReadOnly }, set: { store.isReadOnly = $0 }))
                 Button("Delete…", role: .destructive) { destructiveConfirmation = true }
                     .disabled(!store.canDeleteSelected)
