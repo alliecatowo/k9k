@@ -177,6 +177,33 @@ type AccessReview struct {
 	EvaluationError string `json:"evaluationError,omitempty"`
 }
 
+// NodeDrainRequest is the deliberately narrow drain contract exposed to the
+// native client. K9k never force-deletes Pods during a drain: eviction honors
+// PodDisruptionBudgets and any individual failure is reported in the result.
+// DaemonSet and mirror Pods are left in place by Kubernetes drain semantics.
+type NodeDrainRequest struct {
+	Node               string `json:"node"`
+	IgnoreDaemonSets   bool   `json:"ignoreDaemonSets"`
+	DeleteEmptyDirData bool   `json:"deleteEmptyDirData"`
+}
+
+// NodeDrainResult retains every decision so the GUI can distinguish an
+// eviction accepted by the API server from Pods that were intentionally left
+// behind or blocked by policy.
+type NodeDrainResult struct {
+	Node     string         `json:"node"`
+	Evicted  []NodeDrainPod `json:"evicted"`
+	Skipped  []NodeDrainPod `json:"skipped"`
+	Blocked  []NodeDrainPod `json:"blocked"`
+	Failures []NodeDrainPod `json:"failures"`
+}
+
+type NodeDrainPod struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	Reason    string `json:"reason"`
+}
+
 // PortForwardRequest describes one pod port-forward owned by the helper. The
 // local address is always loopback-only; K9k deliberately never turns a pod
 // port into a network-reachable listener without an explicit Kubernetes

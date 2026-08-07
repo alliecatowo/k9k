@@ -50,6 +50,7 @@ type ClusterClient interface {
 	PodLogs(context.Context, string, string, string, bool, bool, bool, int64) (io.ReadCloser, error)
 	Events(context.Context, string, string) ([]ClusterEvent, error)
 	Metrics(context.Context, MetricsQuery) ([]ResourceMetrics, error)
+	DrainNode(context.Context, NodeDrainRequest) (NodeDrainResult, error)
 	CheckAccess(context.Context, AccessCheck) (AccessReview, error)
 	PortForward(context.Context, PortForwardRequest, func(PortForwardBinding)) error
 	PodExec(context.Context, PodExecRequest, PodExecStreams) error
@@ -518,6 +519,29 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			"resource":   params.Resource,
 			"items":      result,
 		}, nil
+	case "node.drain":
+		var params struct {
+			NodeDrainRequest
+			Confirm bool `json:"confirm"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		params.Node = strings.TrimSpace(params.Node)
+		if params.Node == "" {
+			return nil, invalidParams(errors.New("node is required"))
+		}
+		if !params.IgnoreDaemonSets {
+			return nil, invalidParams(errors.New("node draining requires ignoreDaemonSets: true; DaemonSet Pods cannot be evicted"))
+		}
+		if !params.Confirm {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("node drain requires confirm: true")}
+		}
+		result, drainErr := s.cluster.DrainNode(ctx, params.NodeDrainRequest)
+		if drainErr != nil {
+			return nil, kubeError(drainErr)
+		}
+		return result, nil
 	case "rbac.check":
 		params, err := decodeAccessCheckParams(request.Params)
 		if err != nil {

@@ -96,6 +96,23 @@ struct ResourceSummary: Codable, Identifiable, Hashable {
     var subtitle: String { namespace?.isEmpty == false ? namespace! : "Cluster-scoped" }
 }
 
+struct NodeDrainResult: Codable, Hashable {
+    let node: String
+    let evicted: [NodeDrainPod]
+    let skipped: [NodeDrainPod]
+    let blocked: [NodeDrainPod]
+    let failures: [NodeDrainPod]
+
+    var hasIssues: Bool { !blocked.isEmpty || !failures.isEmpty }
+}
+
+struct NodeDrainPod: Codable, Hashable, Identifiable {
+    let namespace: String
+    let name: String
+    let reason: String
+    var id: String { "\(namespace)/\(name)/\(reason)" }
+}
+
 struct RelationshipGraph: Codable, Hashable {
     let rootID: String
     let nodes: [RelationshipNode]

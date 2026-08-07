@@ -39,6 +39,7 @@ type fakeCluster struct {
 	listErr, getErr, watchErr, deleteErr, patchErr      error
 	accessErr, portForwardErr                           error
 	metricsErr                                          error
+	drainErr                                            error
 	execErr                                             error
 	manifestErr, applyManifestErr                       error
 
@@ -52,6 +53,7 @@ type fakeCluster struct {
 	forwards       []PortForwardRequest
 	metrics        []MetricsQuery
 	metricItems    []ResourceMetrics
+	drains         []NodeDrainRequest
 	execs          []PodExecRequest
 	execFn         func(context.Context, PodExecRequest, PodExecStreams) error
 	manifests      []resourceCall
@@ -182,6 +184,16 @@ func (f *fakeCluster) Metrics(_ context.Context, query MetricsQuery) ([]Resource
 		return nil, f.metricsErr
 	}
 	return append([]ResourceMetrics(nil), f.metricItems...), nil
+}
+
+func (f *fakeCluster) DrainNode(_ context.Context, request NodeDrainRequest) (NodeDrainResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.drains = append(f.drains, request)
+	if f.drainErr != nil {
+		return NodeDrainResult{}, f.drainErr
+	}
+	return NodeDrainResult{Node: request.Node, Evicted: []NodeDrainPod{}, Skipped: []NodeDrainPod{}, Blocked: []NodeDrainPod{}, Failures: []NodeDrainPod{}}, nil
 }
 
 func (f *fakeCluster) CheckAccess(_ context.Context, check AccessCheck) (AccessReview, error) {
@@ -575,6 +587,29 @@ func TestServerDeleteRequiresConfirmationAndScaleUsesMergePatch(t *testing.T) {
 	}
 	if scalePatch == nil {
 		t.Errorf("scale patch not found in %#v", client.patches)
+	}
+}
+
+func TestServerDrainRequiresExplicitSafetyFlagsAndConfirmation(t *testing.T) {
+	client := &fakeCluster{}
+	responses := runRequests(t, client,
+		request("unconfirmed", "node.drain", map[string]any{"node": "worker", "ignoreDaemonSets": true}),
+		request("daemonsets", "node.drain", map[string]any{"node": "worker", "confirm": true}),
+		request("drain", "node.drain", map[string]any{"node": "worker", "ignoreDaemonSets": true, "deleteEmptyDirData": true, "confirm": true}),
+	)
+	if got := envelopeByID(t, responses, "unconfirmed").Error; got == nil || got.Code != "confirmation_required" {
+		t.Errorf("unconfirmed drain = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "daemonsets").Error; got == nil || got.Code != "invalid_params" {
+		t.Errorf("daemonset drain = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "drain").Error; got != nil {
+		t.Errorf("confirmed drain = %#v", got)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.drains) != 1 || client.drains[0].Node != "worker" || !client.drains[0].DeleteEmptyDirData {
+		t.Errorf("drains = %#v", client.drains)
 	}
 }
 

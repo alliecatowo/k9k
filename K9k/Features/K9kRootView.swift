@@ -13,6 +13,7 @@ struct K9kRootView: View {
     @State private var manifestEditorPresented = false
     @State private var relationshipsPresented = false
     @State private var nodeCordonConfirmation = false
+    @State private var nodeDrainPresented = false
 
     var body: some View {
         @Bindable var store = store
@@ -42,6 +43,7 @@ struct K9kRootView: View {
                 await store.updateExecAccess()
                 await store.updateManifestAccess()
                 await store.updateNodePatchAccess()
+                await store.updateNodeDrainAccess()
             }
         }
         .confirmationDialog("Delete selected resources?", isPresented: $destructiveConfirmation, titleVisibility: .visible) {
@@ -73,6 +75,9 @@ struct K9kRootView: View {
             if let resource = store.resource(for: store.selectedResources.first), let type = store.selectedResourceType {
                 RelationshipGraphView(resource: resource, type: type)
             }
+        }
+        .sheet(isPresented: $nodeDrainPresented) {
+            if let node = store.selectedNodeResource { NodeDrainView(node: node, isPresented: $nodeDrainPresented) }
         }
         .alert("K9k could not complete the request", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK", role: .cancel) { store.errorMessage = nil }
@@ -128,6 +133,8 @@ struct K9kRootView: View {
                     } else {
                         Button("Cordon…", role: .destructive) { nodeCordonConfirmation = true }.disabled(!store.canPatchSelectedNode)
                     }
+                    Button("Drain…") { nodeDrainPresented = true }
+                        .disabled(!store.canDrainSelectedNode || node.raw?.objectValue?["spec"]?.objectValue?["unschedulable"]?.boolValue != true)
                 }
                 Divider()
                 Toggle("Read-only Mode", isOn: Binding(get: { store.isReadOnly }, set: { store.isReadOnly = $0 }))

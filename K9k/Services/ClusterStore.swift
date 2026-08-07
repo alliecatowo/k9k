@@ -43,6 +43,8 @@ final class ClusterStore {
     var restartAccess: AccessReview?
     var isCheckingRestartAccess = false
     var nodePatchAccess: AccessReview?
+    var nodeDrainAccess: AccessReview?
+    var nodeDrainResult: NodeDrainResult?
     var relationshipGraph: RelationshipGraph?
     var isLoadingRelationships = false
     private var deleteAccessGeneration = 0
@@ -229,6 +231,7 @@ final class ClusterStore {
 
     var selectedNodeResource: ResourceSummary? { guard selectedResources.count == 1, let resource = selectedSelectedResource, resource.kind == "Node" else { return nil }; return resource }
     var canPatchSelectedNode: Bool { !isReadOnly && selectedNodeResource != nil && nodePatchAccess?.allowed == true }
+    var canDrainSelectedNode: Bool { !isReadOnly && selectedNodeResource != nil && nodeDrainAccess?.allowed == true }
 
     var canOpenExec: Bool {
         !isReadOnly && selectedPodResource != nil && execAccess?.allowed == true
@@ -386,6 +389,21 @@ final class ClusterStore {
         catch { nodePatchAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify node patch permission: \(error.localizedDescription)", evaluationError: nil) }
     }
 
+    func updateNodeDrainAccess() async {
+        guard selectedNodeResource != nil else { nodeDrainAccess = nil; return }
+        do {
+            nodeDrainAccess = try decode(
+                (try await client.request("rbac.check", parameters: .object([
+                    "group": .string("policy"), "version": .string("v1"), "resource": .string("pods"),
+                    "subresource": .string("eviction"), "namespaced": .bool(true), "verb": .string("create")
+                ]))).result,
+                as: AccessReview.self
+            )
+        } catch {
+            nodeDrainAccess = AccessReview(allowed: false, denied: false, reason: "K9k could not verify Pod eviction permission: \(error.localizedDescription)", evaluationError: nil)
+        }
+    }
+
     func setSelectedNodeUnschedulable(_ unschedulable: Bool) async {
         guard let type = selectedResourceType, let node = selectedNodeResource, !isReadOnly else { return }
         await updateNodePatchAccess()
@@ -394,6 +412,27 @@ final class ClusterStore {
             _ = try await client.request("resource.patch", parameters: operationParameters(type: type, resource: node, additional: ["patch": .object(["spec": .object(["unschedulable": .bool(unschedulable)])])]))
             await loadResources()
         } catch { errorMessage = error.localizedDescription }
+    }
+
+    func drainSelectedNode(deleteEmptyDirData: Bool) async {
+        guard let node = selectedNodeResource, !isReadOnly else { return }
+        await updateNodeDrainAccess()
+        guard canDrainSelectedNode else {
+            errorMessage = nodeDrainAccess?.reason ?? "The active Kubernetes identity is not authorized to evict Pods."
+            return
+        }
+        do {
+            nodeDrainResult = try decode(
+                (try await client.request("node.drain", parameters: .object([
+                    "node": .string(node.name), "ignoreDaemonSets": .bool(true),
+                    "deleteEmptyDirData": .bool(deleteEmptyDirData), "confirm": .bool(true)
+                ]))).result,
+                as: NodeDrainResult.self
+            )
+            await loadResources()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     func updateExecAccess() async {

@@ -13,6 +13,7 @@ import (
 	"github.com/k9k-app/k9k/backend/internal/api"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -466,6 +467,87 @@ func (c *Cluster) Metrics(ctx context.Context, query api.MetricsQuery) ([]api.Re
 	default:
 		return nil, fmt.Errorf("unsupported metrics resource %q", query.Resource)
 	}
+}
+
+// DrainNode performs Kubernetes-native eviction for ordinary Pods on a
+// cordoned node. It deliberately does not implement force deletion: PDBs,
+// termination grace, and RBAC errors remain visible in the result. Mirror and
+// DaemonSet Pods cannot be safely evicted, and emptyDir data requires an
+// explicit opt-in from the native confirmation sheet.
+func (c *Cluster) DrainNode(ctx context.Context, request api.NodeDrainRequest) (api.NodeDrainResult, error) {
+	c.mu.RLock()
+	typed := c.typed
+	c.mu.RUnlock()
+	if typed == nil {
+		return api.NodeDrainResult{}, fmt.Errorf("no usable Kubernetes context is selected")
+	}
+	node, err := typed.CoreV1().Nodes().Get(ctx, request.Node, metav1.GetOptions{})
+	if err != nil {
+		return api.NodeDrainResult{}, err
+	}
+	if !node.Spec.Unschedulable {
+		return api.NodeDrainResult{}, fmt.Errorf("node %q must be cordoned before draining", request.Node)
+	}
+	result := api.NodeDrainResult{
+		Node: request.Node, Evicted: []api.NodeDrainPod{}, Skipped: []api.NodeDrainPod{}, Blocked: []api.NodeDrainPod{}, Failures: []api.NodeDrainPod{},
+	}
+	pods, err := typed.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: "spec.nodeName=" + request.Node})
+	if err != nil {
+		return api.NodeDrainResult{}, err
+	}
+	for _, pod := range pods.Items {
+		entry := api.NodeDrainPod{Namespace: pod.Namespace, Name: pod.Name}
+		if !pod.DeletionTimestamp.IsZero() {
+			entry.Reason = "already terminating"
+			result.Skipped = append(result.Skipped, entry)
+			continue
+		}
+		if pod.Annotations[corev1.MirrorPodAnnotationKey] != "" {
+			entry.Reason = "mirror Pod managed by the node"
+			result.Blocked = append(result.Blocked, entry)
+			continue
+		}
+		if isDaemonSetPod(&pod) {
+			entry.Reason = "DaemonSet Pod left running"
+			if request.IgnoreDaemonSets {
+				result.Skipped = append(result.Skipped, entry)
+			} else {
+				result.Blocked = append(result.Blocked, entry)
+			}
+			continue
+		}
+		if podUsesEmptyDir(&pod) && !request.DeleteEmptyDirData {
+			entry.Reason = "uses emptyDir data; enable deletion explicitly to evict"
+			result.Blocked = append(result.Blocked, entry)
+			continue
+		}
+		if err := typed.PolicyV1().Evictions(pod.Namespace).Evict(ctx, &policyv1.Eviction{ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace}}); err != nil {
+			entry.Reason = err.Error()
+			result.Failures = append(result.Failures, entry)
+			continue
+		}
+		entry.Reason = "eviction accepted"
+		result.Evicted = append(result.Evicted, entry)
+	}
+	return result, nil
+}
+
+func isDaemonSetPod(pod *corev1.Pod) bool {
+	for _, owner := range pod.OwnerReferences {
+		if owner.Kind == "DaemonSet" {
+			return true
+		}
+	}
+	return false
+}
+
+func podUsesEmptyDir(pod *corev1.Pod) bool {
+	for _, volume := range pod.Spec.Volumes {
+		if volume.EmptyDir != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeMetricsError(err error) error {
