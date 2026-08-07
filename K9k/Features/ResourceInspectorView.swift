@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct ResourceInspectorView: View {
@@ -121,11 +122,18 @@ struct ResourceInspectorView: View {
     }
 
     @ViewBuilder private func yaml(_ resource: ResourceSummary) -> some View {
-        Text(prettyJSON(resource.raw))
-            .font(.system(.caption, design: .monospaced))
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .trailing, spacing: 0) {
+            Button("Copy JSON") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(prettyJSON(resource.raw), forType: .string)
+            }
             .padding()
+            Text(prettyJSON(resource.raw))
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+        }
     }
 
     private func prettyJSON(_ raw: JSONValue?) -> String {
