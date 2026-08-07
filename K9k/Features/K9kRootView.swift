@@ -181,6 +181,7 @@ struct SettingsView: View {
     @State private var editorPresented = false
     @State private var defaultNamespace = ""
     @State private var namespaceConfirmation = false
+    @State private var contextManagerPresented = false
     var body: some View {
         @Bindable var store = store
         Form {
@@ -213,6 +214,7 @@ struct SettingsView: View {
                         else { Button("Use") { Task { await store.selectContext(context) } } }
                     }
                 }
+                Button("Manage Contexts…") { contextManagerPresented = true }
                 Text("Credentials remain in kubeconfig and are never displayed by K9k.").font(.caption).foregroundStyle(.secondary)
             }
             Section("K9s compatibility") {
@@ -238,6 +240,7 @@ struct SettingsView: View {
         .padding()
         .frame(width: 520)
         .sheet(isPresented: $editorPresented) { K9sConfigEditorView(name: editorFile) }
+        .sheet(isPresented: $contextManagerPresented) { KubeconfigContextManagerView(isPresented: $contextManagerPresented) }
         .task(id: store.selectedContext?.id) { defaultNamespace = store.selectedContext?.namespace ?? "" }
         .confirmationDialog("Save default namespace?", isPresented: $namespaceConfirmation, titleVisibility: .visible) {
             Button("Save to Kubeconfig") { Task { _ = await store.updateActiveContextNamespace(defaultNamespace) } }

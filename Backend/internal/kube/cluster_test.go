@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -16,6 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	clientgotesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 	metricsfake "k8s.io/metrics/pkg/client/clientset/versioned/fake"
 )
@@ -65,6 +68,56 @@ func TestCheckAccessRequiresSelectedContext(t *testing.T) {
 	_, err := (&Cluster{}).CheckAccess(context.Background(), api.AccessCheck{Verb: "get", Resource: "pods"})
 	if err == nil || err.Error() != "no usable Kubernetes context is selected" {
 		t.Errorf("error = %v", err)
+	}
+}
+
+func TestContextRenameAndDeleteModifyOnlyInactiveContextEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	raw := clientcmdapi.Config{
+		CurrentContext: "active",
+		Contexts: map[string]*clientcmdapi.Context{
+			"active": {Cluster: "cluster-a", AuthInfo: "user-a", Namespace: "default"},
+			"stage":  {Cluster: "cluster-b", AuthInfo: "user-b", Namespace: "platform"},
+		},
+	}
+	if err := clientcmd.WriteToFile(raw, path); err != nil {
+		t.Fatal(err)
+	}
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	rules.ExplicitPath = path
+	cluster := &Cluster{
+		rules:   rules,
+		config:  clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{CurrentContext: "active"}),
+		context: "active",
+	}
+	if err := cluster.RenameContext("stage", "production"); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := clientcmd.LoadFromFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := updated.Contexts["stage"]; found {
+		t.Fatal("old context name remains in kubeconfig")
+	}
+	if got := updated.Contexts["production"]; got == nil || got.Cluster != "cluster-b" || got.AuthInfo != "user-b" || got.Namespace != "platform" {
+		t.Errorf("renamed context = %#v", got)
+	}
+	if got := updated.Contexts["active"]; got == nil || got.Cluster != "cluster-a" || got.AuthInfo != "user-a" {
+		t.Errorf("active context was unexpectedly changed = %#v", got)
+	}
+	if err := cluster.DeleteContext("production"); err != nil {
+		t.Fatal(err)
+	}
+	updated, err = clientcmd.LoadFromFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := updated.Contexts["production"]; found {
+		t.Fatal("deleted context remains in kubeconfig")
+	}
+	if err := cluster.DeleteContext("active"); err == nil {
+		t.Fatal("deleting the active context unexpectedly succeeded")
 	}
 }
 

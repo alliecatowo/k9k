@@ -130,6 +130,42 @@ final class ClusterStore {
         }
     }
 
+    func renameKubeContext(_ context: KubeContext, to newName: String) async -> Bool {
+        let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != context.name else { return false }
+        do {
+            _ = try await client.request("context.rename", parameters: .object([
+                "name": .string(context.name), "newName": .string(name), "confirm": .bool(true),
+            ]))
+            contexts = contexts.map {
+                guard $0.id == context.id else { return $0 }
+                return KubeContext(name: name, cluster: $0.cluster, user: $0.user, namespace: $0.namespace, active: $0.active)
+            }
+            selectedContext = contexts.first(where: { $0.active }) ?? selectedContext
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    func deleteKubeContext(_ context: KubeContext) async -> Bool {
+        guard !context.active else {
+            errorMessage = "Select a different context before deleting the active context."
+            return false
+        }
+        do {
+            _ = try await client.request("context.delete", parameters: .object([
+                "name": .string(context.name), "confirm": .bool(true),
+            ]))
+            contexts.removeAll { $0.id == context.id }
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
     func loadNamespaces() async {
         do {
             namespaces = ["All Namespaces"] + (try decodeArray((try await client.request("namespace.list")).result, as: String.self))

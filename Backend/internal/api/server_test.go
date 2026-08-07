@@ -37,6 +37,8 @@ type fakeCluster struct {
 
 	contextsErr, selectErr, namespacesErr, discoveryErr error
 	updateContextErr                                    error
+	renameContextErr                                    error
+	deleteContextErr                                    error
 	listErr, getErr, watchErr, deleteErr, patchErr      error
 	accessErr, portForwardErr                           error
 	metricsErr                                          error
@@ -47,6 +49,8 @@ type fakeCluster struct {
 
 	selected       []string
 	contextUpdates []Context
+	contextRenames [][2]string
+	contextDeletes []string
 	lists          []resourceCall
 	gets           []resourceCall
 	watches        []resourceCall
@@ -96,6 +100,20 @@ func (f *fakeCluster) UpdateContextNamespace(name, namespace string) error {
 	defer f.mu.Unlock()
 	f.contextUpdates = append(f.contextUpdates, Context{Name: name, Namespace: namespace})
 	return f.updateContextErr
+}
+
+func (f *fakeCluster) RenameContext(name, newName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.contextRenames = append(f.contextRenames, [2]string{name, newName})
+	return f.renameContextErr
+}
+
+func (f *fakeCluster) DeleteContext(name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.contextDeletes = append(f.contextDeletes, name)
+	return f.deleteContextErr
 }
 
 func (f *fakeCluster) Namespaces(context.Context) ([]string, error) {
@@ -651,6 +669,36 @@ func TestServerContextUpdateRequiresConfirmation(t *testing.T) {
 	defer client.mu.Unlock()
 	if len(client.contextUpdates) != 1 || client.contextUpdates[0].Name != "stage" || client.contextUpdates[0].Namespace != "platform" {
 		t.Errorf("context updates = %#v", client.contextUpdates)
+	}
+}
+
+func TestServerContextRenameAndDeleteRequireConfirmation(t *testing.T) {
+	client := &fakeCluster{}
+	responses := runRequests(t, client,
+		request("rename-unconfirmed", "context.rename", map[string]any{"name": "stage", "newName": "production"}),
+		request("rename", "context.rename", map[string]any{"name": "stage", "newName": "production", "confirm": true}),
+		request("delete-unconfirmed", "context.delete", map[string]any{"name": "old"}),
+		request("delete", "context.delete", map[string]any{"name": "old", "confirm": true}),
+	)
+	if got := envelopeByID(t, responses, "rename-unconfirmed").Error; got == nil || got.Code != "confirmation_required" {
+		t.Errorf("unconfirmed rename = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "rename").Error; got != nil {
+		t.Errorf("confirmed rename = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "delete-unconfirmed").Error; got == nil || got.Code != "confirmation_required" {
+		t.Errorf("unconfirmed delete = %#v", got)
+	}
+	if got := envelopeByID(t, responses, "delete").Error; got != nil {
+		t.Errorf("confirmed delete = %#v", got)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if got := client.contextRenames; len(got) != 1 || got[0] != [2]string{"stage", "production"} {
+		t.Errorf("context renames = %#v", got)
+	}
+	if got := client.contextDeletes; len(got) != 1 || got[0] != "old" {
+		t.Errorf("context deletes = %#v", got)
 	}
 }
 

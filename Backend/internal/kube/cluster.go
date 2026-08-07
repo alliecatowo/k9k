@@ -141,6 +141,66 @@ func (c *Cluster) UpdateContextNamespace(name, namespace string) error {
 	}
 	return nil
 }
+
+// RenameContext changes only the kubeconfig context key. The cluster and
+// AuthInfo objects, including any credentials they hold, are intentionally
+// untouched. An active context is reloaded under its new name after the
+// atomic-ish client-go config write has succeeded.
+func (c *Cluster) RenameContext(name, newName string) error {
+	c.mu.RLock()
+	config := c.config
+	rules := c.rules
+	active := c.context
+	c.mu.RUnlock()
+	raw, err := config.RawConfig()
+	if err != nil {
+		return err
+	}
+	contextValue, exists := raw.Contexts[name]
+	if !exists {
+		return fmt.Errorf("kubeconfig context %q does not exist", name)
+	}
+	if _, exists := raw.Contexts[newName]; exists {
+		return fmt.Errorf("kubeconfig context %q already exists", newName)
+	}
+	delete(raw.Contexts, name)
+	raw.Contexts[newName] = contextValue
+	if raw.CurrentContext == name {
+		raw.CurrentContext = newName
+	}
+	if err := clientcmd.ModifyConfig(rules, raw, true); err != nil {
+		return err
+	}
+	if active == name {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.reload(newName)
+	}
+	return nil
+}
+
+// DeleteContext removes only an inactive kubeconfig context entry. K9k refuses
+// to delete the selected or kubeconfig-current context so a settings action can
+// never strand the running application without a usable cluster client.
+func (c *Cluster) DeleteContext(name string) error {
+	c.mu.RLock()
+	config := c.config
+	rules := c.rules
+	active := c.context
+	c.mu.RUnlock()
+	raw, err := config.RawConfig()
+	if err != nil {
+		return err
+	}
+	if _, exists := raw.Contexts[name]; !exists {
+		return fmt.Errorf("kubeconfig context %q does not exist", name)
+	}
+	if name == active || name == raw.CurrentContext {
+		return fmt.Errorf("cannot delete active kubeconfig context %q; select a different context first", name)
+	}
+	delete(raw.Contexts, name)
+	return clientcmd.ModifyConfig(rules, raw, true)
+}
 func (c *Cluster) Namespaces(ctx context.Context) ([]string, error) {
 	c.mu.RLock()
 	typed := c.typed

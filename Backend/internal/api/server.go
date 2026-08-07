@@ -39,6 +39,8 @@ type ClusterClient interface {
 	Contexts() ([]Context, error)
 	SelectContext(name string) error
 	UpdateContextNamespace(name, namespace string) error
+	RenameContext(name, newName string) error
+	DeleteContext(name string) error
 	Namespaces(context.Context) ([]string, error)
 	Discovery(context.Context) ([]ResourceType, error)
 	List(context.Context, schema.GroupVersionResource, string, bool, string, string) ([]ResourceSummary, error)
@@ -432,6 +434,49 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(err)
 		}
 		return map[string]any{"name": params.Name, "namespace": params.Namespace, "updated": true}, nil
+	case "context.rename":
+		var params struct {
+			Name    string `json:"name"`
+			NewName string `json:"newName"`
+			Confirm bool   `json:"confirm"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		params.Name = strings.TrimSpace(params.Name)
+		params.NewName = strings.TrimSpace(params.NewName)
+		if params.Name == "" || params.NewName == "" {
+			return nil, invalidParams(errors.New("context name and newName are required"))
+		}
+		if params.Name == params.NewName {
+			return nil, invalidParams(errors.New("new context name must be different"))
+		}
+		if !params.Confirm {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("kubeconfig context rename requires confirm: true")}
+		}
+		if err := s.cluster.RenameContext(params.Name, params.NewName); err != nil {
+			return nil, kubeError(err)
+		}
+		return map[string]any{"name": params.Name, "newName": params.NewName, "renamed": true}, nil
+	case "context.delete":
+		var params struct {
+			Name    string `json:"name"`
+			Confirm bool   `json:"confirm"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		params.Name = strings.TrimSpace(params.Name)
+		if params.Name == "" {
+			return nil, invalidParams(errors.New("context name is required"))
+		}
+		if !params.Confirm {
+			return nil, &operationError{code: "confirmation_required", err: errors.New("kubeconfig context deletion requires confirm: true")}
+		}
+		if err := s.cluster.DeleteContext(params.Name); err != nil {
+			return nil, kubeError(err)
+		}
+		return map[string]any{"name": params.Name, "deleted": true}, nil
 	case "namespace.list":
 		result, err := s.cluster.Namespaces(ctx)
 		if err != nil {
