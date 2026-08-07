@@ -21,7 +21,12 @@ final class ClusterStore {
     var favoriteNamespaces = UserDefaults.standard.stringArray(forKey: "k9k.favoriteNamespaces") ?? [] {
         didSet { UserDefaults.standard.set(favoriteNamespaces, forKey: "k9k.favoriteNamespaces") }
     }
-    var selectedResourceType: ResourceType?
+    var selectedResourceType: ResourceType? {
+        didSet {
+            guard !isRestoringNavigation, oldValue != selectedResourceType, let selectedResourceType else { return }
+            recordNavigation(to: selectedResourceType)
+        }
+    }
     var resources: [ResourceSummary] = []
     var selectedResources = Set<ResourceSummary.ID>()
     var searchText = ""
@@ -83,11 +88,35 @@ final class ClusterStore {
     // and watch start carries this generation so a late Pod response can never
     // replace the table after the user has already selected Deployments.
     private var resourceLoadGeneration = 0
+    private var navigationHistory: [ResourceNavigationEntry] = []
+    private var navigationHistoryIndex: Int?
+    private var isRestoringNavigation = false
+    private let navigationHistoryDefaultsKey = "k9k.resourceNavigationHistory.v1"
+    private let navigationHistoryLimit = 30
 
     private let client = CoreClient()
 
     init() {
         client.onEvent = { [weak self] envelope in self?.apply(event: envelope) }
+        loadNavigationHistory()
+    }
+
+    /// Current-context history only. This avoids a Back command unexpectedly
+    /// switching credentials or cluster context while an operator is working.
+    var recentResourceNavigation: [ResourceNavigationEntry] {
+        navigationHistory
+            .filter { $0.contextName == selectedContext?.name }
+            .reversed()
+    }
+
+    var canNavigateBack: Bool {
+        guard let navigationHistoryIndex else { return false }
+        return navigationHistory[..<navigationHistoryIndex].contains { $0.contextName == selectedContext?.name }
+    }
+
+    var canNavigateForward: Bool {
+        guard let navigationHistoryIndex else { return false }
+        return navigationHistory.indices.dropFirst(navigationHistoryIndex + 1).contains { navigationHistory[$0].contextName == selectedContext?.name }
     }
 
     var visibleResources: [ResourceSummary] {
@@ -286,6 +315,15 @@ final class ClusterStore {
     }
 
     func selectResourceType(_ type: ResourceType) async {
+        guard selectedResourceType != type else { return }
+        // A selector belongs to the GVR that created it. Clear it before the
+        // assignment is recorded so history never labels a Deployment visit
+        // with a stale Pod selector.
+        if selectorResourceTypeID != type.id {
+            labelSelector = ""
+            fieldSelector = ""
+            selectorResourceTypeID = nil
+        }
         selectedResourceType = type
         selectedResources.removeAll()
         deleteAccess = nil
@@ -299,12 +337,109 @@ final class ClusterStore {
 
     func openHelmReleases() async {
         guard let secrets = preferredResource(named: "secrets") else { return }
-        selectedResourceType = secrets
-        selectedResources.removeAll()
         labelSelector = "owner=helm"
         fieldSelector = ""
         selectorResourceTypeID = secrets.id
+        if selectedResourceType == secrets { recordNavigation(to: secrets) }
+        else { await selectResourceType(secrets) }
         await loadResources()
+    }
+
+    /// Moves to a previously visited native resource list without changing the
+    /// selected kubeconfig context. The root view observes the restored
+    /// selection and reloads the matching list/watch exactly as a sidebar
+    /// selection would.
+    func navigateBack() async {
+        guard let index = previousNavigationIndex() else { return }
+        await restoreNavigation(at: index)
+    }
+
+    func navigateForward() async {
+        guard let index = nextNavigationIndex() else { return }
+        await restoreNavigation(at: index)
+    }
+
+    func openRecentNavigation(_ entry: ResourceNavigationEntry) async {
+        guard let index = navigationHistory.firstIndex(of: entry) else { return }
+        await restoreNavigation(at: index)
+    }
+
+    private func recordNavigation(to type: ResourceType) {
+        let entry = ResourceNavigationEntry(
+            resourceTypeID: type.id,
+            kind: type.kind,
+            resource: type.resource,
+            namespace: selectedNamespace,
+            labelSelector: labelSelector,
+            fieldSelector: fieldSelector,
+            contextName: selectedContext?.name,
+            visitedAt: .now
+        )
+
+        if let index = navigationHistoryIndex,
+           navigationHistory.indices.contains(index),
+           navigationHistory[index].resourceTypeID == entry.resourceTypeID,
+           navigationHistory[index].namespace == entry.namespace,
+           navigationHistory[index].labelSelector == entry.labelSelector,
+           navigationHistory[index].fieldSelector == entry.fieldSelector,
+           navigationHistory[index].contextName == entry.contextName {
+            return
+        }
+
+        if let index = navigationHistoryIndex {
+            navigationHistory.removeSubrange((index + 1)..<navigationHistory.count)
+        }
+        navigationHistory.append(entry)
+        if navigationHistory.count > navigationHistoryLimit {
+            navigationHistory.removeFirst(navigationHistory.count - navigationHistoryLimit)
+        }
+        navigationHistoryIndex = navigationHistory.indices.last
+        persistNavigationHistory()
+    }
+
+    private func previousNavigationIndex() -> Int? {
+        guard let current = navigationHistoryIndex else { return nil }
+        return navigationHistory[..<current].indices.reversed().first {
+            navigationHistory[$0].contextName == selectedContext?.name
+        }
+    }
+
+    private func nextNavigationIndex() -> Int? {
+        guard let current = navigationHistoryIndex else { return nil }
+        return navigationHistory.indices.dropFirst(current + 1).first {
+            navigationHistory[$0].contextName == selectedContext?.name
+        }
+    }
+
+    private func restoreNavigation(at index: Int) async {
+        guard navigationHistory.indices.contains(index) else { return }
+        let entry = navigationHistory[index]
+        guard entry.contextName == selectedContext?.name else { return }
+        guard let type = discoveredResources.first(where: { $0.id == entry.resourceTypeID }) else {
+            errorMessage = "\(entry.kind) is no longer available in this cluster's API discovery."
+            return
+        }
+        isRestoringNavigation = true
+        selectedNamespace = namespaces.contains(entry.namespace) ? entry.namespace : "All Namespaces"
+        labelSelector = entry.labelSelector
+        fieldSelector = entry.fieldSelector
+        selectorResourceTypeID = type.id
+        selectedResources.removeAll()
+        selectedResourceType = type
+        isRestoringNavigation = false
+        navigationHistoryIndex = index
+    }
+
+    private func loadNavigationHistory() {
+        guard let data = UserDefaults.standard.data(forKey: navigationHistoryDefaultsKey),
+              let saved = try? JSONDecoder().decode([ResourceNavigationEntry].self, from: data) else { return }
+        navigationHistory = Array(saved.suffix(navigationHistoryLimit))
+        navigationHistoryIndex = navigationHistory.indices.last
+    }
+
+    private func persistNavigationHistory() {
+        guard let data = try? JSONEncoder().encode(navigationHistory) else { return }
+        UserDefaults.standard.set(data, forKey: navigationHistoryDefaultsKey)
     }
 
     /// Keeps user-authored selectors associated with the current GVR. This
@@ -312,6 +447,14 @@ final class ClusterStore {
     /// view, while allowing the user to refresh and keep the current filter.
     func pinSelectorsToCurrentResource() {
         selectorResourceTypeID = selectedResourceType?.id
+        if let selectedResourceType { recordNavigation(to: selectedResourceType) }
+    }
+
+    func clearSelectors() {
+        labelSelector = ""
+        fieldSelector = ""
+        selectorResourceTypeID = selectedResourceType?.id
+        if let selectedResourceType { recordNavigation(to: selectedResourceType) }
     }
 
     func customJumps(for type: ResourceType) -> [K9sJump] {
@@ -927,13 +1070,12 @@ final class ClusterStore {
         try await submitManifest(type: type, document: document, source: source, confirm: true)
     }
 
-    func importManifest(type: ResourceType, source: String, confirm: Bool) async throws -> ManifestApplyResult {
+    func importManifestBatch(type: ResourceType, source: String, confirm: Bool) async throws -> ManifestBatchApplyResult {
         var parameters = type.requestParameters.objectValue ?? [:]
         parameters["manifest"] = .string(source)
         parameters["kind"] = .string(type.kind)
-        parameters["create"] = .bool(true)
         parameters["confirm"] = .bool(confirm)
-        return try decode((try await client.request("manifest.apply", parameters: .object(parameters))).result, as: ManifestApplyResult.self)
+        return try decode((try await client.request("manifest.applyBatch", parameters: .object(parameters))).result, as: ManifestBatchApplyResult.self)
     }
 
     func copySelectedName() {

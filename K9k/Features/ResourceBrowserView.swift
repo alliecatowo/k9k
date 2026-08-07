@@ -69,8 +69,7 @@ struct ResourceBrowserView: View {
                         if !store.labelSelector.isEmpty { Text("Label: \(store.labelSelector)") }
                         if !store.fieldSelector.isEmpty { Text("Field: \(store.fieldSelector)") }
                         Button("Clear Selectors") {
-                            store.labelSelector = ""
-                            store.fieldSelector = ""
+                            store.clearSelectors()
                             Task { await store.loadResources() }
                         }
                     }

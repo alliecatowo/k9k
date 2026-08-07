@@ -94,6 +94,31 @@ struct ResourceType: Codable, Identifiable, Hashable {
     }
 }
 
+/// A compact, credential-free record of a place the operator visited.  The
+/// history deliberately stores discovery identity and list scope only; it
+/// never serializes resource contents, kubeconfig data, or selections.
+struct ResourceNavigationEntry: Codable, Identifiable, Hashable {
+    let resourceTypeID: String
+    let kind: String
+    let resource: String
+    let namespace: String
+    let labelSelector: String
+    let fieldSelector: String
+    let contextName: String?
+    let visitedAt: Date
+
+    var id: String { "\(resourceTypeID)|\(namespace)|\(labelSelector)|\(fieldSelector)|\(visitedAt.timeIntervalSince1970)" }
+
+    var title: String { kind }
+
+    var detail: String {
+        var values = [namespace == "All Namespaces" ? "All namespaces" : namespace]
+        if !labelSelector.isEmpty { values.append("label: \(labelSelector)") }
+        if !fieldSelector.isEmpty { values.append("field: \(fieldSelector)") }
+        return values.joined(separator: " · ")
+    }
+}
+
 struct ResourceSummary: Codable, Identifiable, Hashable {
     let apiVersion: String
     let kind: String
@@ -108,6 +133,26 @@ struct ResourceSummary: Codable, Identifiable, Hashable {
 
     var id: String { uid.isEmpty ? "\(apiVersion)/\(namespace ?? "")/\(name)" : uid }
     var subtitle: String { namespace?.isEmpty == false ? namespace! : "Cluster-scoped" }
+}
+
+/// A metadata-only Helm v3 release timeline. K9k derives it from Helm's
+/// standard storage Secret labels; it deliberately does not decode the opaque
+/// release payload, which can contain values and rendered manifests.
+struct HelmReleaseHistory: Codable, Hashable {
+    let release: String
+    let namespace: String?
+    let revisions: [HelmReleaseRevision]
+    let total: Int
+    let truncated: Bool
+}
+
+struct HelmReleaseRevision: Codable, Identifiable, Hashable {
+    let revision: Int
+    let status: String
+    let storageName: String
+    let createdAt: Date
+    let age: String
+    var id: String { storageName }
 }
 
 struct NodeDrainResult: Codable, Hashable {
@@ -258,6 +303,15 @@ struct ManifestApplyResult: Codable, Hashable {
     let validated: Bool
     let applied: Bool
     let manifest: ManifestDocument
+}
+
+/// Result of a multi-document manifest import. Each item was dry-run before
+/// any confirmed write starts; Kubernetes cannot make arbitrary object applies
+/// transactional, so callers must not present this as an all-or-nothing batch.
+struct ManifestBatchApplyResult: Codable, Hashable {
+    let validated: Bool
+    let applied: Bool
+    let items: [ManifestDocument]
 }
 
 enum JSONValue: Codable, Hashable {

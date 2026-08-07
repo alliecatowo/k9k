@@ -612,6 +612,74 @@ func TestManifestCreateRequiresExplicitCreateModeAndDryRuns(t *testing.T) {
 	}
 }
 
+func TestManifestBatchApplyValidatesEveryDocumentBeforeAnyConfirmedWrite(t *testing.T) {
+	manifests := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: first\n  namespace: demo\ndata:\n  mode: first\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: second\n  namespace: demo\ndata:\n  mode: second\n"
+	params := map[string]any{"gvr": "v1/configmaps", "namespace": "demo", "kind": "ConfigMap", "manifest": manifests}
+	client := &fakeCluster{object: &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "returned", "namespace": "demo", "uid": "created"}, "data": map[string]any{},
+	}}}
+	responses := runRequests(t, client,
+		request("preview", "manifest.applyBatch", params),
+		request("apply", "manifest.applyBatch", map[string]any{"gvr": "v1/configmaps", "namespace": "demo", "kind": "ConfigMap", "manifest": manifests, "confirm": true}),
+	)
+	preview := mustObject(t, envelopeByID(t, responses, "preview").Result)
+	if preview["validated"] != true || preview["applied"] != false {
+		t.Errorf("preview = %#v", preview)
+	}
+	if items, ok := preview["items"].([]any); !ok || len(items) != 2 {
+		t.Errorf("preview items = %#v", preview["items"])
+	}
+	confirmed := mustObject(t, envelopeByID(t, responses, "apply").Result)
+	if confirmed["validated"] != true || confirmed["applied"] != true {
+		t.Errorf("confirmed = %#v", confirmed)
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.applyManifests) != 6 {
+		t.Fatalf("apply calls = %d, want 4 dry runs plus 2 confirmed writes", len(client.applyManifests))
+	}
+	dryRuns := 0
+	writes := 0
+	names := map[string]bool{}
+	for _, apply := range client.applyManifests {
+		if apply.DryRun {
+			dryRuns++
+		} else {
+			writes++
+		}
+		if apply.Object != nil {
+			names[apply.Object.GetName()] = true
+		}
+		if !apply.Create {
+			t.Errorf("batch item must use import/create semantics: %#v", apply)
+		}
+	}
+	if dryRuns != 4 || writes != 2 || !names["first"] || !names["second"] {
+		t.Errorf("batch calls = %#v", client.applyManifests)
+	}
+}
+
+func TestManifestBatchRejectsDuplicateAndMismatchedDocumentsBeforeCallingCluster(t *testing.T) {
+	duplicate := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: duplicate\n  namespace: demo\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: duplicate\n  namespace: demo\n"
+	mismatch := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: config\n  namespace: demo\n---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: secret\n  namespace: demo\n"
+	client := &fakeCluster{}
+	responses := runRequests(t, client,
+		request("duplicate", "manifest.applyBatch", map[string]any{"gvr": "v1/configmaps", "namespace": "demo", "kind": "ConfigMap", "manifest": duplicate}),
+		request("mismatch", "manifest.applyBatch", map[string]any{"gvr": "v1/configmaps", "namespace": "demo", "kind": "ConfigMap", "manifest": mismatch}),
+	)
+	for _, id := range []string{"duplicate", "mismatch"} {
+		if got := envelopeByID(t, responses, id).Error; got == nil || got.Code != "invalid_params" {
+			t.Errorf("%s error = %#v", id, got)
+		}
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.applyManifests) != 0 {
+		t.Errorf("invalid batch must not reach cluster: %#v", client.applyManifests)
+	}
+}
+
 func TestResourceTypeSerializesMissingShortNamesAsArray(t *testing.T) {
 	encoded, err := json.Marshal(ResourceType{Version: "v1", Resource: "pods", Kind: "Pod"})
 	if err != nil {

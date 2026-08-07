@@ -18,6 +18,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/remotecommand"
 	kubeexec "k8s.io/client-go/util/exec"
@@ -536,6 +537,23 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(getErr)
 		}
 		return result.Object, nil
+	case "helm.history":
+		var params struct {
+			Namespace string `json:"namespace"`
+			Release   string `json:"release"`
+		}
+		if err := decodeParams(request.Params, &params); err != nil {
+			return nil, invalidParams(err)
+		}
+		namespace, release, err := validateHelmHistoryParams(params.Namespace, params.Release)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		result, historyErr := s.helmHistory(ctx, namespace, release)
+		if historyErr != nil {
+			return nil, kubeError(historyErr)
+		}
+		return result, nil
 	case "relationships.get":
 		params, err := decodeResourceParams(request.Params, true)
 		if err != nil {
@@ -584,6 +602,44 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 			return nil, kubeError(documentErr)
 		}
 		return map[string]any{"validated": true, "applied": true, "manifest": appliedDocument}, nil
+	case "manifest.applyBatch":
+		params, err := decodeManifestBatchApplyParams(request.Params)
+		if err != nil {
+			return nil, invalidParams(err)
+		}
+		// A batch is deliberately two-phase: Kubernetes dry-runs every
+		// document before K9k starts a real apply. Kubernetes has no
+		// transaction spanning arbitrary objects, so a later write can still
+		// fail and leave earlier confirmed documents applied; the UI calls that
+		// out instead of implying atomicity.
+		previewDocuments := make([]ManifestDocument, 0, len(params.Items))
+		for _, item := range params.Items {
+			preview, applyErr := s.cluster.ApplyManifest(ctx, item.request(true))
+			if applyErr != nil {
+				return nil, manifestOperationError(applyErr, "manifest batch validation failed")
+			}
+			document, documentErr := NewManifestDocument(preview, item.identity())
+			if documentErr != nil {
+				return nil, kubeError(documentErr)
+			}
+			previewDocuments = append(previewDocuments, document)
+		}
+		if !params.Confirm {
+			return map[string]any{"validated": true, "applied": false, "items": previewDocuments}, nil
+		}
+		appliedDocuments := make([]ManifestDocument, 0, len(params.Items))
+		for _, item := range params.Items {
+			applied, applyErr := s.cluster.ApplyManifest(ctx, item.request(false))
+			if applyErr != nil {
+				return nil, manifestOperationError(applyErr, "manifest batch apply failed")
+			}
+			document, documentErr := NewManifestDocument(applied, item.identity())
+			if documentErr != nil {
+				return nil, kubeError(documentErr)
+			}
+			appliedDocuments = append(appliedDocuments, document)
+		}
+		return map[string]any{"validated": true, "applied": true, "items": appliedDocuments}, nil
 	case "resource.events":
 		var params struct {
 			Namespace string `json:"namespace"`
@@ -1661,6 +1717,73 @@ type manifestApplyParams struct {
 	Create      bool   `json:"create"`
 }
 
+const maxManifestBatchDocuments = 100
+
+// manifestBatchApplyParams handles a multi-document import for one discovered
+// GVR. It intentionally does not accept expectedUID values: this is an import
+// workflow, whereas editing a selected existing object remains on manifest.apply
+// and retains its immutable UID guard. Every document must therefore target the
+// selected GVR and is validated independently before any confirmed write.
+type manifestBatchApplyParams struct {
+	resourceParams
+	Kind     string `json:"kind"`
+	Manifest string `json:"manifest"`
+	Confirm  bool   `json:"confirm"`
+	Items    []manifestApplyParams
+}
+
+func decodeManifestBatchApplyParams(raw json.RawMessage) (manifestBatchApplyParams, error) {
+	var params manifestBatchApplyParams
+	if err := decodeParams(raw, &params); err != nil {
+		return params, err
+	}
+	if err := params.validate(); err != nil {
+		return params, err
+	}
+	return params, nil
+}
+
+func (p *manifestBatchApplyParams) validate() error {
+	if err := p.validateResource(); err != nil {
+		return err
+	}
+	p.Kind = strings.TrimSpace(p.Kind)
+	p.Manifest = strings.TrimSpace(p.Manifest)
+	if p.Kind == "" {
+		return errors.New("kind is required")
+	}
+	if p.Manifest == "" {
+		return errors.New("manifest is required")
+	}
+	documents, err := parseManifestYAMLDocuments(p.Manifest)
+	if err != nil {
+		return err
+	}
+	if len(documents) > maxManifestBatchDocuments {
+		return fmt.Errorf("manifest batch contains %d documents; maximum is %d", len(documents), maxManifestBatchDocuments)
+	}
+	seen := make(map[string]struct{}, len(documents))
+	p.Items = make([]manifestApplyParams, 0, len(documents))
+	for index, document := range documents {
+		item := manifestApplyParams{
+			resourceParams: p.resourceParams,
+			Kind:           p.Kind,
+			Manifest:       document,
+			Create:         true,
+		}
+		if err := item.validate(); err != nil {
+			return fmt.Errorf("manifest document %d: %w", index+1, err)
+		}
+		key := item.gvrString() + "|" + item.Namespace + "|" + item.Name
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("manifest document %d duplicates target %s", index+1, key)
+		}
+		seen[key] = struct{}{}
+		p.Items = append(p.Items, item)
+	}
+	return nil
+}
+
 func decodeManifestApplyParams(raw json.RawMessage) (manifestApplyParams, error) {
 	var params manifestApplyParams
 	if err := decodeParams(raw, &params); err != nil {
@@ -1761,6 +1884,36 @@ func parseManifestYAML(source string) (*unstructured.Unstructured, error) {
 		return nil, errors.New("manifest metadata.name is required")
 	}
 	return result, nil
+}
+
+// parseManifestYAMLDocuments uses Kubernetes' document framing rather than
+// splitting on "---" ourselves, so a YAML scalar containing that text cannot
+// accidentally become a second object. Each document is then parsed with the
+// same strict decoder as the single-manifest editor path.
+func parseManifestYAMLDocuments(source string) ([]string, error) {
+	reader := utilyaml.NewYAMLReader(bufio.NewReader(strings.NewReader(source)))
+	documents := make([]string, 0, 1)
+	for {
+		document, err := reader.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read manifest documents: %w", err)
+		}
+		trimmed := strings.TrimSpace(string(document))
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") && !strings.Contains(trimmed, "\n") {
+			continue
+		}
+		if _, err := parseManifestYAML(trimmed); err != nil {
+			return nil, err
+		}
+		documents = append(documents, trimmed+"\n")
+	}
+	if len(documents) == 0 {
+		return nil, errors.New("manifest must contain at least one YAML object")
+	}
+	return documents, nil
 }
 
 func NewManifestDocument(object *unstructured.Unstructured, identity ManifestIdentity) (ManifestDocument, error) {

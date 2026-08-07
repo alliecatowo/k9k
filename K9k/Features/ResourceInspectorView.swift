@@ -82,6 +82,9 @@ struct ResourceInspectorView: View {
             metrics(resource)
             rolloutDetails(resource)
             rbacDetails(resource)
+            if resource.labels?["owner"] == "helm", let release = helmReleaseName(resource), let namespace = resource.namespace, !namespace.isEmpty {
+                HelmReleaseHistorySection(release: release, namespace: namespace)
+            }
             if resource.kind == "Pod", let containers = resource.raw?.objectValue?["spec"]?.objectValue?["containers"]?.arrayValue, !containers.isEmpty {
                 Section("Containers") {
                     ForEach(Array(containers.enumerated()), id: \.offset) { _, container in
@@ -275,5 +278,10 @@ struct ResourceInspectorView: View {
         let verbs = list(rule["verbs"], fallback: "no verbs")
         if let urls = rule["nonResourceURLs"], !list(urls).isEmpty { return "\(verbs) · \(list(urls))" }
         return verbs
+    }
+
+    private func helmReleaseName(_ resource: ResourceSummary) -> String? {
+        if let name = resource.labels?["name"], !name.isEmpty { return name }
+        return resource.raw?.objectValue?["metadata"]?.objectValue?["annotations"]?.objectValue?["meta.helm.sh/release-name"]?.stringValue
     }
 }

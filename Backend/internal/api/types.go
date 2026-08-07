@@ -56,6 +56,31 @@ type ResourceSummary struct {
 	Raw        map[string]any    `json:"raw,omitempty"`
 }
 
+// HelmReleaseHistory is a bounded, metadata-only view of a Helm v3 release's
+// standard Secret storage. Helm records one Secret per revision and exposes
+// release name, revision, and lifecycle state in labels. Keeping this surface
+// metadata-only means K9k can present useful history without decoding the
+// opaque release payload (which may contain chart values and rendered
+// manifests).
+type HelmReleaseHistory struct {
+	Release   string                `json:"release"`
+	Namespace string                `json:"namespace,omitempty"`
+	Revisions []HelmReleaseRevision `json:"revisions"`
+	Total     int                   `json:"total"`
+	Truncated bool                  `json:"truncated"`
+}
+
+// HelmReleaseRevision identifies one Helm storage Secret. Revision zero is
+// reserved for malformed legacy storage where Helm did not provide a numeric
+// version label; it is shown after valid revisions rather than discarded.
+type HelmReleaseRevision struct {
+	Revision    int       `json:"revision"`
+	Status      string    `json:"status"`
+	StorageName string    `json:"storageName"`
+	CreatedAt   time.Time `json:"createdAt"`
+	Age         string    `json:"age"`
+}
+
 // RelationshipGraph is a bounded, read-only topology snapshot centred on one
 // selected object. Nodes use stable object identity where Kubernetes provided
 // a UID; unresolved references are retained rather than silently discarded.

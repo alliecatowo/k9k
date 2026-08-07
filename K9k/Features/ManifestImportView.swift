@@ -14,54 +14,65 @@ struct ManifestImportView: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Import \(type.kind) Manifest").font(.headline)
-                    Text("K9k validates against the selected cluster before it creates anything.").font(.caption).foregroundStyle(.secondary)
+                    Text("Import \(type.kind) Manifests").font(.headline)
+                    Text("K9k validates every document against the selected cluster before it applies anything.").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Open YAML…") { openFile() }.disabled(isWorking)
+                Button("Open YAML Files…") { openFiles() }.disabled(isWorking)
                 Button("Close") { dismiss() }
             }.padding()
             Divider()
             SyntaxHighlightingEditor(source: $source, language: .yaml, isEditable: !isWorking).padding(10)
             Divider()
             HStack {
-                Text(validationMessage ?? "Paste YAML or open a YAML file. Namespace and name come from the manifest.")
+                Text(validationMessage ?? "Paste one or more YAML documents, or select YAML files. Namespace and name come from each manifest.")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 Spacer()
                 Button("Validate") { validate() }.disabled(source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isWorking)
-                Button("Create…") { applyConfirmation = true }.disabled(source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isWorking || store.isReadOnly)
+                Button("Apply \(documentLabel)…") { applyConfirmation = true }.disabled(source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isWorking || store.isReadOnly)
             }.padding()
         }
         .frame(minWidth: 820, minHeight: 620)
-        .confirmationDialog("Create this manifest?", isPresented: $applyConfirmation, titleVisibility: .visible) {
-            Button("Create", role: .destructive) { create() }
-        } message: { Text("K9k will dry-run this exact YAML first, then create it through server-side apply if validation succeeds.") }
+        .confirmationDialog("Apply manifest batch?", isPresented: $applyConfirmation, titleVisibility: .visible) {
+            Button("Apply \(documentLabel)", role: .destructive) { apply() }
+        } message: { Text("K9k will dry-run every document first, then server-side apply the exact batch without forcing ownership. Kubernetes does not provide a transaction across multiple resources, so a later write could fail after an earlier one succeeds.") }
     }
 
-    private func openFile() {
+    private var documentLabel: String {
+        let count = source.components(separatedBy: "\n---").count
+        return count == 1 ? "Manifest" : "\(count) Documents"
+    }
+
+    private func openFiles() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.yaml]
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { source = try String(contentsOf: url, encoding: .utf8) }
-        catch { store.errorMessage = "K9k could not read the selected manifest: \(error.localizedDescription)" }
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+        do {
+            source = try panel.urls.map { try String(contentsOf: $0, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n---\n")
+        } catch { store.errorMessage = "K9k could not read the selected manifests: \(error.localizedDescription)" }
     }
 
     private func validate() {
         isWorking = true
         Task {
             defer { isWorking = false }
-            do { _ = try await store.importManifest(type: type, source: source, confirm: false); validationMessage = "Validated by Kubernetes — no changes applied." }
+            do {
+                let result = try await store.importManifestBatch(type: type, source: source, confirm: false)
+                validationMessage = "Validated \(result.items.count) document\(result.items.count == 1 ? "" : "s") by Kubernetes — no changes applied."
+            }
             catch { validationMessage = "Validation failed."; store.errorMessage = error.localizedDescription }
         }
     }
 
-    private func create() {
+    private func apply() {
         isWorking = true
         Task {
             defer { isWorking = false }
-            do { _ = try await store.importManifest(type: type, source: source, confirm: true); await store.loadResources(); dismiss() }
-            catch { validationMessage = "Create failed."; store.errorMessage = error.localizedDescription }
+            do { _ = try await store.importManifestBatch(type: type, source: source, confirm: true); await store.loadResources(); dismiss() }
+            catch { validationMessage = "Batch apply failed. Earlier documents may have been applied."; store.errorMessage = error.localizedDescription }
         }
     }
 }

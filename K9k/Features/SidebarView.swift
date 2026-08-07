@@ -6,7 +6,7 @@ struct SidebarView: View {
     let browseResources: () -> Void
 
     var body: some View {
-        List(selection: $selectedResourceType) {
+        List(selection: resourceSelection) {
             Section("Cluster") {
                 Label(store.selectedContext?.name ?? "Connecting…", systemImage: "server.rack")
                     .font(.headline)
@@ -47,6 +47,22 @@ struct SidebarView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
         }
+    }
+
+    /// Sidebar selection is routed through the store rather than assigning the
+    /// binding directly. Besides clearing stale GVR-specific selectors, this
+    /// makes palette, sidebar, and history navigation share one state path.
+    private var resourceSelection: Binding<ResourceType?> {
+        Binding(
+            get: { selectedResourceType },
+            set: { newValue in
+                guard let newValue else {
+                    selectedResourceType = nil
+                    return
+                }
+                Task { await store.selectResourceType(newValue) }
+            }
+        )
     }
 
     @ViewBuilder
