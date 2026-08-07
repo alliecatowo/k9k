@@ -331,6 +331,16 @@ func TestServerContextAndReadOperations(t *testing.T) {
 	}
 }
 
+func TestResourceTypeSerializesMissingShortNamesAsArray(t *testing.T) {
+	encoded, err := json.Marshal(ResourceType{Version: "v1", Resource: "pods", Kind: "Pod"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"shortNames":[]`) {
+		t.Fatalf("short names must be an array for Swift decoding, got %s", encoded)
+	}
+}
+
 func TestServerConfigSummaryAcceptsMissingAndPartialK9sConfiguration(t *testing.T) {
 	directory := t.TempDir()
 	if err := os.WriteFile(filepath.Join(directory, "aliases.yaml"), []byte("aliases:\n  po: v1/pods\n"), 0o600); err != nil {

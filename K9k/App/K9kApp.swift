@@ -10,7 +10,10 @@ struct K9kApp: App {
             K9kRootView()
                 .environment(store)
                 .frame(minWidth: 980, minHeight: 620)
+                .background(WindowSizeConfigurator(minimumSize: NSSize(width: 980, height: 620)))
         }
+        .defaultSize(width: 1280, height: 800)
+        .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(after: .newItem) {
                 Button("New Cluster Window") {

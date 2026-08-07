@@ -1,6 +1,9 @@
 package api
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Context struct {
 	Name    string `json:"name"`
@@ -16,6 +19,17 @@ type ResourceType struct {
 	Kind       string   `json:"kind"`
 	Namespaced bool     `json:"namespaced"`
 	ShortNames []string `json:"shortNames"`
+}
+
+// MarshalJSON keeps the cross-process contract Swift-friendly: Kubernetes
+// discovery commonly supplies nil short names, but absence means an empty
+// collection rather than a nullable field.
+func (r ResourceType) MarshalJSON() ([]byte, error) {
+	type wire ResourceType
+	if r.ShortNames == nil {
+		r.ShortNames = []string{}
+	}
+	return json.Marshal(wire(r))
 }
 
 type ResourceSummary struct {

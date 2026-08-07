@@ -24,6 +24,7 @@ struct K9kRootView: View {
         }
         .toolbar { toolbar }
         .task { await store.connect() }
+        .onChange(of: store.discoveredResources) { _, _ in store.ensureDefaultResourceSelection() }
         .onChange(of: store.selectedResourceType) { _, newValue in if let newValue { Task { await store.selectResourceType(newValue) } } }
         .onChange(of: store.selectedNamespace) { _, _ in Task { await store.loadResources() } }
         .onChange(of: store.selectedResources) { _, selection in Task { await store.loadEvents(for: store.resource(for: selection.first)) } }

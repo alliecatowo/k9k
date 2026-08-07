@@ -19,6 +19,7 @@ final class ClusterStore {
     var isLoading = false
     var isReadOnly = false
     var activeStreamID: String?
+    var k9sAliases: [K9sAlias] = []
 
     var events: [ClusterEvent] = []
     var logLines: [String] = []
@@ -47,7 +48,10 @@ final class ClusterStore {
             contexts = try decodeArray((try await contextsEnvelope).result, as: KubeContext.self)
             selectedContext = contexts.first(where: \.active) ?? contexts.first
             discoveredResources = try decodeArray((try await discoveryEnvelope).result, as: ResourceType.self)
-            selectedResourceType = preferredResource(named: "pods") ?? discoveredResources.first
+            if let config = try? decode((try await client.request("config.summary")).result, as: K9sConfigSummary.self) {
+                k9sAliases = config.aliases
+            }
+            ensureDefaultResourceSelection()
             await loadNamespaces()
             await loadResources()
         } catch { errorMessage = error.localizedDescription }
@@ -68,7 +72,10 @@ final class ClusterStore {
     }
 
     func refreshDiscovery() async {
-        do { discoveredResources = try decodeArray((try await client.request("discovery.list")).result, as: ResourceType.self) }
+        do {
+            discoveredResources = try decodeArray((try await client.request("discovery.list")).result, as: ResourceType.self)
+            ensureDefaultResourceSelection()
+        }
         catch { errorMessage = error.localizedDescription }
     }
 
@@ -144,6 +151,27 @@ final class ClusterStore {
     }
 
     func resource(for id: ResourceSummary.ID?) -> ResourceSummary? { guard let id else { return nil }; return resources.first(where: { $0.id == id }) }
+
+    func resourceType(forK9sAlias name: String) -> ResourceType? {
+        var visited = Set<String>()
+        func resolve(_ target: String) -> ResourceType? {
+            let normalized = target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if let direct = discoveredResources.first(where: { type in
+                type.resource.lowercased() == normalized || type.shortNames.map { $0.lowercased() }.contains(normalized) || type.gvr.lowercased() == normalized
+            }) {
+                return direct
+            }
+            guard visited.insert(normalized).inserted,
+                  let alias = k9sAliases.first(where: { $0.name.lowercased() == normalized }) else { return nil }
+            return resolve(alias.target)
+        }
+        return resolve(name)
+    }
+
+    func ensureDefaultResourceSelection() {
+        guard selectedResourceType == nil || !discoveredResources.contains(selectedResourceType!) else { return }
+        selectedResourceType = preferredResource(named: "pods") ?? discoveredResources.first
+    }
 
     private func preferredResource(named name: String) -> ResourceType? { discoveredResources.first { $0.resource == name && $0.group.isEmpty } }
     private func operationParameters(type: ResourceType, resource: ResourceSummary, additional: [String: JSONValue] = [:]) -> JSONValue {

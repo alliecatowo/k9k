@@ -5,10 +5,24 @@ struct CommandPaletteView: View {
     @Binding var isPresented: Bool
     @State private var query = ""
 
-    private var matches: [ResourceType] {
+    private struct Item: Identifiable {
+        let type: ResourceType
+        let title: String
+        let detail: String
+        var id: String { "\(title)-\(type.id)" }
+    }
+
+    private var matches: [Item] {
         let normalized = query.lowercased().trimmingCharacters(in: .whitespaces)
-        guard !normalized.isEmpty else { return Array(store.discoveredResources.prefix(14)) }
-        return store.discoveredResources.filter { $0.kind.lowercased().contains(normalized) || $0.resource.lowercased().contains(normalized) || $0.shortNames.contains(normalized) }.prefix(14).map { $0 }
+        let resources = store.discoveredResources.filter { type in
+            normalized.isEmpty || type.kind.lowercased().contains(normalized) || type.resource.lowercased().contains(normalized) || type.shortNames.map { $0.lowercased() }.contains(normalized)
+        }.map { Item(type: $0, title: $0.kind, detail: $0.shortNames.joined(separator: ", ")) }
+        let aliases = store.k9sAliases.compactMap { alias -> Item? in
+            guard normalized.isEmpty || alias.name.lowercased().contains(normalized) || alias.target.lowercased().contains(normalized),
+                  let type = store.resourceType(forK9sAlias: alias.name) else { return nil }
+            return Item(type: type, title: alias.name, detail: "K9s alias → \(alias.target)")
+        }
+        return Array((aliases + resources).prefix(14))
     }
 
     var body: some View {
@@ -17,8 +31,8 @@ struct CommandPaletteView: View {
                 .textFieldStyle(.roundedBorder)
                 .font(.title3)
             List(matches) { type in
-                Button { store.selectedResourceType = type; isPresented = false } label: {
-                    HStack { Image(systemName: "cube"); Text(type.kind); Spacer(); Text(type.shortNames.joined(separator: ", ")).foregroundStyle(.secondary) }
+                Button { Task { await store.selectResourceType(type.type) }; isPresented = false } label: {
+                    HStack { Image(systemName: "cube"); Text(type.title); Spacer(); Text(type.detail).foregroundStyle(.secondary) }
                 }
                 .buttonStyle(.plain)
             }

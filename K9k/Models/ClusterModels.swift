@@ -8,6 +8,19 @@ struct KubeContext: Codable, Identifiable, Hashable {
     var id: String { name }
 }
 
+// K9sConfigSummary is intentionally metadata-only. K9k can use familiar
+// resource aliases without importing executable plugin behaviour.
+struct K9sConfigSummary: Codable, Hashable {
+    let directory: String
+    let aliases: [K9sAlias]
+}
+
+struct K9sAlias: Codable, Identifiable, Hashable {
+    let name: String
+    let target: String
+    var id: String { name }
+}
+
 struct ResourceType: Codable, Identifiable, Hashable {
     let group: String
     let version: String
@@ -16,6 +29,7 @@ struct ResourceType: Codable, Identifiable, Hashable {
     let namespaced: Bool
     let shortNames: [String]
     var id: String { "\(group)/\(version)/\(resource)" }
+    var gvr: String { group.isEmpty ? "\(version)/\(resource)" : "\(group)/\(version)/\(resource)" }
 
     var groupDisplayName: String { group.isEmpty ? "core" : group }
     var requestParameters: JSONValue {
