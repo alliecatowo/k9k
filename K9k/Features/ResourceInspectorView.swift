@@ -32,8 +32,11 @@ struct ResourceInspectorView: View {
                 ContentUnavailableView("No Selection", systemImage: "sidebar.right", description: Text("Select a \(type?.kind ?? "resource") to inspect its status, metadata, and raw Kubernetes object."))
             }
         }
-        .task(id: resource?.id) {
-            guard let resource else { return }
+        .task(id: "\(resource?.id ?? "")-\(section.rawValue)") {
+            // Event polling is valuable while reading the timeline but wastes
+            // API capacity (and triggers needless view updates) on Overview,
+            // Raw JSON, and Metadata.
+            guard section == .events, let resource else { return }
             while !Task.isCancelled {
                 await store.loadEvents(for: resource)
                 try? await Task.sleep(for: .seconds(5))
