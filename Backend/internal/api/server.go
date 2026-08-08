@@ -90,11 +90,19 @@ type Server struct {
 	writeMu  sync.Mutex
 	streamMu sync.Mutex
 	streams  map[string]context.CancelFunc
-	execMu   sync.Mutex
-	execs    map[string]*execSession
-	policyMu sync.RWMutex
-	readOnly bool
-	work     sync.WaitGroup
+	// Context selection is a stream barrier.  A stream captures the current
+	// generation at registration; once a switch starts, old generations cannot
+	// emit events while the next Kubernetes clients are being installed.
+	contextMu              sync.RWMutex
+	contextSelectMu        sync.Mutex
+	contextGeneration      uint64
+	contextSwitching       bool
+	contextSwitchesPending int
+	execMu                 sync.Mutex
+	execs                  map[string]*execSession
+	policyMu               sync.RWMutex
+	readOnly               bool
+	work                   sync.WaitGroup
 }
 
 func NewServer(cluster ClusterClient, input io.Reader, output io.Writer) *Server {
@@ -217,6 +225,69 @@ func (s *Server) dispatch(ctx context.Context, request protocol.Request) {
 
 func (s *Server) isReadOnly() bool       { s.policyMu.RLock(); defer s.policyMu.RUnlock(); return s.readOnly }
 func (s *Server) setReadOnly(value bool) { s.policyMu.Lock(); s.readOnly = value; s.policyMu.Unlock() }
+
+// registerContextStream reserves a stream only while the selected Kubernetes
+// context is stable.  A request that races a context switch gets a structured
+// failure instead of attaching to clients that are about to be replaced.
+func (s *Server) registerContextStream(requestID, streamID string, cancel context.CancelFunc) (uint64, bool) {
+	s.contextMu.RLock()
+	defer s.contextMu.RUnlock()
+	if s.contextSwitching {
+		cancel()
+		s.writeFailure(requestID, "context_switching", errors.New("Kubernetes context is changing; retry the stream after the switch completes"), nil)
+		return 0, true
+	}
+	if s.registerStreamFailure(requestID, streamID, cancel) {
+		return 0, true
+	}
+	return s.contextGeneration, false
+}
+
+// selectContext serializes the complete stream-barrier and client-replacement
+// interval. A second requested switch keeps the barrier closed while waiting
+// for the first to finish, so no stream can attach to transient A clients
+// between A and B selections.
+func (s *Server) selectContext(name string) error {
+	s.contextMu.Lock()
+	s.contextSwitching = true
+	s.contextSwitchesPending++
+	s.contextGeneration++
+	s.cancelAllStreams()
+	s.contextMu.Unlock()
+
+	s.contextSelectMu.Lock()
+	err := s.cluster.SelectContext(name)
+	s.contextSelectMu.Unlock()
+
+	s.contextMu.Lock()
+	s.contextSwitchesPending--
+	if s.contextSwitchesPending == 0 {
+		s.contextSwitching = false
+	}
+	s.contextMu.Unlock()
+	return err
+}
+
+func (s *Server) writeStreamResponse(requestID, streamID string, generation uint64, result any) bool {
+	s.contextMu.RLock()
+	current := !s.contextSwitching && generation == s.contextGeneration
+	if current {
+		s.write(protocol.Response(requestID, result))
+	}
+	s.contextMu.RUnlock()
+	if !current {
+		s.writeFailure(requestID, "context_switched", fmt.Errorf("stream %q was cancelled because the Kubernetes context changed", streamID), nil)
+	}
+	return current
+}
+
+func (s *Server) writeStreamEvent(streamID string, generation uint64, event string, result any) {
+	s.contextMu.RLock()
+	if !s.contextSwitching && generation == s.contextGeneration {
+		s.write(protocol.Event(streamID, event, result))
+	}
+	s.contextMu.RUnlock()
+}
 
 func protectedReadOnlyOperation(operation string) bool {
 	switch operation {
@@ -363,9 +434,10 @@ type execSession struct {
 // escape sequences and non-UTF-8 output. The GUI can therefore feed the
 // decoded bytes directly to a terminal emulator without newline heuristics.
 type execEventWriter struct {
-	server   *Server
-	streamID string
-	event    string
+	server     *Server
+	streamID   string
+	generation uint64
+	event      string
 }
 
 func (w execEventWriter) Write(data []byte) (int, error) {
@@ -375,9 +447,9 @@ func (w execEventWriter) Write(data []byte) (int, error) {
 		if length > maxExecOutputChunkBytes {
 			length = maxExecOutputChunkBytes
 		}
-		w.server.write(protocol.Event(w.streamID, w.event, map[string]any{
+		w.server.writeStreamEvent(w.streamID, w.generation, w.event, map[string]any{
 			"encoding": "base64", "dataBase64": base64.StdEncoding.EncodeToString(data[:length]),
-		}))
+		})
 		data = data[length:]
 	}
 	return written, nil
@@ -472,7 +544,11 @@ func (s *Server) handle(ctx context.Context, request protocol.Request) (any, *op
 		if params.Name == "" {
 			return nil, invalidParams(errors.New("name is required"))
 		}
-		if err := s.cluster.SelectContext(params.Name); err != nil {
+		// Streams own clients captured at open time.  Fence and cancel every
+		// one before replacing those clients so an old-cluster terminal, log,
+		// watch, or tunnel can never outlive the selected context.
+		err := s.selectContext(params.Name)
+		if err != nil {
 			return nil, kubeError(err)
 		}
 		return map[string]any{"selected": params.Name}, nil
@@ -1452,7 +1528,8 @@ func (s *Server) startExec(ctx context.Context, request protocol.Request) {
 	}
 
 	streamContext, cancel := context.WithCancel(ctx)
-	if s.registerStreamFailure(request.ID, streamID, cancel) {
+	generation, rejected := s.registerContextStream(request.ID, streamID, cancel)
+	if rejected {
 		return
 	}
 	input := newExecInput()
@@ -1478,8 +1555,17 @@ func (s *Server) startExec(ctx context.Context, request protocol.Request) {
 		"pod": params.Pod, "container": params.Container, "command": params.Command,
 		"tty": params.tty(), "stdin": params.stdin(),
 	}
-	s.write(protocol.Response(request.ID, result))
-	s.write(protocol.Event(streamID, "exec.started", result))
+	if !s.writeStreamResponse(request.ID, streamID, generation, result) {
+		s.unregisterExecSession(streamID)
+		s.unregisterStream(streamID)
+		input.Close()
+		if resize != nil {
+			resize.Close()
+		}
+		cancel()
+		return
+	}
+	s.writeStreamEvent(streamID, generation, "exec.started", result)
 	s.work.Add(1)
 	go func() {
 		defer s.work.Done()
@@ -1492,8 +1578,8 @@ func (s *Server) startExec(ctx context.Context, request protocol.Request) {
 		}
 
 		streams := PodExecStreams{
-			Stdout: execEventWriter{server: s, streamID: streamID, event: "exec.stdout"},
-			Stderr: execEventWriter{server: s, streamID: streamID, event: "exec.stderr"},
+			Stdout: execEventWriter{server: s, streamID: streamID, generation: generation, event: "exec.stdout"},
+			Stderr: execEventWriter{server: s, streamID: streamID, generation: generation, event: "exec.stderr"},
 		}
 		if params.stdin() {
 			streams.Stdin = input
@@ -1514,10 +1600,10 @@ func (s *Server) startExec(ctx context.Context, request protocol.Request) {
 			if isExit {
 				closeResult["exitCode"] = exitCode
 			}
-			s.write(protocol.Event(streamID, "exec.error", closeResult))
+			s.writeStreamEvent(streamID, generation, "exec.error", closeResult)
 		}
 		closeResult["reason"] = reason
-		s.write(protocol.Event(streamID, "exec.closed", closeResult))
+		s.writeStreamEvent(streamID, generation, "exec.closed", closeResult)
 	}()
 }
 
@@ -1543,7 +1629,8 @@ func (s *Server) startAttach(ctx context.Context, request protocol.Request) {
 		return
 	}
 	streamContext, cancel := context.WithCancel(ctx)
-	if s.registerStreamFailure(request.ID, streamID, cancel) {
+	generation, rejected := s.registerContextStream(request.ID, streamID, cancel)
+	if rejected {
 		return
 	}
 	input := newExecInput()
@@ -1564,8 +1651,17 @@ func (s *Server) startAttach(ctx context.Context, request protocol.Request) {
 		return
 	}
 	result := map[string]any{"streamID": streamID, "status": "started", "namespace": params.Namespace, "pod": params.Pod, "container": params.Container, "attach": true, "tty": params.tty(), "stdin": params.stdin()}
-	s.write(protocol.Response(request.ID, result))
-	s.write(protocol.Event(streamID, "exec.started", result))
+	if !s.writeStreamResponse(request.ID, streamID, generation, result) {
+		s.unregisterExecSession(streamID)
+		s.unregisterStream(streamID)
+		input.Close()
+		if resize != nil {
+			resize.Close()
+		}
+		cancel()
+		return
+	}
+	s.writeStreamEvent(streamID, generation, "exec.started", result)
 	s.work.Add(1)
 	go func() {
 		defer s.work.Done()
@@ -1576,7 +1672,7 @@ func (s *Server) startAttach(ctx context.Context, request protocol.Request) {
 		if resize != nil {
 			defer resize.Close()
 		}
-		streams := PodExecStreams{Stdout: execEventWriter{server: s, streamID: streamID, event: "exec.stdout"}, Stderr: execEventWriter{server: s, streamID: streamID, event: "exec.stderr"}}
+		streams := PodExecStreams{Stdout: execEventWriter{server: s, streamID: streamID, generation: generation, event: "exec.stdout"}, Stderr: execEventWriter{server: s, streamID: streamID, generation: generation, event: "exec.stderr"}}
 		if params.stdin() {
 			streams.Stdin = input
 		}
@@ -1592,9 +1688,9 @@ func (s *Server) startAttach(ctx context.Context, request protocol.Request) {
 			if exitCode, isExit := remoteExitCode(err); isExit {
 				closeResult["exitCode"] = exitCode
 			}
-			s.write(protocol.Event(streamID, "exec.error", closeResult))
+			s.writeStreamEvent(streamID, generation, "exec.error", closeResult)
 		}
-		s.write(protocol.Event(streamID, "exec.closed", closeResult))
+		s.writeStreamEvent(streamID, generation, "exec.closed", closeResult)
 	}()
 }
 
@@ -1666,7 +1762,8 @@ func (s *Server) startPortForward(ctx context.Context, request protocol.Request)
 	}
 
 	streamContext, cancel := context.WithCancel(ctx)
-	if s.registerStreamFailure(request.ID, streamID, cancel) {
+	generation, rejected := s.registerContextStream(request.ID, streamID, cancel)
+	if rejected {
 		return
 	}
 	defer s.unregisterStream(streamID)
@@ -1686,6 +1783,7 @@ func (s *Server) startPortForward(ctx context.Context, request protocol.Request)
 	}()
 
 	var forwardErr error
+	responseWritten := false
 	select {
 	case binding := <-ready:
 		if streamContext.Err() != nil {
@@ -1697,8 +1795,12 @@ func (s *Server) startPortForward(ctx context.Context, request protocol.Request)
 			"pod": binding.Pod, "localAddress": binding.LocalAddress,
 			"localPort": binding.LocalPort, "remotePort": binding.RemotePort,
 		}
-		s.write(protocol.Response(request.ID, result))
-		s.write(protocol.Event(streamID, "portforward.ready", result))
+		if !s.writeStreamResponse(request.ID, streamID, generation, result) {
+			forwardErr = <-done
+			break
+		}
+		responseWritten = true
+		s.writeStreamEvent(streamID, generation, "portforward.ready", result)
 		forwardErr = <-done
 	case forwardErr = <-done:
 		if streamContext.Err() == nil {
@@ -1709,15 +1811,20 @@ func (s *Server) startPortForward(ctx context.Context, request protocol.Request)
 			return
 		}
 	}
+	if streamContext.Err() != nil && !responseWritten {
+		// A cancellation before readiness must still resolve the request rather
+		// than leaving the native caller suspended forever.
+		s.writeStreamResponse(request.ID, streamID, generation, map[string]any{"streamID": streamID, "status": "cancelled"})
+	}
 
 	reason := "completed"
 	if streamContext.Err() != nil {
 		reason = "cancelled"
 	} else if forwardErr != nil {
 		reason = "error"
-		s.write(protocol.Event(streamID, "portforward.error", map[string]any{"message": forwardErr.Error()}))
+		s.writeStreamEvent(streamID, generation, "portforward.error", map[string]any{"message": forwardErr.Error()})
 	}
-	s.write(protocol.Event(streamID, "portforward.closed", map[string]any{"reason": reason}))
+	s.writeStreamEvent(streamID, generation, "portforward.closed", map[string]any{"reason": reason})
 }
 
 const (
@@ -1782,7 +1889,8 @@ func (s *Server) startLogs(ctx context.Context, request protocol.Request) {
 		return
 	}
 	streamContext, cancel := context.WithCancel(ctx)
-	if s.registerStreamFailure(request.ID, streamID, cancel) {
+	generation, rejected := s.registerContextStream(request.ID, streamID, cancel)
+	if rejected {
 		return
 	}
 	stream, err := s.cluster.PodLogs(streamContext, params.request())
@@ -1792,7 +1900,12 @@ func (s *Server) startLogs(ctx context.Context, request protocol.Request) {
 		s.writeFailure(request.ID, "kubernetes_error", err, nil)
 		return
 	}
-	s.write(protocol.Response(request.ID, map[string]any{"streamID": streamID, "status": "started"}))
+	if !s.writeStreamResponse(request.ID, streamID, generation, map[string]any{"streamID": streamID, "status": "started"}) {
+		s.unregisterStream(streamID)
+		cancel()
+		_ = stream.Close()
+		return
+	}
 	s.work.Add(1)
 	go func() {
 		defer s.work.Done()
@@ -1802,17 +1915,17 @@ func (s *Server) startLogs(ctx context.Context, request protocol.Request) {
 		scanner := bufio.NewScanner(stream)
 		scanner.Buffer(make([]byte, 64*1024), maxRequestBytes)
 		for scanner.Scan() {
-			s.write(protocol.Event(streamID, "logs.data", map[string]any{"line": scanner.Text()}))
+			s.writeStreamEvent(streamID, generation, "logs.data", map[string]any{"line": scanner.Text()})
 		}
 		reason := "completed"
 		if streamContext.Err() != nil {
 			reason = "cancelled"
 		}
 		if err := scanner.Err(); err != nil && streamContext.Err() == nil {
-			s.write(protocol.Event(streamID, "logs.error", map[string]any{"message": err.Error()}))
+			s.writeStreamEvent(streamID, generation, "logs.error", map[string]any{"message": err.Error()})
 			reason = "error"
 		}
-		s.write(protocol.Event(streamID, "logs.closed", map[string]any{"reason": reason}))
+		s.writeStreamEvent(streamID, generation, "logs.closed", map[string]any{"reason": reason})
 	}()
 }
 
@@ -1832,7 +1945,8 @@ func (s *Server) startWatch(ctx context.Context, request protocol.Request) {
 	}
 
 	watchContext, cancel := context.WithCancel(ctx)
-	if s.registerStreamFailure(request.ID, streamID, cancel) {
+	generation, rejected := s.registerContextStream(request.ID, streamID, cancel)
+	if rejected {
 		return
 	}
 
@@ -1844,39 +1958,44 @@ func (s *Server) startWatch(ctx context.Context, request protocol.Request) {
 		return
 	}
 
-	s.write(protocol.Response(request.ID, map[string]any{"streamID": streamID, "status": "started"}))
+	if !s.writeStreamResponse(request.ID, streamID, generation, map[string]any{"streamID": streamID, "status": "started"}) {
+		s.unregisterStream(streamID)
+		cancel()
+		watcher.Stop()
+		return
+	}
 	s.work.Add(1)
 	go func() {
 		defer s.work.Done()
 		defer s.unregisterStream(streamID)
 		defer cancel()
 		defer watcher.Stop()
-		s.write(protocol.Event(streamID, "resource.watch.started", map[string]any{"gvr": params.gvrString(), "namespace": params.Namespace, "resourceVersion": params.ResourceVersion}))
+		s.writeStreamEvent(streamID, generation, "resource.watch.started", map[string]any{"gvr": params.gvrString(), "namespace": params.Namespace, "resourceVersion": params.ResourceVersion})
 
 		for event := range watcher.ResultChan() {
 			if object, ok := event.Object.(*unstructured.Unstructured); ok {
 				name := watchEventName(event.Type)
 				if name != "" {
 					if params.Compact {
-						s.write(protocol.Event(streamID, name, summarizeProjected(object, params.Columns)))
+						s.writeStreamEvent(streamID, generation, name, summarizeProjected(object, params.Columns))
 					} else {
-						s.write(protocol.Event(streamID, name, summarize(object)))
+						s.writeStreamEvent(streamID, generation, name, summarize(object))
 					}
 					continue
 				}
 				if event.Type == watch.Bookmark {
-					s.write(protocol.Event(streamID, "resource.watch.bookmark", map[string]any{"resourceVersion": object.GetResourceVersion()}))
+					s.writeStreamEvent(streamID, generation, "resource.watch.bookmark", map[string]any{"resourceVersion": object.GetResourceVersion()})
 					continue
 				}
 			}
-			s.write(protocol.Event(streamID, "resource.watch.event", map[string]any{"type": string(event.Type), "resource": event.Object}))
+			s.writeStreamEvent(streamID, generation, "resource.watch.event", map[string]any{"type": string(event.Type), "resource": event.Object})
 		}
 
 		reason := "completed"
 		if watchContext.Err() != nil {
 			reason = "cancelled"
 		}
-		s.write(protocol.Event(streamID, "resource.watch.closed", map[string]any{"reason": reason}))
+		s.writeStreamEvent(streamID, generation, "resource.watch.closed", map[string]any{"reason": reason})
 	}()
 }
 

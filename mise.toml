@@ -40,21 +40,33 @@ run = "xcodebuild -project K9k.xcodeproj -scheme K9k -configuration Debug -sdk m
 description = "Test bounded, local-only benchmark history"
 run = "Scripts/test-benchmark-history.sh"
 
+[tasks.test-core-client-policy]
+description = "Test app-wide helper read-only policy replay"
+run = "Scripts/test-core-client-policy.sh"
+
+[tasks.test-workspace-geometry]
+description = "Test native three-column workspace geometry"
+run = "Scripts/check-workspace-geometry.sh"
+
 [tasks.test]
 description = "Run K9k unit tests"
-run = "mise run test-go && mise run test-benchmark-history && mise run test-swift"
+run = "mise run test-go && mise run test-benchmark-history && mise run test-core-client-policy && mise run test-workspace-geometry && mise run test-swift"
 
 [tasks.format]
 description = "Format Go sources"
 run = "cd Backend && gofmt -w $(find . -name '*.go' -not -path './vendor/*')"
+
+[tasks.format-check]
+description = "Verify Go formatting without changing the checkout"
+run = "Scripts/check-go-format.sh"
 
 [tasks.lint]
 description = "Run static analysis"
 run = "cd Backend && go vet ./..."
 
 [tasks.check]
-description = "Run formatting, tests, and static analysis"
-run = "mise run format && mise run test && mise run lint"
+description = "Run non-mutating formatting, tests, and static analysis"
+run = "mise run format-check && mise run test && mise run lint"
 
 [tasks.run]
 description = "Build and open K9k"

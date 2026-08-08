@@ -2,7 +2,9 @@ import SwiftUI
 
 struct K9kRootView: View {
     @Environment(ClusterStore.self) private var store
+    @State private var splitVisibility: NavigationSplitViewVisibility = .all
     @State private var inspectorIsPresented = true
+    @State private var inspectorRevealGeneration = 0
     @State private var paletteIsPresented = false
     @State private var destructiveConfirmation = false
     @State private var logsPresented = false
@@ -34,27 +36,26 @@ struct K9kRootView: View {
 
     var body: some View {
         @Bindable var store = store
+        let selectionHydration = SelectionHydration(
+            contextID: store.selectedContext?.id,
+            resourceTypeID: store.selectedResourceType?.id,
+            selectedResourceIDs: store.selectedResources
+        )
         navigationContent(selectedResourceType: $store.selectedResourceType)
         .toolbar { toolbar }
         .task { await store.connect() }
         .onChange(of: store.discoveredResources) { _, _ in store.ensureDefaultResourceSelection() }
         .onChange(of: store.selectedResourceType) { _, newValue in if newValue != nil { Task { await store.loadResources() } } }
         .onChange(of: store.selectedNamespace) { _, _ in Task { await store.loadResources() } }
-        .onChange(of: store.selectedResources) { _, selection in
-            let deferForInspectorPresentation = inspectorIsPresented
-            Task {
-                // A selected object may need a full resource.get decode before
-                // its detailed inspector data can be shown. Let the native
-                // inspector finish its reveal first, then hydrate only if the
-                // selection is still current.
-                if deferForInspectorPresentation {
-                    try? await Task.sleep(for: .milliseconds(300))
-                    guard !Task.isCancelled else { return }
-                    let selectionIsStillCurrent = store.selectedResources == selection
-                    guard selectionIsStillCurrent else { return }
-                }
-                await store.loadSelectedResourceSummary(for: selection.first)
-            }
+        .task(id: selectionHydration) {
+            // Selection hydration is ordinary data work, not part of the
+            // inspector animation. Starting it immediately removes a fixed
+            // 300 ms penalty from every row click. task(id:) cancels the
+            // previous selection's work, while the store revalidates the
+            // selected resource after each awaited backend request.
+            guard !Task.isCancelled,
+                  selectionHydration == currentSelectionHydration else { return }
+            await store.loadSelectedResourceSummary(for: selectionHydration.selectedResourceIDs.first)
         }
         .onChange(of: store.pulseDrilldownTarget) { _, target in
             if target != nil { pulsePresented = true }
@@ -102,28 +103,69 @@ struct K9kRootView: View {
         }
     }
 
+    private var currentSelectionHydration: SelectionHydration {
+        SelectionHydration(
+            contextID: store.selectedContext?.id,
+            resourceTypeID: store.selectedResourceType?.id,
+            selectedResourceIDs: store.selectedResources
+        )
+    }
+
+    /// Includes cluster and GVR identity so a same-UID selection reached
+    /// through a context or navigation change cannot reuse stale hydration.
+    private struct SelectionHydration: Equatable {
+        let contextID: String?
+        let resourceTypeID: String?
+        let selectedResourceIDs: Set<ResourceSummary.ID>
+    }
+
+    /// Records the transition before presenting the native inspector so its
+    /// content can distinguish a real reveal from an ordinary row change.
+    private var inspectorPresentation: Binding<Bool> {
+        Binding(
+            get: { inspectorIsPresented },
+            set: { newValue in
+                guard newValue != inspectorIsPresented else { return }
+                if newValue { inspectorRevealGeneration &+= 1 }
+                inspectorIsPresented = newValue
+            }
+        )
+    }
+
     @ViewBuilder private func navigationContent(selectedResourceType: Binding<ResourceType?>) -> some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $splitVisibility) {
             SidebarView(selectedResourceType: selectedResourceType) { paletteIsPresented = true }
                 // Kubernetes names, namespaces, and custom resources are often
                 // long; a narrow Finder-like sidebar hides the operational
                 // context people need while scanning a cluster.
-                .navigationSplitViewColumnWidth(min: 340, ideal: 380, max: 480)
+                .navigationSplitViewColumnWidth(
+                    min: WorkspaceGeometry.sidebarMinimumWidth,
+                    ideal: WorkspaceGeometry.sidebarIdealWidth,
+                    max: WorkspaceGeometry.sidebarMaximumWidth
+                )
         } detail: {
-            ResourceBrowserView(inspectorIsPresented: $inspectorIsPresented, destructiveConfirmation: $destructiveConfirmation)
+            ResourceBrowserView(
+                inspectorIsPresented: inspectorPresentation,
+                destructiveConfirmation: $destructiveConfirmation
+            )
         }
         .navigationSplitViewStyle(.balanced)
-        .inspector(isPresented: $inspectorIsPresented) {
+        .inspector(isPresented: inspectorPresentation) {
             ResourceInspectorView(
                 resource: store.resource(for: store.selectedResources.first),
                 type: store.selectedResourceType,
                 events: store.events,
-                isPresented: inspectorIsPresented
+                isPresented: inspectorIsPresented,
+                presentationGeneration: inspectorRevealGeneration
             )
                 // Inspector Forms include operationally important RBAC reasons,
                 // metrics diagnostics, and resource identities. A narrow
                 // column forces those values into unreadable fragments.
-                .inspectorColumnWidth(min: 360, ideal: 420, max: 560)
+                .inspectorColumnWidth(
+                    min: WorkspaceGeometry.inspectorMinimumWidth,
+                    ideal: WorkspaceGeometry.inspectorIdealWidth,
+                    max: WorkspaceGeometry.inspectorMaximumWidth
+                )
         }
     }
 
@@ -296,7 +338,7 @@ struct K9kRootView: View {
             Button { navigationHelpPresented = true } label: { Label("Navigation Help", systemImage: "questionmark.circle") }
                 .keyboardShortcut("?", modifiers: .command)
                 .help("Open navigation and command help")
-            Button { inspectorIsPresented.toggle() } label: { Label("Toggle Inspector", systemImage: "sidebar.right") }
+            Button { inspectorPresentation.wrappedValue.toggle() } label: { Label("Toggle Inspector", systemImage: "sidebar.right") }
                 .help("Show or hide inspector")
             Menu {
                 Button("Copy Name", action: store.copySelectedName).disabled(store.selectedResources.isEmpty)

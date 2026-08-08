@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Go safety and protocol
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: Backend/go.mod
+          cache-dependency-path: Backend/go.sum
+      - name: Check formatting
+        run: Scripts/check-go-format.sh
+      - name: Test with race detector
+        working-directory: Backend
+        run: go test -race ./...
+      - name: Vet
+        working-directory: Backend
+        run: go vet ./...
+      - name: Build helper
+        run: Scripts/build-core.sh
+
+  macos-app:
+    name: Native macOS app
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: Backend/go.mod
+          cache-dependency-path: Backend/go.sum
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          swift --version
+          go version
+      - name: Build and bundle app
+        run: Scripts/build-core.sh && Scripts/build-app.sh
+      - name: Test bounded benchmark history
+        run: Scripts/test-benchmark-history.sh
+      - name: Test helper policy replay
+        run: Scripts/test-core-client-policy.sh
+      - name: Test workspace geometry
+        run: Scripts/check-workspace-geometry.sh
+      - name: Verify bundled helper
+        run: |
+          test -x DerivedData/Build/Products/Debug/K9k.app/Contents/Resources/k9k-core
+          printf '%s\n' '{"version":1,"id":"ci-health","operation":"health.ping"}' \
+            | DerivedData/Build/Products/Debug/K9k.app/Contents/Resources/k9k-core \
+            | grep '"status":"ok"'
+          codesign --verify --deep --strict DerivedData/Build/Products/Debug/K9k.app

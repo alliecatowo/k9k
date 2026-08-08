@@ -328,6 +328,52 @@ func TestContextRenameAndDeleteModifyOnlyInactiveContextEntries(t *testing.T) {
 	}
 }
 
+func TestSelectContextFailurePreservesLiveClientsAndActiveContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	raw := clientcmdapi.Config{
+		CurrentContext: "active",
+		Contexts: map[string]*clientcmdapi.Context{
+			"active": {Cluster: "working-cluster"},
+			// The context itself is present, but its cluster reference cannot
+			// produce a REST config. This is the failure mode that previously
+			// changed c.context before retaining the old API clients.
+			"broken": {Cluster: "missing-cluster"},
+		},
+		Clusters: map[string]*clientcmdapi.Cluster{
+			"working-cluster": {Server: "https://kubernetes.example.test"},
+		},
+	}
+	if err := clientcmd.WriteToFile(raw, path); err != nil {
+		t.Fatal(err)
+	}
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	rules.ExplicitPath = path
+	cluster := &Cluster{rules: rules}
+	if err := cluster.reload("active"); err != nil {
+		t.Fatalf("initial reload = %v", err)
+	}
+	oldConfig, oldRest := cluster.config, cluster.rest
+	oldDynamic, oldTyped := cluster.dynamic, cluster.typed
+	oldDiscovery, oldMetrics := cluster.discovery, cluster.metrics
+
+	if err := cluster.SelectContext("broken"); err == nil {
+		t.Fatal("broken context selection unexpectedly succeeded")
+	}
+	if cluster.context != "active" || cluster.config != oldConfig || cluster.rest != oldRest ||
+		cluster.dynamic != oldDynamic || cluster.typed != oldTyped || cluster.discovery != oldDiscovery || cluster.metrics != oldMetrics {
+		t.Fatalf("failed selection replaced live state: context=%q configChanged=%t restChanged=%t dynamicChanged=%t typedChanged=%t discoveryChanged=%t metricsChanged=%t",
+			cluster.context, cluster.config != oldConfig, cluster.rest != oldRest, cluster.dynamic != oldDynamic,
+			cluster.typed != oldTyped, cluster.discovery != oldDiscovery, cluster.metrics != oldMetrics)
+	}
+	contexts, err := cluster.Contexts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contexts) != 2 || !contexts[0].Active {
+		t.Fatalf("contexts after failed selection = %#v, want active context preserved", contexts)
+	}
+}
+
 func TestCopyContextPreservesReferencesAndChangesOnlyNamespace(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config")
 	raw := clientcmdapi.Config{Contexts: map[string]*clientcmdapi.Context{

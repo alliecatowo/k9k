@@ -4,10 +4,13 @@ import AppKit
 @main
 struct K9kApp: App {
     // The browser, operational sidebar, and inspector all carry information
-    // that must stay readable at once. Below this width AppKit may otherwise
-    // compress an inspector despite its preferred column width and clip its
-    // segmented control or LabeledContent values.
-    private static let minimumWorkspaceSize = NSSize(width: 1_120, height: 620)
+    // that must stay readable at once. This is derived from the same geometry
+    // contract as the split-view columns so restored windows cannot compress
+    // the table underneath Tahoe's floating sidebar.
+    private static let minimumWorkspaceSize = NSSize(
+        width: WorkspaceGeometry.minimumWindowSize.width,
+        height: WorkspaceGeometry.minimumWindowSize.height
+    )
 
     @State private var store = ClusterStore()
 
@@ -18,7 +21,7 @@ struct K9kApp: App {
                 .frame(minWidth: Self.minimumWorkspaceSize.width, minHeight: Self.minimumWorkspaceSize.height)
                 .background(WindowSizeConfigurator(minimumSize: Self.minimumWorkspaceSize))
         }
-        .defaultSize(width: 1280, height: 800)
+        .defaultSize(width: WorkspaceGeometry.defaultWindowWidth, height: 800)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(after: .newItem) {

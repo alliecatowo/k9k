@@ -64,9 +64,14 @@ final class ClusterStore {
     private var selectorResourceTypeID: String?
     var errorMessage: String?
     var isLoading = false
+    /// Context switching has a separate lifecycle from ordinary resource
+    /// loading. ClusterStore is MainActor-isolated but reentrant at awaits, so
+    /// this gate prevents two toolbar/settings selections from interleaving.
+    private(set) var isSelectingContext = false
     var isReadOnly = UserDefaults.standard.bool(forKey: "k9k.readOnly") {
         didSet {
             UserDefaults.standard.set(isReadOnly, forKey: "k9k.readOnly")
+            CoreClient.setApplicationReadOnlyPolicy(isReadOnly)
             Task { await synchronizeReadOnlyPolicy() }
         }
     }
@@ -132,6 +137,10 @@ final class ClusterStore {
     // and watch start carries this generation so a late Pod response can never
     // replace the table after the user has already selected Deployments.
     private var resourceLoadGeneration = 0
+    // Context changes invalidate every long-lived operation.  This generation
+    // also prevents an in-flight open/reconnect from attaching an old-cluster
+    // session after the UI has already switched credentials.
+    private var contextGeneration = 0
     private var resourceIndexByID: [ResourceSummary.ID: Int] = [:]
     private let resourcePageLimit = 250
     private var navigationHistory: [ResourceNavigationEntry] = []
@@ -149,6 +158,9 @@ final class ClusterStore {
     private let client = CoreClient()
 
     init() {
+        // The initial property value does not run didSet. Publish it before
+        // any of this store's or a secondary sheet's CoreClient can launch.
+        CoreClient.setApplicationReadOnlyPolicy(isReadOnly)
         client.onEvent = { [weak self] envelope in self?.apply(event: envelope) }
         loadNavigationHistory()
         loadSavedResourceQueries()
@@ -281,28 +293,62 @@ final class ClusterStore {
     /// protected requests before they reach a Kubernetes client.
     private func synchronizeReadOnlyPolicy() async {
         do {
-            _ = try await client.request("policy.readOnly", parameters: .object(["enabled": .bool(isReadOnly)]))
+            try await client.synchronizeApplicationReadOnlyPolicy()
         } catch {
             errorMessage = "K9k could not synchronize read-only safety: \(error.localizedDescription)"
         }
     }
 
     func selectContext(_ context: KubeContext) async {
+        guard !isSelectingContext else { return }
+        isSelectingContext = true
+        defer { isSelectingContext = false }
         isLoading = true
         defer { isLoading = false }
+        contextGeneration &+= 1
+        let generation = contextGeneration
         do {
-            // A loopback listener must never silently retarget a different
-            // kubeconfig context. Stop its live SPDY stream and any scheduled
-            // reconnect before swapping credentials/cluster clients.
-            await closeAllPortForwards()
+            // A loopback listener, terminal, log follow, or watch must never
+            // silently retarget a different kubeconfig context. Clear local
+            // ownership before issuing cancellations so late old events are
+            // ignored even if the helper is concurrently unwinding a stream.
+            await closeStreamsForContextChange()
             _ = try await client.request("context.select", parameters: .object(["name": .string(context.name)]))
+            guard generation == contextGeneration else { return }
             selectedContext = context
             contexts = contexts.map { KubeContext(name: $0.name, cluster: $0.cluster, user: $0.user, namespace: $0.namespace, active: $0.id == context.id) }
             selectedNamespace = "All Namespaces"
             await loadNamespaces()
             await refreshDiscovery()
             await loadResources()
-        } catch { errorMessage = error.localizedDescription }
+        } catch {
+            guard generation == contextGeneration else { return }
+            // A failed backend selection leaves the previous Cluster clients
+            // active by design. We already cancelled its old browser/watch,
+            // so re-read the authoritative helper context and rebuild the
+            // browser before surfacing the original selection failure.
+            let selectionError = error.localizedDescription
+            await restoreContextAfterSelectionFailure(generation: generation)
+            if generation == contextGeneration { errorMessage = selectionError }
+        }
+    }
+
+    private func restoreContextAfterSelectionFailure(generation: Int) async {
+        do {
+            let refreshedContexts = try decodeArray((try await client.request("context.list")).result, as: KubeContext.self)
+            guard generation == contextGeneration else { return }
+            contexts = refreshedContexts
+            selectedContext = refreshedContexts.first(where: \.active) ?? refreshedContexts.first
+            await loadNamespaces()
+            guard generation == contextGeneration else { return }
+            await refreshDiscovery()
+            guard generation == contextGeneration else { return }
+            await loadResources()
+        } catch {
+            // The original select error is the actionable failure. Do not
+            // replace it with a secondary refresh failure after rebuilding as
+            // much local state as the still-active helper can provide.
+        }
     }
 
     /// Retrieves structural kubeconfig references only. The helper does not
@@ -1537,12 +1583,15 @@ final class ClusterStore {
 
     func openExec(for resource: ResourceSummary, command: [String], container: String? = nil) async {
         guard resource.kind == "Pod", let namespace = resource.namespace else { return }
+        let contextGeneration = self.contextGeneration
         await updateExecAccess()
+        guard contextGeneration == self.contextGeneration else { return }
         guard canOpenExec else {
             errorMessage = execAccess?.reason ?? "The active Kubernetes identity is not authorized to open an exec session for this Pod."
             return
         }
         await closeExec()
+        guard contextGeneration == self.contextGeneration else { return }
         let streamID = UUID().uuidString
         activeExecStreamID = streamID
         var parameters: [String: JSONValue] = [
@@ -1559,19 +1608,24 @@ final class ClusterStore {
         do {
             _ = try await client.request("exec.open", parameters: .object(parameters))
         } catch {
-            activeExecStreamID = nil
-            errorMessage = error.localizedDescription
+            if activeExecStreamID == streamID {
+                activeExecStreamID = nil
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
     func openAttach(for resource: ResourceSummary, container: String? = nil) async {
         guard resource.kind == "Pod", let namespace = resource.namespace else { return }
+        let contextGeneration = self.contextGeneration
         await updateAttachAccess()
+        guard contextGeneration == self.contextGeneration else { return }
         guard canOpenAttach else {
             errorMessage = attachAccess?.reason ?? "The active Kubernetes identity is not authorized to attach to this Pod."
             return
         }
         await closeExec()
+        guard contextGeneration == self.contextGeneration else { return }
         let streamID = UUID().uuidString
         activeExecStreamID = streamID
         var parameters: [String: JSONValue] = [
@@ -1580,7 +1634,12 @@ final class ClusterStore {
         ]
         if let container, !container.isEmpty { parameters["container"] = .string(container) }
         do { _ = try await client.request("attach.open", parameters: .object(parameters)) }
-        catch { activeExecStreamID = nil; errorMessage = error.localizedDescription }
+        catch {
+            if activeExecStreamID == streamID {
+                activeExecStreamID = nil
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 
     func createDebugContainer(for resource: ResourceSummary, image: String, targetContainer: String) async {
@@ -1867,7 +1926,12 @@ final class ClusterStore {
             ]
             if let sinceSeconds { parameters["sinceSeconds"] = .number(Double(sinceSeconds)) }
             _ = try await client.request("logs.open", parameters: .object(parameters))
-        } catch { errorMessage = error.localizedDescription }
+        } catch {
+            if activeLogStreamID == streamID {
+                activeLogStreamID = nil
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 
     func closeLogs() async {
@@ -1881,10 +1945,15 @@ final class ClusterStore {
             errorMessage = "Ports must be between 1 and 65535 (or use 0 for an automatic local port)."
             return nil
         }
+        let contextGeneration = self.contextGeneration
         do {
             guard resource.kind == "Service" || resource.kind == "Pod" else { return nil }
             let request = PortForwardReconnectRequest(resource: resource, remotePort: remotePort, localPort: localPort)
             let session = try await startPortForward(request)
+            guard contextGeneration == self.contextGeneration else {
+                await client.cancel(streamID: session.streamID)
+                return nil
+            }
             let forward = ActivePortForward(
                 id: UUID(), streamID: session.streamID, binding: session.binding, connectionState: .connected
             )
@@ -1892,7 +1961,9 @@ final class ClusterStore {
             activePortForwards.append(forward)
             return forward
         } catch {
-            errorMessage = error.localizedDescription
+            if contextGeneration == self.contextGeneration {
+                errorMessage = error.localizedDescription
+            }
             return nil
         }
     }
@@ -1989,6 +2060,28 @@ final class ClusterStore {
         for forward in forwards { await client.cancel(streamID: forward.streamID) }
     }
 
+    /// Clears every locally owned stream before a kubeconfig context swap.
+    /// IDs are cleared before their cancellation requests so a buffered event
+    /// from the old helper session can never be accepted by the new context.
+    private func closeStreamsForContextChange() async {
+        resourceLoadGeneration &+= 1
+        let resourceWatch = activeStreamID
+        activeStreamID = nil
+
+        let logStream = activeLogStreamID
+        activeLogStreamID = nil
+        logLines = []
+        droppedLogLineCount = 0
+
+        let terminalStream = activeExecStreamID
+        activeExecStreamID = nil
+
+        if let resourceWatch { await client.cancel(streamID: resourceWatch) }
+        if let logStream { await client.cancel(streamID: logStream) }
+        if let terminalStream { await client.cancel(streamID: terminalStream) }
+        await closeAllPortForwards()
+    }
+
     private func schedulePortForwardReconnect(id: ActivePortForward.ID, reason: String? = nil) {
         guard let index = activePortForwards.firstIndex(where: { $0.id == id }),
               portForwardReconnectRequests[id] != nil else { return }
@@ -2016,8 +2109,13 @@ final class ClusterStore {
     private func reconnectPortForward(id: ActivePortForward.ID) async {
         guard let request = portForwardReconnectRequests[id],
               activePortForwards.contains(where: { $0.id == id }) else { return }
+        let contextGeneration = self.contextGeneration
         do {
             let session = try await startPortForward(request)
+            guard contextGeneration == self.contextGeneration else {
+                await client.cancel(streamID: session.streamID)
+                return
+            }
             guard let currentIndex = activePortForwards.firstIndex(where: { $0.id == id }) else {
                 await client.cancel(streamID: session.streamID)
                 return
@@ -2027,6 +2125,7 @@ final class ClusterStore {
             activePortForwards[currentIndex].connectionState = .connected
             portForwardReconnectTasks.removeValue(forKey: id)
         } catch {
+            guard contextGeneration == self.contextGeneration else { return }
             guard let currentIndex = activePortForwards.firstIndex(where: { $0.id == id }) else { return }
             let message = error.localizedDescription
             if case let .reconnecting(attempt, _) = activePortForwards[currentIndex].connectionState,
@@ -2196,6 +2295,7 @@ final class ClusterStore {
         }
         if event.type == "portforward.error", let streamID = event.streamID,
            let message = event.result?.objectValue?["message"]?.stringValue {
+            guard activePortForwards.contains(where: { $0.streamID == streamID }) else { return }
             portForwardFailureMessages[streamID] = message
             return
         }

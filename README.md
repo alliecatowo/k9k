@@ -6,9 +6,9 @@ K9k is a macOS Tahoe 26+ Kubernetes manager built with SwiftUI and a bundled Go 
 
 > K9s defines the Kubernetes workflows. Apple’s native macOS design defines the interface.
 
-![K9k inspecting a live Deployment in a local Kind fixture cluster](Documentation/Media/k9k-workload-inspector.jpeg)
+![K9k inspecting a live Pod in a local Kind fixture cluster](Documentation/Media/k9k-workspace-final.png)
 
-<p align="center"><sub>Live fixture-cluster capture: resource browser, native inspector, rollout health, RBAC preflight, and Kubernetes metadata in one window.</sub></p>
+<p align="center"><sub>Live fixture-cluster capture from the app: wide native sidebar, dense Pod browser, RBAC preflight, metrics diagnostics, and operational metadata in one window.</sub></p>
 
 ## What it feels like
 
@@ -59,7 +59,7 @@ K9k keeps the cluster context, namespace scope, selected resource, and navigatio
 
 ### Raw object fidelity
 
-![K9k showing syntax-highlighted raw Deployment JSON beside the live resource table](Documentation/Media/k9k-raw-json.jpeg)
+![K9k showing syntax-highlighted raw Pod JSON beside the live resource table](Documentation/Media/k9k-raw-json-final.png)
 
 <p align="center"><sub>Live fixture-cluster capture: inspect the API-faithful object without leaving the resource browser.</sub></p>
 
@@ -115,9 +115,9 @@ These tasks use the disposable `kind-k9k-test` context. Switch back to your prod
 
 ## Parity status
 
-K9k is actively developed and deliberately candid about parity. It covers many high-value K9s workflows today, but it is not yet complete K9s parity. Notable remaining areas include Helm upgrade/non-Secret storage, general manifest-directory browsing, and specialised K9s views. Host SSH is an explicit handoff to macOS OpenSSH using a supplied host/alias and existing SSH configuration/agent—K9k stores no credentials and never prompts for a password. Image scanning is available only through an explicitly configured local scanner; K9k never downloads, guesses, or auto-runs one. Node Shell is available through an explicitly configured, existing trusted DaemonSet rather than an automatically created privileged Pod.
+K9k is actively developed and deliberately candid about parity. It covers many high-value K9s workflows today, but it is not yet complete K9s parity. Notable remaining areas include remote/OCI Helm sources and non-Secret storage, Kustomize rendering, truly progressive browsing of very large resource sets, modern live Event streams, and the remainder of K9s's specialised renderers. Host SSH is an explicit handoff to macOS OpenSSH using a supplied host/alias and existing SSH configuration/agent—K9k stores no credentials and never prompts for a password. Image scanning is available only through an explicitly configured local scanner; K9k never downloads, guesses, or auto-runs one. Node Shell is available through an explicitly configured, existing trusted DaemonSet rather than an automatically created privileged Pod.
 
-See [K9S_PARITY.md](Docs/K9S_PARITY.md) for the source-pinned capability ledger, [ARCHITECTURE.md](Docs/ARCHITECTURE.md) for design, and [IPC_PROTOCOL.md](Docs/IPC_PROTOCOL.md) for the helper contract.
+See [RELEASE_AUDIT.md](Docs/RELEASE_AUDIT.md) for the prioritized implementation backlog, [K9S_PARITY.md](Docs/K9S_PARITY.md) for the source-pinned capability ledger, [ARCHITECTURE.md](Docs/ARCHITECTURE.md) for design, and [IPC_PROTOCOL.md](Docs/IPC_PROTOCOL.md) for the helper contract.
 
 ## Provenance
 

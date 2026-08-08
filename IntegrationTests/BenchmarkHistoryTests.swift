@@ -30,7 +30,9 @@ struct BenchmarkHistoryTests {
             precondition(history.entries.count == BenchmarkHistoryStore.maximumEntries, "non-loopback data must not enter history")
 
             let data = try history.exportData()
-            let exported = try JSONDecoder().decode([BenchmarkHistoryEntry].self, from: data)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let exported = try decoder.decode([BenchmarkHistoryEntry].self, from: data)
             precondition(exported.count == BenchmarkHistoryStore.maximumEntries, "explicit JSON export must include each retained summary")
             precondition(exported.allSatisfy { $0.successRate == 1 && $0.meanMilliseconds == 50 }, "derived summary metrics must remain stable")
 

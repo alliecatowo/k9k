@@ -23,13 +23,34 @@ final class CoreClient {
     /// retaining an unbounded partial NDJSON line on the main actor.
     private static let maximumBufferedEnvelopeBytes = 8 * 1024 * 1024
 
+    // The helper's read-only switch deliberately lives in its own process. A
+    // view that creates a short-lived CoreClient must therefore inherit the
+    // same policy as the main ClusterStore client before it can do anything
+    // else. Keep the desired value in this app-wide actor-isolated state,
+    // rather than trusting each feature view to remember a setup request.
+    private static var applicationReadOnlyPolicy = UserDefaults.standard.bool(forKey: "k9k.readOnly")
+    private static var applicationPolicyGeneration: UInt64 = 0
+
     private var process: Process?
     private var input: FileHandle?
     private var output: FileHandle?
     private var diagnostics: FileHandle?
     private var buffer = Data()
     private var continuations: [String: CheckedContinuation<CoreEnvelope, Error>] = [:]
+    // Reset with the transport: a relaunched helper starts writable even when
+    // the previous helper had already accepted this policy generation.
+    private var appliedPolicyGeneration: UInt64?
     var onEvent: ((CoreEnvelope) -> Void)?
+
+    /// Updates the desired policy synchronously on the main actor. Existing
+    /// helpers replay it on their next request; fresh helpers replay it before
+    /// their first normal request. This makes a Settings toggle global without
+    /// requiring views with secondary clients to coordinate manually.
+    static func setApplicationReadOnlyPolicy(_ enabled: Bool) {
+        guard applicationReadOnlyPolicy != enabled else { return }
+        applicationReadOnlyPolicy = enabled
+        applicationPolicyGeneration &+= 1
+    }
 
     func start() throws {
         if let process, process.isRunning { return }
@@ -84,6 +105,40 @@ final class CoreClient {
 
     func request(_ operation: String, parameters: JSONValue = .object([:])) async throws -> CoreEnvelope {
         try start()
+        if operation == "policy.readOnly" {
+            if let enabled = parameters.objectValue?["enabled"]?.boolValue {
+                Self.setApplicationReadOnlyPolicy(enabled)
+            }
+            let response = try await sendRequest(operation, parameters: parameters)
+            if let enabled = parameters.objectValue?["enabled"]?.boolValue,
+               enabled == Self.applicationReadOnlyPolicy {
+                appliedPolicyGeneration = Self.applicationPolicyGeneration
+            }
+            return response
+        }
+        try await synchronizeApplicationReadOnlyPolicy()
+        return try await sendRequest(operation, parameters: parameters)
+    }
+
+    /// Explicit synchronization is useful after the Settings toggle changes,
+    /// while `request` still calls this automatically for every non-policy
+    /// operation. The latter is the safety boundary for secondary sheets and
+    /// helper relaunches.
+    func synchronizeApplicationReadOnlyPolicy() async throws {
+        try start()
+        while appliedPolicyGeneration != Self.applicationPolicyGeneration {
+            let generation = Self.applicationPolicyGeneration
+            let enabled = Self.applicationReadOnlyPolicy
+            _ = try await sendRequest("policy.readOnly", parameters: .object(["enabled": .bool(enabled)]))
+            // A Settings change can occur while the helper responds. Replay
+            // the newer value before allowing an ordinary operation through.
+            if generation == Self.applicationPolicyGeneration {
+                appliedPolicyGeneration = generation
+            }
+        }
+    }
+
+    private func sendRequest(_ operation: String, parameters: JSONValue) async throws -> CoreEnvelope {
         let id = UUID().uuidString
         let request = CoreRequest(version: 1, id: id, operation: operation, streamID: nil, params: parameters)
         let data = try JSONEncoder().encode(request) + Data([0x0A])
@@ -175,6 +230,7 @@ final class CoreClient {
         diagnostics = nil
         process = nil
         buffer.removeAll(keepingCapacity: false)
+        appliedPolicyGeneration = nil
     }
 
     private func helperURL() -> URL? {

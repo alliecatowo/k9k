@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -94,6 +95,7 @@ type fakeCluster struct {
 	applyManifests    []ManifestApplyRequest
 	manifestDeletes   []ManifestIdentity
 	accessFn          func(AccessCheck) AccessReview
+	selectHook        func(string)
 }
 
 type resourceCall struct {
@@ -128,9 +130,13 @@ func (f *fakeCluster) InspectContext(name string) (KubeconfigContextInspection, 
 
 func (f *fakeCluster) SelectContext(name string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.selected = append(f.selected, name)
-	return f.selectErr
+	err, hook := f.selectErr, f.selectHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook(name)
+	}
+	return err
 }
 
 func (f *fakeCluster) UpdateContextNamespace(name, namespace string) error {
@@ -537,6 +543,173 @@ func TestServerReadOnlyPolicyRejectsProtectedOperationsBeforeKubernetes(t *testi
 	}
 }
 
+func TestServerContextSelectCancelsAllStreamsBeforeReplacingClients(t *testing.T) {
+	cancelled := make(chan string, 5)
+	var cancellationCountAtSelect int
+	client := &fakeCluster{selectHook: func(_ string) { cancellationCountAtSelect = len(cancelled) }}
+	var output lockedBuffer
+	server := NewServer(client, strings.NewReader(""), &output)
+	for _, id := range []string{"watch", "logs", "exec", "attach", "forward"} {
+		streamID := id
+		if got := server.registerStream(streamID, func() { cancelled <- streamID }); got != streamRegistered {
+			t.Fatalf("register %q = %v", streamID, got)
+		}
+	}
+
+	result, operationErr := server.handle(context.Background(), request("select", "context.select", map[string]any{"name": "production"}))
+	selected, ok := result.(map[string]any)
+	if operationErr != nil || !ok || selected["selected"] != "production" {
+		t.Fatalf("context.select result=%#v error=%#v", result, operationErr)
+	}
+	if cancellationCountAtSelect != 5 {
+		t.Fatalf("context select observed %d cancelled streams, want 5", cancellationCountAtSelect)
+	}
+	if len(cancelled) != 5 {
+		t.Fatalf("cancelled streams = %d, want 5", len(cancelled))
+	}
+	// An event from the just-cancelled generation must not be serialized after
+	// a successful context selection.
+	server.writeStreamEvent("watch", 0, "resource.added", map[string]any{"name": "old-cluster-pod"})
+	if values := decodeEnvelopes(t, output.String()); len(values) != 0 {
+		t.Fatalf("old context event escaped the switch fence: %#v", values)
+	}
+}
+
+func TestServerContextSelectFencesLateExecOutput(t *testing.T) {
+	lateWrite := make(chan struct{})
+	client := &fakeCluster{execFn: func(ctx context.Context, _ PodExecRequest, streams PodExecStreams) error {
+		<-ctx.Done()
+		_, _ = streams.Stdout.Write([]byte("late-old-context-output"))
+		close(lateWrite)
+		return nil
+	}}
+	inputReader, inputWriter := io.Pipe()
+	var output lockedBuffer
+	server := NewServer(client, inputReader, &output)
+	done := make(chan error, 1)
+	go func() { done <- server.Run(context.Background()) }()
+
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "open", Operation: "exec.open", StreamID: "terminal", Params: json.RawMessage(`{"namespace":"demo","pod":"api","command":["/bin/sh"]}`)})
+	waitFor(t, &output, func(values []protocol.Envelope) bool { return hasEnvelope(values, "open", "response") })
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "select", Operation: "context.select", Params: json.RawMessage(`{"name":"production"}`)})
+	waitFor(t, &output, func(values []protocol.Envelope) bool { return hasEnvelope(values, "select", "response") })
+	select {
+	case <-lateWrite:
+	case <-time.After(time.Second):
+		t.Fatal("context selection did not cancel the exec stream")
+	}
+	for _, envelope := range decodeEnvelopes(t, output.String()) {
+		if envelope.Type == "exec.stdout" {
+			t.Fatalf("late old-context terminal output escaped the switch fence: %#v", envelope)
+		}
+	}
+	if err := inputWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop")
+	}
+}
+
+func TestServerRejectsStreamWhileSecondContextSelectIsQueued(t *testing.T) {
+	firstEntered := make(chan struct{})
+	allowFirst := make(chan struct{})
+	secondEntered := make(chan struct{})
+	allowSecond := make(chan struct{})
+	client := &fakeCluster{selectHook: func(name string) {
+		switch name {
+		case "context-a":
+			close(firstEntered)
+			<-allowFirst
+		case "context-b":
+			close(secondEntered)
+			<-allowSecond
+		}
+	}}
+	inputReader, inputWriter := io.Pipe()
+	var output lockedBuffer
+	server := NewServer(client, inputReader, &output)
+	done := make(chan error, 1)
+	go func() { done <- server.Run(context.Background()) }()
+
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "select-a", Operation: "context.select", Params: json.RawMessage(`{"name":"context-a"}`)})
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first context selection did not start")
+	}
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "select-b", Operation: "context.select", Params: json.RawMessage(`{"name":"context-b"}`)})
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.contextMu.RLock()
+		pending := server.contextSwitchesPending
+		server.contextMu.RUnlock()
+		if pending == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second context selection did not establish a pending stream barrier")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(allowFirst)
+	select {
+	case <-secondEntered:
+	case <-time.After(time.Second):
+		t.Fatal("second context selection did not start after the first completed")
+	}
+
+	// A is complete, but B is still replacing clients. The stream must be
+	// rejected instead of binding to A during that otherwise tiny interval.
+	writeRequest(t, inputWriter, protocol.Request{Version: protocol.Version, ID: "logs", Operation: "logs.open", StreamID: "late", Params: json.RawMessage(`{"namespace":"demo","pod":"api"}`)})
+	waitFor(t, &output, func(values []protocol.Envelope) bool { return hasEnvelope(values, "logs", "response") })
+	if response := envelopeByID(t, decodeEnvelopes(t, output.String()), "logs"); response.Error == nil || response.Error.Code != "context_switching" {
+		t.Fatalf("stream opened between queued context switches: %#v", response)
+	}
+	close(allowSecond)
+	if err := inputWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop")
+	}
+}
+
+// Keep the helper's policy boundary explicit as new operations are added. A
+// secondary CoreClient replays policy.readOnly before its first operation, so
+// every write-capable or interactive route must be classified here rather than
+// relying on the originating SwiftUI button to be disabled.
+func TestProtectedReadOnlyOperationCoversMutatingAndInteractiveRoutes(t *testing.T) {
+	protected := []string{
+		"context.select", "context.update", "context.rename", "context.copy", "context.delete", "config.write",
+		"resource.patch", "resource.delete", "resource.scale",
+		"manifest.apply", "manifest.applyBatch", "manifest.applyMixed", "manifest.deleteBatch",
+		"node.drain", "pod.debug", "cronjob.trigger", "deployment.rollback",
+		"exec.open", "attach.open", "portforward.open",
+		"helm.rollback", "helm.uninstall", "helm.upgrade",
+	}
+	for _, operation := range protected {
+		if !protectedReadOnlyOperation(operation) {
+			t.Errorf("%q must be blocked by the read-only helper policy", operation)
+		}
+	}
+	for _, operation := range []string{"policy.readOnly", "resource.listPage", "resource.get", "resource.events", "logs.open", "helm.history", "helm.inspect"} {
+		if protectedReadOnlyOperation(operation) {
+			t.Errorf("%q must remain usable in read-only mode", operation)
+		}
+	}
+}
+
 func decodeEnvelopes(t *testing.T, output string) []protocol.Envelope {
 	t.Helper()
 	var result []protocol.Envelope
@@ -702,7 +875,9 @@ func TestServerContextInspectionIsReadOnlyAndAllowsActiveDefault(t *testing.T) {
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	if got, want := client.inspectedContexts, []string{"", "staging"}; !reflect.DeepEqual(got, want) {
+	got := append([]string(nil), client.inspectedContexts...)
+	sort.Strings(got)
+	if want := []string{"", "staging"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("inspected contexts = %#v, want %#v", got, want)
 	}
 }
@@ -1473,10 +1648,18 @@ func TestServerEffectiveRBACValidatesSubjectAndReturnsStaticExplanation(t *testi
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	if got, want := client.effectiveRBACs, []EffectiveRBACRequest{
+	got := append([]EffectiveRBACRequest(nil), client.effectiveRBACs...)
+	want := []EffectiveRBACRequest{
 		{SubjectKind: "ServiceAccount", SubjectName: "api", SubjectNamespace: "demo"},
 		{SubjectKind: "User", SubjectName: "alice", BindingNamespace: "team-a"},
-	}; !reflect.DeepEqual(got, want) {
+	}
+	sort.Slice(got, func(i, j int) bool {
+		return got[i].SubjectKind+got[i].SubjectName < got[j].SubjectKind+got[j].SubjectName
+	})
+	sort.Slice(want, func(i, j int) bool {
+		return want[i].SubjectKind+want[i].SubjectName < want[j].SubjectKind+want[j].SubjectName
+	})
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("effective requests = %#v, want %#v", got, want)
 	}
 }

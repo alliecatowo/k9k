@@ -65,9 +65,15 @@ func New() (*Cluster, error) {
 func (c *Cluster) reload(selected string) error {
 	overrides := &clientcmd.ConfigOverrides{CurrentContext: selected}
 	config := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(c.rules, overrides)
-	c.config, c.context = config, selected
 	restConfig, err := config.ClientConfig()
 	if err != nil {
+		// Keep the first deferred config so context.list still works when K9k
+		// starts without a usable current context.  Once a working client exists,
+		// a failed context selection must leave every live client and the displayed
+		// active context untouched.
+		if c.config == nil {
+			c.config, c.context = config, selected
+		}
 		return err
 	}
 	dyn, err := dynamic.NewForConfig(restConfig)
@@ -86,6 +92,10 @@ func (c *Cluster) reload(selected string) error {
 	if err != nil {
 		return err
 	}
+	// Do not publish a partial replacement.  In particular, a kubeconfig
+	// context with an invalid cluster/auth reference must not make the UI show
+	// that context while requests still use clients for the previous cluster.
+	c.config, c.context = config, selected
 	c.rest, c.dynamic, c.typed, c.discovery, c.metrics = restConfig, dyn, typed, disc, metricClient
 	return nil
 }

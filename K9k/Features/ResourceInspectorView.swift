@@ -3,13 +3,17 @@ import SwiftUI
 
 struct ResourceInspectorView: View {
     @Environment(ClusterStore.self) private var store
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
     let resource: ResourceSummary?
     let type: ResourceType?
     let events: [ClusterEvent]
     let isPresented: Bool
+    let presentationGeneration: Int
     @State private var section: InspectorSection = .overview
     @State private var isLoadingEvents = false
-    @State private var areOverviewDetailsReady = false
+    @State private var overviewDetailsResourceID: ResourceSummary.ID?
+    @State private var overviewPreparationTask: Task<Void, Never>?
+    @State private var handledPresentationGeneration = 0
 
     /// The raw-object viewer can be revisited many times while a watch is
     /// updating the resource list. Keep the expensive JSON serialization out
@@ -74,19 +78,27 @@ struct ResourceInspectorView: View {
                 await store.loadEvents(for: resource)
             }
         }
-        .task(id: "inspector-overview-\(resource?.id ?? "none")-\(isPresented)") {
-            guard isPresented, resource != nil else {
-                setOverviewDetailsReady(false)
-                return
-            }
-
-            setOverviewDetailsReady(false)
-            // The system owns this trailing inspector transition. Keep its
-            // first layout pass compact, then build the potentially large
-            // Kubernetes detail tree once the reveal has settled.
-            try? await Task.sleep(for: .milliseconds(260))
-            guard !Task.isCancelled, isPresented else { return }
-            setOverviewDetailsReady(true)
+        .onChange(of: resource?.id, initial: true) { _, resourceID in
+            prepareOverviewForSelection(resourceID)
+        }
+        .onChange(of: presentationGeneration, initial: true) { _, generation in
+            handleInspectorReveal(generation: generation)
+        }
+        .onChange(of: isPresented) { _, isPresented in
+            guard !isPresented else { return }
+            overviewPreparationTask?.cancel()
+            overviewPreparationTask = nil
+        }
+        .onChange(of: accessibilityReduceMotion) { _, reduceMotion in
+            guard reduceMotion, isPresented, let resourceID = resource?.id else { return }
+            overviewPreparationTask?.cancel()
+            overviewPreparationTask = nil
+            setOverviewDetailsResourceID(resourceID)
+            handledPresentationGeneration = presentationGeneration
+        }
+        .onDisappear {
+            overviewPreparationTask?.cancel()
+            overviewPreparationTask = nil
         }
     }
 
@@ -145,7 +157,7 @@ struct ResourceInspectorView: View {
     @ViewBuilder private func overview(_ resource: ResourceSummary) -> some View {
         Form {
             resourceSummary(resource)
-            if areOverviewDetailsReady {
+            if overviewDetailsResourceID == resource.id {
                 schemaFreeDetails(resource, type: type)
                 if let access = store.deleteAccess {
                     Section("Access") {
@@ -198,11 +210,60 @@ struct ResourceInspectorView: View {
         }
     }
 
-    private func setOverviewDetailsReady(_ value: Bool) {
+    private func setOverviewDetailsResourceID(_ value: ResourceSummary.ID?) {
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            areOverviewDetailsReady = value
+            overviewDetailsResourceID = value
+        }
+    }
+
+    /// Row selection while the inspector is already visible should feel
+    /// instantaneous. If selection changes while it is hidden, avoid building
+    /// an off-screen Form; the actual reveal path below will prepare it.
+    private func prepareOverviewForSelection(_ resourceID: ResourceSummary.ID?) {
+        overviewPreparationTask?.cancel()
+        overviewPreparationTask = nil
+        guard let resourceID else {
+            setOverviewDetailsResourceID(nil)
+            return
+        }
+        if isPresented, handledPresentationGeneration >= presentationGeneration {
+            setOverviewDetailsResourceID(resourceID)
+        } else if overviewDetailsResourceID != resourceID {
+            setOverviewDetailsResourceID(nil)
+        }
+    }
+
+    /// Defer the large detail tree only for a real hidden-to-visible system
+    /// inspector transition. A prepared resource survives hide/reveal, and
+    /// Reduce Motion skips the delay because the system transition is reduced.
+    private func handleInspectorReveal(generation: Int) {
+        overviewPreparationTask?.cancel()
+        overviewPreparationTask = nil
+        guard generation > handledPresentationGeneration, isPresented,
+              let resourceID = resource?.id else { return }
+
+        guard overviewDetailsResourceID != resourceID else {
+            handledPresentationGeneration = generation
+            return
+        }
+
+        guard !accessibilityReduceMotion else {
+            setOverviewDetailsResourceID(resourceID)
+            handledPresentationGeneration = generation
+            return
+        }
+
+        overviewPreparationTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(260))
+            guard !Task.isCancelled,
+                  self.isPresented,
+                  self.presentationGeneration == generation,
+                  self.resource?.id == resourceID else { return }
+            setOverviewDetailsResourceID(resourceID)
+            handledPresentationGeneration = generation
+            overviewPreparationTask = nil
         }
     }
 

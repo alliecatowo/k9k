@@ -40,7 +40,7 @@ Swift owns window lifecycle, navigation, tables, sheets, inspectors, searches, k
 5. Unexpected helper termination first clears the stale process and pipes, then fails outstanding continuations with `helperExited`; the next request launches a fresh helper instead of writing to a dead pipe.
 6. Explicit shutdown, write failures, and cancellation resolve pending continuations rather than leaving work suspended. An incomplete NDJSON envelope is capped at 8 MiB; an invalid or runaway helper is terminated and reported as a `protocol` error rather than retaining unbounded main-actor memory.
 
-The Swift startup code implements steps 1–4. `Backend/internal/api.Server` is now the Go request dispatcher for the baseline context, discovery, generic-resource, scale, watch, and cancellation operations. Reconnect/relist policy remains implementation work.
+The Swift client implements the complete lifecycle above, including bounded partial envelopes, stderr draining, stale-process isolation, and request failure on shutdown. `Backend/internal/api.Server` owns the current context, discovery, generic-resource, manifest, Helm, diagnostics, mutation, stream, and cancellation operations. Context replacement is atomic, context selection fences every old stream, and resource-watch/port-forward recovery is bounded and visible. The release audit tracks the remaining unary-request deadline work.
 
 ## Protocol contract
 
@@ -56,10 +56,10 @@ Preserve group, version, resource, kind when known, namespace, name, UID, and re
 
 | Family | Intended operations | Lifecycle requirement |
 | --- | --- | --- |
-| Connection | `context.list`, `context.select`, `namespace.list`, `namespace.select` | Context change invalidates clients, discovery, and streams. |
+| Connection | `context.list`, `context.select`, `namespace.list`, `namespace.select` | Context change stages every replacement client, atomically commits on success, and generation-fences all old streams. |
 | Discovery | `discovery.list` | Return scope, short names, preferred version, partial-discovery errors. |
 | Resources | `resource.list/get/watch/patch/delete` | Raw object plus display data; cancellable watch preserves event/resourceVersion. |
-| Diagnostics | `events.watch`, `metrics.watch`, `relationships.get` | Cancellable streams and explicit unsupported/forbidden results. |
+| Diagnostics | `resource.events`, `metrics.list`, `relationships.get` | Bounded snapshots and explicit unavailable/forbidden results; a scoped Event watch remains tracked in the release audit. |
 | Interactive streams | `logs.*`, `exec.*`, `attach.*` | Stream IDs, ordered data, resize/EOF/cancellation semantics. |
 | Operations | `resource.scale/restart`, `portforward.*`, `manifest.apply/delete` | Structured progress, completion, Kubernetes status errors. |
 | Security/extensions | `rbac.check`, plugins, Helm, scans | Explicit capability detection and permission errors. |
@@ -84,7 +84,7 @@ This follows K9s's `internal/client`, `dao`, `watch`, and `model` model. Focused
 - `CoreClient` is `@MainActor`; events update observable UI state on that actor.
 - Every request continuation resolves exactly once on response, failure, cancellation, timeout, or helper exit.
 - Mutations send full object identity and resourceVersion/preconditions where supported; conflicts and forbidden errors remain distinct.
-- A central read-only/RBAC/confirmation policy guards every mutation before IPC.
+- A central read-only/RBAC/confirmation policy guards every mutation before IPC. The app-wide desired read-only state is replayed to every primary or secondary helper before its next ordinary request, including after helper restart; the helper then enforces the policy before Kubernetes access.
 
 ## Native macOS presentation mapping
 
