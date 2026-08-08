@@ -14,6 +14,7 @@ struct LogStreamView: View {
     @State private var filter = ""
     @State private var wrapsLines = false
     @State private var hasStarted = false
+    @State private var pendingLineCount = 0
 
     private var containers: [LogContainerChoice] {
         let spec = resource.raw?.objectValue?["spec"]?.objectValue ?? [:]
@@ -95,21 +96,50 @@ struct LogStreamView: View {
                     .padding(.bottom, 6)
             }
             ScrollViewReader { proxy in
-                ScrollView([.vertical, .horizontal]) {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(visibleLines.enumerated()), id: \.offset) { offset, line in
-                            Text(line)
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
-                                .lineLimit(wrapsLines ? nil : 1)
-                                .fixedSize(horizontal: !wrapsLines, vertical: true)
-                                .frame(maxWidth: wrapsLines ? .infinity : nil, alignment: .leading)
-                                .id(offset)
+                ZStack(alignment: .bottomTrailing) {
+                    ScrollView([.vertical, .horizontal]) {
+                        LazyVStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(visibleLines.enumerated()), id: \.offset) { offset, line in
+                                Text(line)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .textSelection(.enabled)
+                                    .lineLimit(wrapsLines ? nil : 1)
+                                    .fixedSize(horizontal: !wrapsLines, vertical: true)
+                                    .frame(maxWidth: wrapsLines ? .infinity : nil, alignment: .leading)
+                                    .id(offset)
+                            }
                         }
+                        .padding()
                     }
-                    .padding()
+                    if pendingLineCount > 0 {
+                        Button {
+                            isFollowing = true
+                            pendingLineCount = 0
+                            scrollToLatest(with: proxy)
+                        } label: {
+                            Label("Jump to latest (\(pendingLineCount))", systemImage: "arrow.down.to.line.compact")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .padding(16)
+                        .accessibilityLabel("Jump to latest log output")
+                        .accessibilityHint("Resumes following \(pendingLineCount) new log line\(pendingLineCount == 1 ? "" : "s")")
+                    }
                 }
-                .onChange(of: visibleLines.count) { _, count in if isFollowing, count > 0 { withAnimation(.linear(duration: 0.1)) { proxy.scrollTo(count - 1, anchor: .bottom) } } }
+                .onChange(of: store.logLines.count) { previousCount, count in
+                    guard count > previousCount else { return }
+                    if isFollowing {
+                        pendingLineCount = 0
+                        scrollToLatest(with: proxy)
+                    } else {
+                        pendingLineCount += count - previousCount
+                    }
+                }
+                .onChange(of: isFollowing) { _, following in
+                    guard following else { return }
+                    pendingLineCount = 0
+                    scrollToLatest(with: proxy)
+                }
             }
         }
         .frame(minWidth: 760, minHeight: 440)
@@ -141,8 +171,16 @@ struct LogStreamView: View {
     }
 
     private func reload() {
+        pendingLineCount = 0
         Task {
             await openSelectedLogs()
+        }
+    }
+
+    private func scrollToLatest(with proxy: ScrollViewProxy) {
+        guard !visibleLines.isEmpty else { return }
+        withAnimation(.linear(duration: 0.1)) {
+            proxy.scrollTo(visibleLines.count - 1, anchor: .bottom)
         }
     }
 

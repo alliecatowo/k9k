@@ -49,7 +49,9 @@ struct K9kRootView: View {
                 // selection is still current.
                 if deferForInspectorPresentation {
                     try? await Task.sleep(for: .milliseconds(300))
-                    guard !Task.isCancelled, store.selectedResources == selection else { return }
+                    guard !Task.isCancelled else { return }
+                    let selectionIsStillCurrent = store.selectedResources == selection
+                    guard selectionIsStillCurrent else { return }
                 }
                 await store.loadSelectedResourceSummary(for: selection.first)
             }
@@ -128,14 +130,14 @@ struct K9kRootView: View {
     private func rootPresentations(
         destructiveConfirmation: Binding<Bool>, restartConfirmation: Binding<Bool>, rollbackConfirmation: Binding<Bool>, cronJobTriggerConfirmation: Binding<Bool>, nodeCordonConfirmation: Binding<Bool>,
         paletteIsPresented: Binding<Bool>, logsPresented: Binding<Bool>, portForwardPresented: Binding<Bool>, portForwardListPresented: Binding<Bool>,
-        scalePresented: Binding<Bool>, terminalPresented: Binding<Bool>, terminalMode: Binding<PodTerminalMode>, manifestEditorPresented: Binding<Bool>,
+        benchmarkHistory: BenchmarkHistoryStore, scalePresented: Binding<Bool>, terminalPresented: Binding<Bool>, terminalMode: Binding<PodTerminalMode>, manifestEditorPresented: Binding<Bool>,
         relationshipsPresented: Binding<Bool>, nodeDrainPresented: Binding<Bool>, nodeShellPresented: Binding<Bool>, debugPresented: Binding<Bool>, resourceSelectorsPresented: Binding<Bool>,
         pluginToRun: Binding<K9sPlugin?>, manifestImportPresented: Binding<Bool>, pulsePresented: Binding<Bool>, accessCheckPresented: Binding<Bool>, navigationHelpPresented: Binding<Bool>, imageScanPresented: Binding<Bool>, hostSSHPresented: Binding<Bool>
     ) -> some ViewModifier {
         RootPresentations(
             destructiveConfirmation: destructiveConfirmation, restartConfirmation: restartConfirmation, rollbackConfirmation: rollbackConfirmation, cronJobTriggerConfirmation: cronJobTriggerConfirmation,
             nodeCordonConfirmation: nodeCordonConfirmation, paletteIsPresented: paletteIsPresented, logsPresented: logsPresented,
-            portForwardPresented: portForwardPresented, portForwardListPresented: portForwardListPresented, scalePresented: scalePresented,
+            portForwardPresented: portForwardPresented, portForwardListPresented: portForwardListPresented, benchmarkHistory: benchmarkHistory, scalePresented: scalePresented,
             terminalPresented: terminalPresented, terminalMode: terminalMode, manifestEditorPresented: manifestEditorPresented,
             relationshipsPresented: relationshipsPresented, nodeDrainPresented: nodeDrainPresented, nodeShellPresented: nodeShellPresented, debugPresented: debugPresented,
             resourceSelectorsPresented: resourceSelectorsPresented, pluginToRun: pluginToRun, manifestImportPresented: manifestImportPresented, pulsePresented: pulsePresented,
@@ -144,7 +146,7 @@ struct K9kRootView: View {
     }
 
     private struct RootPresentations: ViewModifier {
-        private static let imageScannableKinds: Set<String> = ["Pod", "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "Job", "CronJob"]
+        fileprivate static let imageScannableKinds: Set<String> = ["Pod", "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "Job", "CronJob"]
         @Environment(ClusterStore.self) private var store
         @Binding var destructiveConfirmation: Bool
         @Binding var restartConfirmation: Bool
