@@ -1,11 +1,12 @@
 import AppKit
 import SwiftUI
 
-// SwiftUI's frame constraints can be compressed by a restored split-view
-// window. Apply the minimum to the owning NSWindow so all three columns remain
-// usable on first launch and after state restoration.
+// SwiftUI restores the last frame before laying out a NavigationSplitView. A
+// frame saved on a larger display can put the leading sidebar beyond a compact
+// display, so configure both the preferred minimum and screen reachability on
+// the owning NSWindow.
 struct WindowSizeConfigurator: NSViewRepresentable {
-    let minimumSize: NSSize
+    let preferredMinimumSize: NSSize
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
@@ -19,9 +20,27 @@ struct WindowSizeConfigurator: NSViewRepresentable {
 
     private func configure(_ window: NSWindow?) {
         guard let window else { return }
-        window.minSize = minimumSize
-        if window.contentLayoutRect.size.width < minimumSize.width || window.contentLayoutRect.size.height < minimumSize.height {
-            window.setContentSize(NSSize(width: max(minimumSize.width, window.contentLayoutRect.width), height: max(minimumSize.height, window.contentLayoutRect.height)))
+        guard let screen = window.screen ?? NSScreen.main else {
+            window.minSize = preferredMinimumSize
+            return
+        }
+
+        let visibleFrame = screen.visibleFrame
+        // A screen can be smaller than the preferred three-column workspace.
+        // Never make the minimum itself larger than the reachable display.
+        window.minSize = NSSize(
+            width: min(preferredMinimumSize.width, visibleFrame.width),
+            height: min(preferredMinimumSize.height, visibleFrame.height)
+        )
+
+        let normalized = WorkspaceGeometry.normalizedWindowFrame(
+            window.frame,
+            visibleFrame: visibleFrame,
+            preferredMinimumSize: preferredMinimumSize
+        )
+        let constrained = window.constrainFrameRect(normalized, to: screen)
+        if !window.frame.equalTo(constrained) {
+            window.setFrame(constrained, display: true)
         }
     }
 }

@@ -4,10 +4,10 @@ import AppKit
 @main
 struct K9kApp: App {
     // The browser, operational sidebar, and inspector all carry information
-    // that must stay readable at once. This is derived from the same geometry
-    // contract as the split-view columns so restored windows cannot compress
-    // the table underneath Tahoe's floating sidebar.
-    private static let minimumWorkspaceSize = NSSize(
+    // that should stay readable at once. The AppKit configurator treats this
+    // as a preferred minimum when the current display can accommodate it and
+    // yields to the visible frame on compact or newly attached displays.
+    private static let preferredWorkspaceSize = NSSize(
         width: WorkspaceGeometry.minimumWindowSize.width,
         height: WorkspaceGeometry.minimumWindowSize.height
     )
@@ -18,11 +18,9 @@ struct K9kApp: App {
         WindowGroup("K9k") {
             K9kRootView()
                 .environment(store)
-                .frame(minWidth: Self.minimumWorkspaceSize.width, minHeight: Self.minimumWorkspaceSize.height)
-                .background(WindowSizeConfigurator(minimumSize: Self.minimumWorkspaceSize))
+                .background(WindowSizeConfigurator(preferredMinimumSize: Self.preferredWorkspaceSize))
         }
         .defaultSize(width: WorkspaceGeometry.defaultWindowWidth, height: 800)
-        .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(after: .newItem) {
                 Button("New Cluster Window") {

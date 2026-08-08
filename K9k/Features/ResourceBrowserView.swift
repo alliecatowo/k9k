@@ -5,6 +5,7 @@ struct ResourceBrowserView: View {
     @Environment(ClusterStore.self) private var store
     @Binding var inspectorIsPresented: Bool
     @Binding var destructiveConfirmation: Bool
+    let availableColumnWidth: CGFloat
     @State private var sortOrder = [KeyPathComparator(\ResourceSummary.name)]
 
     var body: some View {
@@ -12,7 +13,8 @@ struct ResourceBrowserView: View {
         Group {
             if let type = store.selectedResourceType {
                 let customColumns = store.customColumns(for: type)
-                let columns = customColumns.isEmpty ? K9sViewColumn.nativeColumns(for: type) : customColumns
+                let configuredColumns = customColumns.isEmpty ? K9sViewColumn.nativeColumns(for: type) : customColumns
+                let columns = columnsThatFit(configuredColumns, availableWidth: availableColumnWidth)
                 Table(store.visibleResources, selection: $store.selectedResources, sortOrder: $sortOrder) {
                     // Native resource layouts and K9s custom views share the
                     // same Table rendering path. No concatenated pseudo-cell
@@ -27,6 +29,11 @@ struct ResourceBrowserView: View {
                 .tableStyle(.inset)
                 .alternatingRowBackgrounds(.disabled)
                 .scrollContentBackground(.hidden)
+                // Keep operational row text and selection fills inside the
+                // system-negotiated detail column. The split view already
+                // accounts for its sidebar; adding a second inset crushes the
+                // browser at compact widths.
+                .clipped()
                 .onChange(of: sortOrder) { _, newOrder in store.sortResources(using: newOrder) }
                 .contextMenu(forSelectionType: ResourceSummary.ID.self) { selection in
                     Button("Copy Name") { store.copySelectedName() }
@@ -122,6 +129,40 @@ struct ResourceBrowserView: View {
         case .labels: 260
         default: column.title.count > 14 ? 190 : 120
         }
+    }
+
+    /// K9s drops low-priority columns as the terminal narrows. Do the native
+    /// equivalent so SwiftUI never needs to horizontally scroll the Name
+    /// column beneath the sidebar. Name, Status, and Age are considered first;
+    /// remaining configured columns fill the measured browser budget in their
+    /// original order.
+    private func columnsThatFit(_ columns: [K9sViewColumn], availableWidth: CGFloat) -> [K9sViewColumn] {
+        guard columns.count > 1, availableWidth > 0 else { return columns }
+        let fullWidth = WorkspaceGeometry.estimatedTableWidth(
+            minimumColumnWidths: columns.map(columnMinimumWidth)
+        )
+        guard fullWidth > availableWidth else { return columns }
+
+        var chosen = Set<Int>()
+        let nameIndex = columns.firstIndex { if case .name = $0.source { true } else { false } } ?? columns.startIndex
+        let priorityIndices = [
+            nameIndex,
+            columns.firstIndex { if case .status = $0.source { true } else { false } },
+            columns.firstIndex { if case .age = $0.source { true } else { false } },
+        ].compactMap { $0 }
+
+        func addingFits(_ index: Int) -> Bool {
+            let candidate = (chosen.union([index])).sorted().map { columnMinimumWidth(columns[$0]) }
+            return WorkspaceGeometry.estimatedTableWidth(minimumColumnWidths: candidate) <= availableWidth
+        }
+
+        for index in priorityIndices where !chosen.contains(index) {
+            if chosen.isEmpty || addingFits(index) { chosen.insert(index) }
+        }
+        for index in columns.indices where !chosen.contains(index) {
+            if addingFits(index) { chosen.insert(index) }
+        }
+        return columns.indices.compactMap { chosen.contains($0) ? columns[$0] : nil }
     }
 
     private enum ExportFormat: String { case json, csv, tsv }

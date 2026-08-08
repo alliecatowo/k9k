@@ -1001,6 +1001,11 @@ final class ClusterStore {
             )
             resources[index] = hydrated
             return hydrated
+        } catch is CancellationError {
+            // Selection hydration is generation-scoped. A rapid row change
+            // deliberately cancels the obsolete request and must not surface
+            // that expected control flow as a modal application error.
+            return resource
         } catch {
             errorMessage = error.localizedDescription
             return resource

@@ -5,6 +5,10 @@ struct K9kRootView: View {
     @State private var splitVisibility: NavigationSplitViewVisibility = .all
     @State private var inspectorIsPresented = true
     @State private var inspectorRevealGeneration = 0
+    @State private var workspaceWidth = WorkspaceGeometry.defaultWindowWidth
+    @State private var renderedSidebarWidth = WorkspaceGeometry.sidebarMinimumWidth
+    @State private var renderedInspectorWidth = WorkspaceGeometry.inspectorMinimumWidth
+    @State private var compactLayoutIsActive = false
     @State private var paletteIsPresented = false
     @State private var destructiveConfirmation = false
     @State private var logsPresented = false
@@ -43,6 +47,26 @@ struct K9kRootView: View {
         )
         navigationContent(selectedResourceType: $store.selectedResourceType)
         .toolbar { toolbar }
+        .onGeometryChange(for: CGFloat.self) { geometry in
+            geometry.size.width
+        } action: { width in
+            workspaceWidth = width
+            let compact = WorkspaceGeometry.usesCompactSideColumns(windowWidth: width)
+            guard compact != compactLayoutIsActive else { return }
+            compactLayoutIsActive = compact
+
+            // Do not turn a restored wide inspector into an unsolicited
+            // modal sheet when the app first lands on a compact display.
+            // Once compact, an explicit inspector action opens the contained
+            // sheet and subsequent geometry updates leave it alone.
+            if compact, inspectorIsPresented {
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    inspectorIsPresented = false
+                }
+            }
+        }
         .task { await store.connect() }
         .onChange(of: store.discoveredResources) { _, _ in store.ensureDefaultResourceSelection() }
         .onChange(of: store.selectedResourceType) { _, newValue in if newValue != nil { Task { await store.loadResources() } } }
@@ -133,39 +157,109 @@ struct K9kRootView: View {
     }
 
     @ViewBuilder private func navigationContent(selectedResourceType: Binding<ResourceType?>) -> some View {
-        NavigationSplitView(columnVisibility: $splitVisibility) {
+        let usesCompactSideColumns = WorkspaceGeometry.usesCompactSideColumns(windowWidth: workspaceWidth)
+        let availableBrowserWidth = WorkspaceGeometry.browserWidth(
+            windowWidth: workspaceWidth,
+            sidebarWidth: splitVisibility == .detailOnly ? 0 : renderedSidebarWidth,
+            inspectorWidth: !usesCompactSideColumns && inspectorIsPresented
+                ? renderedInspectorWidth
+                : 0
+        )
+        let workspace = NavigationSplitView(columnVisibility: $splitVisibility) {
             SidebarView(selectedResourceType: selectedResourceType) { paletteIsPresented = true }
                 // Kubernetes names, namespaces, and custom resources are often
                 // long; a narrow Finder-like sidebar hides the operational
                 // context people need while scanning a cluster.
                 .navigationSplitViewColumnWidth(
                     min: WorkspaceGeometry.sidebarMinimumWidth,
-                    ideal: WorkspaceGeometry.sidebarIdealWidth,
-                    max: WorkspaceGeometry.sidebarMaximumWidth
+                    ideal: usesCompactSideColumns ? WorkspaceGeometry.sidebarMinimumWidth : WorkspaceGeometry.sidebarIdealWidth,
+                    max: usesCompactSideColumns ? WorkspaceGeometry.sidebarMinimumWidth : WorkspaceGeometry.sidebarMaximumWidth
                 )
+                .onGeometryChange(for: CGFloat.self) { geometry in
+                    geometry.size.width
+                } action: { width in
+                    let budgetWidth = WorkspaceGeometry.quantizedMeasuredWidth(width)
+                    if renderedSidebarWidth != budgetWidth {
+                        renderedSidebarWidth = budgetWidth
+                    }
+                }
         } detail: {
             ResourceBrowserView(
                 inspectorIsPresented: inspectorPresentation,
-                destructiveConfirmation: $destructiveConfirmation
+                destructiveConfirmation: $destructiveConfirmation,
+                availableColumnWidth: availableBrowserWidth
             )
         }
         .navigationSplitViewStyle(.balanced)
-        .inspector(isPresented: inspectorPresentation) {
-            ResourceInspectorView(
-                resource: store.resource(for: store.selectedResources.first),
-                type: store.selectedResourceType,
-                events: store.events,
-                isPresented: inspectorIsPresented,
-                presentationGeneration: inspectorRevealGeneration
-            )
-                // Inspector Forms include operationally important RBAC reasons,
-                // metrics diagnostics, and resource identities. A narrow
-                // column forces those values into unreadable fragments.
-                .inspectorColumnWidth(
-                    min: WorkspaceGeometry.inspectorMinimumWidth,
-                    ideal: WorkspaceGeometry.inspectorIdealWidth,
-                    max: WorkspaceGeometry.inspectorMaximumWidth
+
+        if usesCompactSideColumns {
+            workspace
+                .sheet(isPresented: inspectorPresentation) {
+                    NavigationStack {
+                        ResourceInspectorView(
+                            resource: store.resource(for: store.selectedResources.first),
+                            type: store.selectedResourceType,
+                            events: store.events,
+                            isPresented: inspectorIsPresented,
+                            presentationGeneration: inspectorRevealGeneration
+                        )
+                        .frame(
+                            minWidth: WorkspaceGeometry.compactInspectorMinimumWidth,
+                            idealWidth: WorkspaceGeometry.compactInspectorIdealWidth,
+                            minHeight: WorkspaceGeometry.compactInspectorMinimumHeight,
+                            idealHeight: WorkspaceGeometry.compactInspectorIdealHeight
+                        )
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button("Done") { inspectorPresentation.wrappedValue = false }
+                                    .keyboardShortcut(.defaultAction)
+                            }
+                        }
+                    }
+                }
+        } else {
+            // Tahoe can lay out a native .inspector partly beyond its owning
+            // window even when the declared column minimum mathematically
+            // fits. An in-flow HSplitView preserves the same resizable
+            // trailing-inspector interaction while making the window itself
+            // the hard clipping and sizing boundary. Keep the panel mounted
+            // at zero width when collapsed so its prepared overview and tab
+            // selection survive repeated toggles and the browser is never
+            // reparented into a different layout hierarchy.
+            HSplitView {
+                workspace
+                    .frame(minWidth: WorkspaceGeometry.sidebarMinimumWidth + WorkspaceGeometry.browserMinimumWidth)
+                    .layoutPriority(1)
+
+                ResourceInspectorView(
+                    resource: store.resource(for: store.selectedResources.first),
+                    type: store.selectedResourceType,
+                    events: store.events,
+                    isPresented: inspectorIsPresented,
+                    presentationGeneration: inspectorRevealGeneration
                 )
+                .frame(
+                    minWidth: inspectorIsPresented ? WorkspaceGeometry.inspectorMinimumWidth : 0,
+                    idealWidth: inspectorIsPresented ? WorkspaceGeometry.inspectorIdealWidth : 0,
+                    maxWidth: inspectorIsPresented ? WorkspaceGeometry.inspectorMaximumWidth : 0,
+                    maxHeight: .infinity,
+                    alignment: .topLeading
+                )
+                .opacity(inspectorIsPresented ? 1 : 0)
+                .allowsHitTesting(inspectorIsPresented)
+                .accessibilityHidden(!inspectorIsPresented)
+                .background(.regularMaterial)
+                .clipped()
+                .onGeometryChange(for: CGFloat.self) { geometry in
+                    geometry.size.width
+                } action: { width in
+                    guard inspectorIsPresented else { return }
+                    let budgetWidth = WorkspaceGeometry.quantizedMeasuredWidth(width)
+                    if renderedInspectorWidth != budgetWidth {
+                        renderedInspectorWidth = budgetWidth
+                    }
+                }
+            }
         }
     }
 

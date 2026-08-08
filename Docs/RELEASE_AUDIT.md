@@ -146,11 +146,13 @@ Finding: live inspection at the default 1280×800 window showed the Tahoe floati
 Acceptance criteria:
 
 - At default, minimum, restored, and full-screen window sizes, sidebar content, the complete first table column, and inspector content never overlap or clip.
-- Sidebar and inspector remain user-resizable and collapsible; the fix does not replace system `NavigationSplitView` or `.inspector` behavior.
+- The sidebar remains system-managed and resizable; the wide inspector remains resizable and collapsible, while compact layouts use a contained native sheet.
 - The Name column has a usable minimum after both navigation surfaces are visible.
 - Add deterministic screenshot/geometry regression coverage for sidebar shown/hidden and inspector shown/hidden.
 
-Primary files: `K9k/Features/K9kRootView.swift`, `K9k/App/K9kApp.swift`, `K9k/App/WindowSizeConfigurator.swift`, `K9k/Features/ResourceBrowserView.swift`.
+Resolution evidence: restored frames are normalized against the active display's visible frame without discarding valid Mac window restoration. Compact workspaces keep the wide operational sidebar and browser in the system-negotiated split lanes, while the inspector opens in a contained native sheet. Roomy windows use a resizable in-flow trailing split panel; SwiftUI's native `.inspector` was rejected after live testing showed Tahoe allocating part of its declared minimum beyond the owning window even at full-screen. The in-flow panel stays mounted at zero width when collapsed, preserving its selected tab and prepared details instead of rebuilding on every toggle. Like K9s, the native table computes its budget from measured split widths, quantized to avoid per-pixel rebuilds during divider drags, and drops lower-priority columns when its lane cannot hold them. Name, Status, and then Age stay ahead of optional projections instead of horizontally scrolling Name under the sidebar. The geometry harness covers oversized restored frames, compact screens, negative-origin displays, wide in-flow inspector sizing, measurement quantization, and the compact four-column/five-column threshold. Live validation exercises repeated sidebar and inspector presentation cycles at compact and wide sizes.
+
+Primary files: `K9k/Features/K9kRootView.swift`, `K9k/Features/ResourceBrowserView.swift`, `K9k/Features/ResourceInspectorView.swift`, `K9k/Services/ClusterStore.swift`, `K9k/App/K9kApp.swift`, and `K9k/App/WindowSizeConfigurator.swift`.
 
 ### K9K-OPS-005 — Stream modern Kubernetes Events
 

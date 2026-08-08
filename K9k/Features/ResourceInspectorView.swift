@@ -60,11 +60,11 @@ struct ResourceInspectorView: View {
                 ContentUnavailableView("No Selection", systemImage: "sidebar.right", description: Text("Select a \(type?.kind ?? "resource") to inspect its status, metadata, and raw Kubernetes object."))
             }
         }
-        .task(id: "\(resource?.id ?? "")-\(section.rawValue)") {
+        .task(id: "\(isPresented)-\(resource?.id ?? "")-\(section.rawValue)") {
             // Event polling is valuable while reading the timeline but wastes
             // API capacity (and triggers needless view updates) on Overview,
             // Raw JSON, and Metadata.
-            guard section == .events, let resource else {
+            guard isPresented, section == .events, let resource else {
                 isLoadingEvents = false
                 return
             }
@@ -228,8 +228,15 @@ struct ResourceInspectorView: View {
             setOverviewDetailsResourceID(nil)
             return
         }
-        if isPresented, handledPresentationGeneration >= presentationGeneration {
-            setOverviewDetailsResourceID(resourceID)
+        if isPresented {
+            if handledPresentationGeneration < presentationGeneration {
+                // A row can change during the short reveal handoff. Replace
+                // the cancelled preparation with one for the new resource so
+                // the inspector cannot remain on its Preparing state.
+                handleInspectorReveal(generation: presentationGeneration)
+            } else {
+                setOverviewDetailsResourceID(resourceID)
+            }
         } else if overviewDetailsResourceID != resourceID {
             setOverviewDetailsResourceID(nil)
         }
@@ -241,8 +248,14 @@ struct ResourceInspectorView: View {
     private func handleInspectorReveal(generation: Int) {
         overviewPreparationTask?.cancel()
         overviewPreparationTask = nil
-        guard generation > handledPresentationGeneration, isPresented,
-              let resourceID = resource?.id else { return }
+        guard generation > handledPresentationGeneration, isPresented else { return }
+        guard let resourceID = resource?.id else {
+            // Revealing an empty inspector completes the handoff. A later
+            // selection occurs in an already-visible surface and should
+            // prepare immediately rather than inheriting a stale generation.
+            handledPresentationGeneration = generation
+            return
+        }
 
         guard overviewDetailsResourceID != resourceID else {
             handledPresentationGeneration = generation
