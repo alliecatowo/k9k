@@ -1907,25 +1907,52 @@ func TestServerPortForwardReportsReadyAndCancellation(t *testing.T) {
 
 func TestServerPortForwardValidationAndStartupError(t *testing.T) {
 	client := &fakeCluster{portForwardErr: os.ErrPermission}
-	responses := runRequests(t, client,
+	inputReader, inputWriter := io.Pipe()
+	defer inputWriter.Close()
+	var output lockedBuffer
+	server := NewServer(client, inputReader, &output)
+	done := make(chan error, 1)
+	go func() { done <- server.Run(context.Background()) }()
+
+	for _, request := range []protocol.Request{
 		request("bad-address", "portforward.open", map[string]any{"streamID": "bad", "namespace": "demo", "pod": "api", "remotePort": 80, "localAddress": "0.0.0.0"}),
 		request("bad-port", "portforward.open", map[string]any{"streamID": "bad-port", "namespace": "demo", "pod": "api", "remotePort": 0}),
 		request("startup", "portforward.open", map[string]any{"streamID": "fail", "namespace": "demo", "pod": "api", "remotePort": 80}),
-	)
-	for _, id := range []string{"bad-address", "bad-port", "startup"} {
+	} {
+		writeRequest(t, inputWriter, request)
+	}
+	waitFor(t, &output, func(values []protocol.Envelope) bool {
+		return hasEnvelope(values, "bad-address", "response") &&
+			hasEnvelope(values, "bad-port", "response") &&
+			hasEnvelope(values, "startup", "response")
+	})
+
+	responses := decodeEnvelopes(t, output.String())
+	for id, wantCode := range map[string]string{
+		"bad-address": "invalid_params",
+		"bad-port":    "invalid_params",
+		"startup":     "kubernetes_error",
+	} {
 		response := envelopeByID(t, responses, id)
 		if response.Error == nil {
 			t.Errorf("%s unexpectedly succeeded: %#v", id, response)
+			continue
+		}
+		if got := response.Error.Code; got != wantCode {
+			t.Errorf("%s code = %q, want %q", id, got, wantCode)
 		}
 	}
-	if got := envelopeByID(t, responses, "bad-address").Error.Code; got != "invalid_params" {
-		t.Errorf("bad-address code = %q", got)
+
+	if err := inputWriter.Close(); err != nil {
+		t.Fatal(err)
 	}
-	if got := envelopeByID(t, responses, "bad-port").Error.Code; got != "invalid_params" {
-		t.Errorf("bad-port code = %q", got)
-	}
-	if got := envelopeByID(t, responses, "startup").Error.Code; got != "kubernetes_error" {
-		t.Errorf("startup code = %q", got)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop after input closed")
 	}
 }
 
