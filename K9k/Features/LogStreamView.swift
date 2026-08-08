@@ -6,15 +6,23 @@ struct LogStreamView: View {
     let resource: ResourceSummary
     @Environment(\.dismiss) private var dismiss
     @State private var isFollowing = true
-    @State private var selectedContainer = ""
+    @State private var selectedContainerID = ""
     @State private var previous = false
     @State private var timestamps = true
     @State private var tailLines = 500
     @State private var sinceSeconds: Int?
     @State private var filter = ""
     @State private var wrapsLines = false
+    @State private var hasStarted = false
 
-    private var containers: [String] { resource.raw?.objectValue?["spec"]?.objectValue?["containers"]?.arrayValue?.compactMap { $0.objectValue?["name"]?.stringValue } ?? [] }
+    private var containers: [LogContainerChoice] {
+        let spec = resource.raw?.objectValue?["spec"]?.objectValue ?? [:]
+        return LogContainerChoice.choices(in: spec)
+    }
+
+    private var selectedContainer: LogContainerChoice? {
+        containers.first { $0.id == selectedContainerID }
+    }
     private var visibleLines: [String] {
         let query = filter.trimmingCharacters(in: .whitespacesAndNewlines)
         return query.isEmpty ? store.logLines : store.logLines.filter { $0.localizedCaseInsensitiveContains(query) }
@@ -29,7 +37,14 @@ struct LogStreamView: View {
                 }
                 Spacer()
                 if containers.count > 1 {
-                    Picker("Container", selection: $selectedContainer) { ForEach(containers, id: \.self) { Text($0).tag($0) } }.frame(maxWidth: 160)
+                    Picker("Container", selection: $selectedContainerID) {
+                        ForEach(containers) { container in
+                            Text(container.title).tag(container.id)
+                        }
+                    }
+                    .frame(maxWidth: 180)
+                    .accessibilityLabel("Pod container")
+                    .accessibilityHint("Switches between app, init, and ephemeral container logs")
                 }
                 Menu {
                     Picker("Recent lines", selection: $tailLines) {
@@ -54,7 +69,10 @@ struct LogStreamView: View {
                 } label: {
                     Label(sinceLabel, systemImage: "clock.arrow.circlepath")
                 }
-                Toggle("Previous", isOn: $previous).toggleStyle(.switch)
+                Toggle("Previous", isOn: $previous)
+                    .toggleStyle(.switch)
+                    .disabled(selectedContainer?.supportsPrevious == false)
+                    .help(selectedContainer?.supportsPrevious == false ? "Kubernetes previous logs are only available for regular containers." : "Show logs from the previous container instance")
                 Toggle("Timestamps", isOn: $timestamps).toggleStyle(.switch)
                 Toggle("Follow", isOn: $isFollowing).toggleStyle(.switch)
                 Button("Reload") { reload() }
@@ -95,7 +113,18 @@ struct LogStreamView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 440)
-        .task { selectedContainer = containers.first ?? ""; await store.openLogs(for: resource, container: selectedContainer, previous: previous, timestamps: timestamps, follow: isFollowing, tailLines: tailLines, sinceSeconds: sinceSeconds) }
+        .task {
+            selectedContainerID = containers.first?.id ?? ""
+            hasStarted = true
+            await openSelectedLogs()
+        }
+        .onChange(of: selectedContainerID) { previousID, _ in
+            if selectedContainer?.supportsPrevious == false { previous = false }
+            // The initial selection is established by the task above; do not
+            // immediately cancel and reopen that first stream.
+            guard hasStarted, !previousID.isEmpty else { return }
+            reload()
+        }
         .onDisappear { Task { await store.closeLogs() } }
     }
 
@@ -113,12 +142,20 @@ struct LogStreamView: View {
 
     private func reload() {
         Task {
-            await store.openLogs(
-                for: resource, container: selectedContainer, previous: previous,
-                timestamps: timestamps, follow: isFollowing, tailLines: tailLines,
-                sinceSeconds: sinceSeconds
-            )
+            await openSelectedLogs()
         }
+    }
+
+    private func openSelectedLogs() async {
+        await store.openLogs(
+            for: resource,
+            container: selectedContainer?.name ?? "",
+            previous: previous,
+            timestamps: timestamps,
+            follow: isFollowing,
+            tailLines: tailLines,
+            sinceSeconds: sinceSeconds
+        )
     }
 
     private func copyVisibleLines() {
@@ -141,5 +178,40 @@ struct LogStreamView: View {
         } catch {
             store.errorMessage = "K9k could not save logs: \(error.localizedDescription)"
         }
+    }
+}
+
+private struct LogContainerChoice: Identifiable {
+    enum Kind: String {
+        case app
+        case initContainer
+        case ephemeral
+
+        var label: String {
+            switch self {
+            case .app: "App"
+            case .initContainer: "Init"
+            case .ephemeral: "Ephemeral"
+            }
+        }
+    }
+
+    let name: String
+    let kind: Kind
+
+    var id: String { "\(kind.rawValue):\(name)" }
+    var title: String { kind == .app ? name : "\(kind.label) · \(name)" }
+    var supportsPrevious: Bool { kind == .app }
+
+    static func choices(in spec: [String: JSONValue]) -> [LogContainerChoice] {
+        func choices(_ key: String, kind: Kind) -> [LogContainerChoice] {
+            (spec[key]?.arrayValue ?? []).compactMap { value in
+                guard let name = value.objectValue?["name"]?.stringValue, !name.isEmpty else { return nil }
+                return LogContainerChoice(name: name, kind: kind)
+            }
+        }
+        return choices("containers", kind: .app) +
+            choices("initContainers", kind: .initContainer) +
+            choices("ephemeralContainers", kind: .ephemeral)
     }
 }
