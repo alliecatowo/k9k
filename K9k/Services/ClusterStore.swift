@@ -461,17 +461,16 @@ final class ClusterStore {
             params["limit"] = .number(Double(resourcePageLimit))
             params["columns"] = .array(browserProjectionPaths(for: type).map(JSONValue.string))
             var continuation: String?
-            var snapshot: [ResourceSummary] = []
             var snapshotResourceVersion = ""
+            beginResourceSnapshot()
             repeat {
                 if let continuation, !continuation.isEmpty { params["continue"] = .string(continuation) }
                 else { params.removeValue(forKey: "continue") }
                 let page = try decode((try await client.request("resource.listPage", parameters: .object(params))).result, as: ResourceListPage.self)
                 guard generation == resourceLoadGeneration, selectedResourceType?.id == type.id else { return }
                 if snapshotResourceVersion.isEmpty { snapshotResourceVersion = page.resourceVersion }
-                snapshot.append(contentsOf: page.items)
-                installResources(snapshot)
-                loadedResourceCount = snapshot.count
+                appendResourcePage(page.items)
+                loadedResourceCount = resources.count
                 remainingResourceCount = page.remainingItemCount
                 continuation = page.continue
             } while continuation?.isEmpty == false
@@ -525,10 +524,38 @@ final class ClusterStore {
         return true
     }
 
-    private func installResources(_ values: [ResourceSummary]) {
-        resources = values
-        resourceIndexByID = Dictionary(uniqueKeysWithValues: values.enumerated().map { ($0.element.id, $0.offset) })
-        recomputeVisibleResources()
+    /// Starts a list snapshot without copying the growing array for each
+    /// Kubernetes continuation page. This is the hot path for clusters with
+    /// thousands of Pods/CRs.
+    private func beginResourceSnapshot() {
+        resources.removeAll(keepingCapacity: true)
+        visibleResources.removeAll(keepingCapacity: true)
+        resourceIndexByID.removeAll(keepingCapacity: true)
+        loadedResourceCount = 0
+        remainingResourceCount = nil
+    }
+
+    /// Appends a bounded server page and updates only the new rows. Rebuilding
+    /// the full filtered list after every page was quadratic in page count and
+    /// could make a busy cluster appear frozen while it was still loading.
+    private func appendResourcePage(_ page: [ResourceSummary]) {
+        guard !page.isEmpty else { return }
+        let start = resources.count
+        resources.append(contentsOf: page)
+        for (offset, resource) in page.enumerated() {
+            resourceIndexByID[resource.id] = start + offset
+        }
+
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else {
+            visibleResources.append(contentsOf: page)
+            return
+        }
+        visibleResources.append(contentsOf: page.filter { resource in
+            resource.name.lowercased().contains(query) ||
+                resource.kind.lowercased().contains(query) ||
+                resource.namespace?.lowercased().contains(query) == true
+        })
     }
 
     func sortResources(using order: [KeyPathComparator<ResourceSummary>]) {
