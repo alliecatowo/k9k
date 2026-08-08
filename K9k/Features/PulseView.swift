@@ -38,7 +38,7 @@ struct PulseView: View {
                     }
                 }
             }
-            .navigationTitle(drilldownTarget == nil ? "Pulse" : "Pulse · \(drilldownTarget.name)")
+            .navigationTitle(drilldownTarget.map { "Pulse · \($0.name)" } ?? "Pulse")
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
                     Button { Task { await sample() } } label: { Label("Refresh Pulse", systemImage: "arrow.clockwise") }

@@ -36,15 +36,17 @@ struct ResourceInspectorView: View {
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
                     Divider()
-                    switch section {
-                    case .overview:
-                        overview(resource)
-                    case .events:
-                        ScrollView { eventList }
-                    case .raw:
-                        rawJSON(resource)
-                    case .metadata:
-                        metadata(resource)
+                    Group {
+                        switch section {
+                        case .overview:
+                            overview(resource)
+                        case .events:
+                            ScrollView { eventList }
+                        case .raw:
+                            rawJSON(resource)
+                        case .metadata:
+                            metadata(resource)
+                        }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
@@ -238,7 +240,7 @@ struct ResourceInspectorView: View {
         // only from structural Kubernetes conventions rather than a guessed
         // OpenAPI schema or custom resource fields.
         let specialisedKinds: Set<String> = ["Pod", "Service", "Node", "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "ReplicationController", "Job", "CronJob", "ConfigMap", "Secret", "Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding", "ServiceAccount"]
-        guard !specialisedKinds.contains(resource.kind), let raw = resource.raw?.objectValue else { return }
+        if !specialisedKinds.contains(resource.kind), let raw = resource.raw?.objectValue {
         let metadata = raw["metadata"]?.objectValue ?? [:]
         let spec = raw["spec"]?.objectValue ?? [:]
         let status = raw["status"]?.objectValue ?? [:]
@@ -266,10 +268,11 @@ struct ResourceInspectorView: View {
                 }
             }
         }
+        }
     }
 
     @ViewBuilder private func podDetails(_ resource: ResourceSummary) -> some View {
-        guard resource.kind == "Pod", let raw = resource.raw?.objectValue else { return }
+        if resource.kind == "Pod", let raw = resource.raw?.objectValue {
         let spec = raw["spec"]?.objectValue ?? [:]
         let status = raw["status"]?.objectValue ?? [:]
         Section("Pod") {
@@ -327,10 +330,11 @@ struct ResourceInspectorView: View {
                 }
             }
         }
+        }
     }
 
     @ViewBuilder private func serviceDetails(_ resource: ResourceSummary) -> some View {
-        guard resource.kind == "Service", let raw = resource.raw?.objectValue else { return }
+        if resource.kind == "Service", let raw = resource.raw?.objectValue {
         let spec = raw["spec"]?.objectValue ?? [:]
         let status = raw["status"]?.objectValue ?? [:]
         Section("Service") {
@@ -360,10 +364,11 @@ struct ResourceInspectorView: View {
         let ingress = status["loadBalancer"]?.objectValue?["ingress"]?.arrayValue ?? []
         let endpoints = ingress.compactMap { $0.objectValue?["ip"]?.stringValue ?? $0.objectValue?["hostname"]?.stringValue }
         if !endpoints.isEmpty { Section("Load Balancer") { LabeledContent("Ingress", value: endpoints.joined(separator: ", ")).textSelection(.enabled) } }
+        }
     }
 
     @ViewBuilder private func nodeDetails(_ resource: ResourceSummary) -> some View {
-        guard resource.kind == "Node", let raw = resource.raw?.objectValue else { return }
+        if resource.kind == "Node", let raw = resource.raw?.objectValue {
         let spec = raw["spec"]?.objectValue ?? [:]
         let status = raw["status"]?.objectValue ?? [:]
         Section("Scheduling") {
@@ -398,10 +403,11 @@ struct ResourceInspectorView: View {
                 }
             }
         }
+        }
     }
 
     @ViewBuilder private func configurationDetails(_ resource: ResourceSummary) -> some View {
-        guard ["ConfigMap", "Secret"].contains(resource.kind), let raw = resource.raw?.objectValue else { return }
+        if ["ConfigMap", "Secret"].contains(resource.kind), let raw = resource.raw?.objectValue {
         let data = raw["data"]?.objectValue ?? [:]
         let binaryData = raw["binaryData"]?.objectValue ?? [:]
         if resource.kind == "ConfigMap" {
@@ -426,6 +432,7 @@ struct ResourceInspectorView: View {
                 }
                 if data.count > 100 { Text("Showing the first 100 keys.").font(.caption).foregroundStyle(.secondary) }
             }
+        }
         }
     }
 

@@ -89,7 +89,7 @@ struct HTTPBenchmarkView: View {
         configuration.timeoutIntervalForResource = 15
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
-        await withTaskGroup(of: RequestOutcome?.self, returning: [RequestOutcome].self) { group in
+        return await withTaskGroup(of: RequestOutcome?.self, returning: [RequestOutcome].self) { group in
             var next = 0; var outcomes: [RequestOutcome] = []
             func submit() { group.addTask { guard !Task.isCancelled else { return nil }; let start = ContinuousClock.now; do { let (_, response) = try await session.data(from: url); let duration = start.duration(to: .now); return RequestOutcome(success: (response as? HTTPURLResponse).map { (200...399).contains($0.statusCode) } ?? false, milliseconds: Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15) } catch { return RequestOutcome(success: false, milliseconds: 0) } } }
             while next < min(count, concurrency) { submit(); next += 1 }

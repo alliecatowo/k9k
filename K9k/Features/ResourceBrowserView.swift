@@ -17,34 +17,11 @@ struct ResourceBrowserView: View {
                     // Native resource layouts and K9s custom views share the
                     // same Table rendering path. No concatenated pseudo-cell
                     // or unsupported empty renderer columns are introduced.
-                    ForEach(columns) { column in
-                        switch column.source {
-                        case .name:
-                            TableColumn(column.title, value: \.name) { resource in
-                                browserCell(column, resource: resource, showsNamespaceSubtitle: customColumns.isEmpty)
-                            }
-                            .width(min: columnMinimumWidth(column), ideal: columnIdealWidth(column))
-                        case .status:
-                            TableColumn(column.title, value: \.status) { resource in
-                                browserCell(column, resource: resource, showsNamespaceSubtitle: customColumns.isEmpty)
-                            }
-                            .width(min: columnMinimumWidth(column), ideal: columnIdealWidth(column))
-                        case .age:
-                            TableColumn(column.title, value: \.age) { resource in
-                                browserCell(column, resource: resource, showsNamespaceSubtitle: customColumns.isEmpty)
-                            }
-                            .width(min: columnMinimumWidth(column), ideal: columnIdealWidth(column))
-                        case .kind:
-                            TableColumn(column.title, value: \.kind) { resource in
-                                browserCell(column, resource: resource, showsNamespaceSubtitle: customColumns.isEmpty)
-                            }
-                            .width(min: columnMinimumWidth(column), ideal: columnIdealWidth(column))
-                        default:
-                            TableColumn(column.title) { resource in
-                                browserCell(column, resource: resource, showsNamespaceSubtitle: customColumns.isEmpty)
-                            }
-                            .width(min: columnMinimumWidth(column), ideal: columnIdealWidth(column))
+                    TableColumnForEach(columns) { column in
+                        TableColumn(column.title) { resource in
+                            browserCell(column, resource: resource, showsNamespaceSubtitle: customColumns.isEmpty)
                         }
+                        .width(min: columnMinimumWidth(column), ideal: columnIdealWidth(column))
                     }
                 }
                 .tableStyle(.inset)
@@ -111,20 +88,23 @@ struct ResourceBrowserView: View {
         }
     }
 
-    @ViewBuilder private func browserCell(_ column: K9sViewColumn, resource: ResourceSummary, showsNamespaceSubtitle: Bool) -> some View {
+    /// `TableColumn` uses a deeply generic builder. Type-erasing this small
+    /// runtime-configured cell keeps custom K9s view columns scalable without
+    /// making Swift's type checker re-solve every source-kind combination.
+    private func browserCell(_ column: K9sViewColumn, resource: ResourceSummary, showsNamespaceSubtitle: Bool) -> AnyView {
         if case .name = column.source {
-            VStack(alignment: .leading, spacing: 2) {
+            return AnyView(VStack(alignment: .leading, spacing: 2) {
                 Text(resource.name).fontWeight(.medium)
                 if showsNamespaceSubtitle, resource.namespace?.isEmpty == false {
                     Text(resource.namespace!).font(.caption).foregroundStyle(.secondary)
                 }
-            }
+            })
         } else {
-            Text(column.value(for: resource))
+            return AnyView(Text(column.value(for: resource))
                 .foregroundStyle(column.source == .status ? statusColor(resource.status) : .primary)
                 .monospacedDigit()
                 .multilineTextAlignment(column.rightAligned ? .trailing : .leading)
-                .frame(maxWidth: .infinity, alignment: column.rightAligned ? .trailing : .leading)
+                .frame(maxWidth: .infinity, alignment: column.rightAligned ? .trailing : .leading))
         }
     }
 

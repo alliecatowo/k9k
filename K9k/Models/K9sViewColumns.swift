@@ -34,26 +34,26 @@ struct K9sViewColumn: Identifiable, Hashable {
 
     func value(for resource: ResourceSummary) -> String {
         switch source {
-        case .name: resource.name
-        case .namespace: resource.namespace?.isEmpty == false ? resource.namespace! : "—"
-        case .status: resource.status
-        case .age: resource.age
-        case .kind: resource.kind
-        case .apiVersion: resource.apiVersion
-        case .uid: resource.uid
-        case .resourceVersion: resource.resourceVersion ?? "—"
+        case .name: return resource.name
+        case .namespace: return resource.namespace?.isEmpty == false ? resource.namespace! : "—"
+        case .status: return resource.status
+        case .age: return resource.age
+        case .kind: return resource.kind
+        case .apiVersion: return resource.apiVersion
+        case .uid: return resource.uid
+        case .resourceVersion: return resource.resourceVersion ?? "—"
         case .labels:
             guard let labels = resource.labels, !labels.isEmpty else { return "—" }
             return labels.keys.sorted().map { "\($0)=\(labels[$0] ?? "")" }.joined(separator: ", ")
         case .label(let key):
             return resource.labels?[key] ?? "—"
         case .projection(let path):
-            let rawValue = resource.columns?[path] ?? valueFromHydratedObject(path, resource.raw) ?? ""
+            let rawValue = resource.columns?[path] ?? Self.valueFromHydratedObject(path, resource.raw) ?? ""
             guard !rawValue.isEmpty else { return "—" }
             return relativeTime ? Self.relativeAge(rawValue) ?? rawValue : rawValue
         case .ready(let readyPath, let desiredPath):
-            let ready = resource.columns?[readyPath] ?? valueFromHydratedObject(readyPath, resource.raw)
-            let desired = resource.columns?[desiredPath] ?? valueFromHydratedObject(desiredPath, resource.raw)
+            let ready = resource.columns?[readyPath] ?? Self.valueFromHydratedObject(readyPath, resource.raw)
+            let desired = resource.columns?[desiredPath] ?? Self.valueFromHydratedObject(desiredPath, resource.raw)
             guard ready != nil || desired != nil else { return "—" }
             return "\(ready ?? "0")/\(desired ?? "0")"
         }
