@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="hero">
+<h1>K9k</h1>
+<p>K9s operational depth, designed as a native macOS app. A SwiftUI Kubernetes manager with a bundled Go <code>client-go</code> helper.</p>
+</div>
+<img src="{{ get_url(path='media/k9k-workspace-final.png') }}" alt="K9k inspecting a live Pod in a local Kind fixture cluster">
+<h2>Where to start</h2>
+<ul>
+{% for p in section.pages %}<li><a href="{{ p.permalink }}">{{ p.title }}</a></li>{% endfor %}
+</ul>
+<p>K9k is pre-release: build from source today. See <a href="{{ get_url(path='getting-started/') }}">Getting started</a>.</p>
+{% endblock %}

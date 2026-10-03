@@ -1,5 +1,7 @@
 # K9k
 
+**[Docs](https://alliecatowo.github.io/k9k/)** · pre-release, build from source
+
 **K9s operational depth, designed as a native macOS app.**
 
 K9k is a macOS Tahoe 26+ Kubernetes manager built with SwiftUI and a bundled Go `client-go` helper. It speaks directly to the active kubeconfig context—there is no Electron shell, webview, embedded TUI, or required `kubectl` installation for normal cluster operations.
