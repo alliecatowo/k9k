@@ -6,8 +6,9 @@
 <title>{% block title %}{{ config.title }}{% endblock %}</title>
 <meta name="description" content="{{ config.description }}">
 <style>
-:root{--bg:#fff;--fg:#1d1d1f;--mut:#6e6e73;--ac:#0a64d6;--bd:#e2e2e7;--code:#f4f4f6}
-@media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#f2f2f4;--mut:#a1a1a8;--ac:#6cb0ff;--bd:#2c2c30;--code:#222226}}
+/* Catppuccin Latte (light) and Mocha (dark), mauve accent */
+:root{--bg:#eff1f5;--fg:#4c4f69;--mut:#6c6f85;--ac:#8839ef;--bd:#ccd0da;--code:#e6e9ef}
+@media(prefers-color-scheme:dark){:root{--bg:#1e1e2e;--fg:#cdd6f4;--mut:#a6adc8;--ac:#cba6f7;--bd:#313244;--code:#181825}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
 a{color:var(--ac)}
