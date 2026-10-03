@@ -1,0 +1,12 @@
+base_url = "https://alliecatowo.github.io/k9k"
+title = "K9k"
+description = "Native macOS Kubernetes manager with K9s-style depth."
+compile_sass = false
+build_search_index = false
+generate_feeds = false
+
+[markdown]
+highlight_code = false
+
+[extra]
+repo = "https://github.com/alliecatowo/k9k"
