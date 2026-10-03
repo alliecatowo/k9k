@@ -1,13 +1,50 @@
 {% extends "base.html" %}
+{% block mainclass %} class="wide"{% endblock %}
 {% block content %}
-<div class="hero">
-<h1>K9k</h1>
-<p>K9s operational depth, designed as a native macOS app. A SwiftUI Kubernetes manager with a bundled Go <code>client-go</code> helper.</p>
+<div class="hero home">
+<h1>K9s operational depth, as a native macOS app.</h1>
+<p class="lede">K9k is a SwiftUI Kubernetes manager for macOS Tahoe 26+. It talks directly to your kubeconfig context through a bundled Go <code>client-go</code> helper. No Electron shell, no webview, no embedded TUI, and <code>kubectl</code> is not required for normal cluster operations.</p>
+<div class="cta">
+<a class="btn primary" href="{{ get_url(path='getting-started/') }}">Build from source</a>
+<a class="btn" href="{{ get_url(path='usage/') }}">Read the docs</a>
+<a class="btn" href="{{ config.extra.repo }}">GitHub</a>
 </div>
-<img src="{{ get_url(path='media/k9k-workspace-final.png') }}" alt="K9k inspecting a live Pod in a local Kind fixture cluster">
-<h2>Where to start</h2>
+<p><small>Pre-release. There is no packaged build yet; see <a href="#install">Install</a>.</small></p>
+</div>
+
+<figure>
+<img src="{{ get_url(path='media/k9k-workspace-final.png') }}" alt="K9k inspecting a live Pod in a local Kind fixture cluster" width="2560" height="1320">
+<figcaption>Capture of the running app against a local Kind fixture cluster: sidebar, Pod table, RBAC preflight, metrics and metadata in one window.</figcaption>
+</figure>
+
+<h2>What it does</h2>
+<div class="grid">
+<div><h3>Live resources</h3><p>Browse built-in resources and CRDs through discovery, with list/watch updates. Filter, sort, export, and save named per-context query scopes.</p></div>
+<div><h3>Inspector</h3><p>Raw JSON, metadata, owners, events, RBAC, rollout state and metrics for the selected object.</p></div>
+<div><h3>Pod terminal and logs</h3><p>Stream logs, open an ANSI/VT terminal over <code>pods/exec</code>, attach, or add a confirmed ephemeral debug container.</p></div>
+<div><h3>Port-forwards and transfers</h3><p>Loopback-only Pod and Service port-forwards, plus file and directory transfer through bounded, traversal-safe tar streams.</p></div>
+<div><h3>Safe changes</h3><p>Scale, restart, roll back, trigger CronJobs, cordon and drain Nodes, apply UID-protected manifests. Mutating actions are access-reviewed and confirmed.</p></div>
+<div><h3>K9s compatible</h3><p>See K9s aliases, custom views, hotkeys and plugins, and edit K9s-compatible configuration safely.</p></div>
+</div>
+
+<figure>
+<img src="{{ get_url(path='media/k9k-raw-json-final.png') }}" alt="K9k showing the syntax-highlighted raw JSON of a resource" width="1420" height="800">
+<figcaption>Raw object view from the same fixture cluster.</figcaption>
+</figure>
+
+<h2 id="install">Install</h2>
+<p>There is no packaged release: no signed or notarized build, no Homebrew cask, and no GitHub release. K9k is built from source. You need macOS Tahoe 26+, Xcode 26+ and <a href="https://mise.jdx.dev/">mise</a>.</p>
+<pre><code>git clone https://github.com/alliecatowo/k9k
+cd k9k
+mise trust
+mise install
+mise run bootstrap
+mise run build
+mise run run</code></pre>
+<p>The Debug app is built at <code>DerivedData/Build/Products/Debug/K9k.app</code>. To try it without touching a real cluster, run <code>mise run cluster:create</code> and <code>mise run cluster:seed</code> first. More in <a href="{{ get_url(path='getting-started/') }}">Getting started</a>.</p>
+
+<h2>Documentation</h2>
 <ul>
 {% for p in section.pages %}<li><a href="{{ p.permalink }}">{{ p.title }}</a></li>{% endfor %}
 </ul>
-<p>K9k is pre-release: build from source today. See <a href="{{ get_url(path='getting-started/') }}">Getting started</a>.</p>
 {% endblock %}

@@ -23,6 +23,16 @@ pre code{background:none;padding:0}
 table{border-collapse:collapse;display:block;overflow-x:auto}
 td,th{border:1px solid var(--bd);padding:.35rem .6rem}
 .hero{padding:2rem 0 1rem}.hero h1{font-size:2.4rem;margin:0}.hero p{color:var(--mut);font-size:1.15rem}
+main.wide{max-width:68rem}
+.hero.home{padding:2.5rem 0 1rem}.hero.home h1{font-size:clamp(1.8rem,6vw,3rem);line-height:1.15}
+.hero.home .lede{font-size:1.2rem;max-width:42rem}
+.cta{display:flex;flex-wrap:wrap;gap:.7rem;margin:1.2rem 0}
+.btn{display:inline-block;padding:.6rem 1.1rem;border-radius:8px;border:1px solid var(--bd);text-decoration:none;font-weight:600;color:var(--fg)}
+.btn.primary{background:var(--ac);border-color:var(--ac);color:var(--bg)}
+figure{margin:1.5rem 0}figcaption{color:var(--mut);font-size:.9rem;margin-top:.4rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));gap:1rem;margin:1rem 0}
+.grid>div{border:1px solid var(--bd);border-radius:10px;padding:1rem}
+.grid h3{margin:0 0 .4rem;font-size:1.05rem}.grid p{margin:0;color:var(--mut);font-size:.95rem}
 </style>
 </head>
 <body>
@@ -34,6 +44,6 @@ td,th{border:1px solid var(--bd);padding:.35rem .6rem}
 <a href="{{ config.extra.repo }}">GitHub</a>
 </nav>
 </header>
-<main>{% block content %}{% endblock %}</main>
+<main{% block mainclass %}{% endblock %}>{% block content %}{% endblock %}</main>
 </body>
 </html>
