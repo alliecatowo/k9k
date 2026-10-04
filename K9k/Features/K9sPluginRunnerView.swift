@@ -14,26 +14,34 @@ struct K9sPluginRunnerView: View {
     @State private var process: Process?
 
     /// K9s accepts either a complete shell command or a command plus `args`.
-    /// Keep the command as authored (it may intentionally use shell syntax),
-    /// but quote each separate argument before passing the resulting string to
-    /// zsh. This gives placeholders in args the same behaviour as placeholders
-    /// in command without letting a resource name change shell syntax.
+    /// The command text is kept as authored (it may intentionally use shell
+    /// syntax), but every placeholder value substituted into it is shell-quoted
+    /// so a resource name can never change shell syntax. Each arg is expanded
+    /// with raw values and then quoted as one whole word.
     private var command: String {
-        ([expanded(plugin.command)] + plugin.args.map { shellQuote(expanded($0)) })
+        ([expanded(plugin.command, quoting: true)]
+            + plugin.args.map { Self.shellQuote(expanded($0, quoting: false)) })
             .filter { !$0.isEmpty }
             .joined(separator: " ")
     }
 
-    private func expanded(_ value: String) -> String {
-        value
-            .replacing("$NAME", with: resource.name)
-            .replacing("$NAMESPACE", with: resource.namespace ?? "")
-            .replacing("$RESOURCE_NAME", with: resource.name)
-            .replacing("$RESOURCE", with: resource.kind.lowercased())
+    /// Single-pass substitution so a substituted value is never re-expanded and
+    /// `$NAMESPACE` is not mistaken for `$NAME` plus a suffix.
+    private func expanded(_ value: String, quoting: Bool) -> String {
+        value.replacing(/\$(NAMESPACE|RESOURCE_NAME|RESOURCE|NAME)/) { match in
+            let raw: String
+            switch match.output.1 {
+            case "NAMESPACE": raw = resource.namespace ?? ""
+            case "RESOURCE": raw = resource.kind.lowercased()
+            default: raw = resource.name
+            }
+            return quoting ? Self.shellQuote(raw) : raw
+        }
     }
 
-    private func shellQuote(_ value: String) -> String {
-        "'" + value.replacing("'", with: "'\\\"'\\\"'") + "'"
+    /// POSIX single-quote escaping: close the quote, emit an escaped quote, reopen.
+    static func shellQuote(_ value: String) -> String {
+        "'" + value.replacing("'", with: "'\\''") + "'"
     }
 
     var body: some View {

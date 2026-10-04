@@ -37,9 +37,9 @@ struct ManifestImportView: View {
                     }
                     .disabled(isWorking)
                     .help("Open an exact post-apply Kubernetes object in the live browser and start its normal watch")
-                    Button("Prepare Removal…") { prepareRemoval(appliedBatch.items.map(\.identity)) }
-                        .disabled(isWorking || store.isReadOnly || appliedBatch.items.contains { $0.identity.uid.isEmpty })
-                        .help("Recheck delete authorization and the UID of every applied object before asking for confirmation")
+                    Button("Prepare Removal…") { prepareRemoval(createdIdentities(in: appliedBatch)) }
+                        .disabled(isWorking || store.isReadOnly || createdIdentities(in: appliedBatch).isEmpty || appliedBatch.items.contains { $0.created == true && $0.identity.uid.isEmpty })
+                        .help("Recheck delete authorization and the UID of every object this import created. Objects that already existed and were only updated are never removed.")
                 } else {
                     Button("Validate") { validate() }.disabled(source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isWorking)
                     Button("Apply \(documentLabel)…") { applyConfirmation = true }.disabled(source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isWorking || store.isReadOnly)
@@ -51,7 +51,7 @@ struct ManifestImportView: View {
             Button("Apply \(documentLabel)", role: .destructive) { apply() }
         } message: { Text("K9k will resolve each document against live discovery, dry-run every document first, then server-side apply the exact batch without forcing ownership. Kubernetes does not provide a transaction across multiple resources, so a later write could fail after an earlier one succeeds.") }
         .confirmationDialog("Delete imported manifest batch?", isPresented: $deleteConfirmation, titleVisibility: .visible) {
-            Button("Delete \(appliedBatch?.items.count ?? 0) Imported Objects", role: .destructive) { deleteAppliedBatch() }
+            Button("Delete \(appliedBatch.map { createdIdentities(in: $0).count } ?? 0) Created Objects", role: .destructive) { deleteAppliedBatch() }
         } message: {
             Text("K9k has checked delete access, existence, kind, and UID for every imported object. It will send UID-preconditioned deletes directly to Kubernetes. Kubernetes cannot make this atomic; a later delete can fail after earlier objects are already removed.")
         }
@@ -170,6 +170,13 @@ struct ManifestImportView: View {
         }
     }
 
+    /// Only objects the import created are removable. Server-side apply also
+    /// updates existing objects, and deleting those would destroy data the
+    /// import never made. A missing flag (older helper) is treated as not created.
+    private func createdIdentities(in batch: ManifestBatchApplyResult) -> [ManifestIdentity] {
+        batch.items.filter { $0.created == true }.map(\.identity)
+    }
+
     private func prepareRemoval(_ identities: [ManifestIdentity]) {
         isWorking = true
         Task {
@@ -191,7 +198,7 @@ struct ManifestImportView: View {
         Task {
             defer { isWorking = false }
             do {
-                let result = try await store.deleteImportedManifestBatch(appliedBatch.items.map(\.identity), confirm: true)
+                let result = try await store.deleteImportedManifestBatch(createdIdentities(in: appliedBatch), confirm: true)
                 self.appliedBatch = nil
                 validationMessage = "Deleted \(result.items.count) imported object\(result.items.count == 1 ? "" : "s")."
                 await store.loadResources()

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/k9k-app/k9k/backend/internal/protocol"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
@@ -1151,6 +1152,33 @@ func TestManifestBatchApplyValidatesEveryDocumentBeforeAnyConfirmedWrite(t *test
 	}
 	if dryRuns != 4 || writes != 2 || !names["first"] || !names["second"] {
 		t.Errorf("batch calls = %#v", client.applyManifests)
+	}
+}
+
+func TestManifestBatchMarksOnlyNewObjectsAsCreated(t *testing.T) {
+	manifests := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: first\n  namespace: demo\n"
+	apply := request("apply", "manifest.applyBatch", map[string]any{"gvr": "v1/configmaps", "namespace": "demo", "kind": "ConfigMap", "manifest": manifests, "confirm": true})
+	object := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "first", "namespace": "demo", "uid": "u1"},
+	}}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"existing object was only updated", nil, false},
+		{"missing object was created", apierrors.NewNotFound(schema.GroupResource{Resource: "configmaps"}, "first"), true},
+	}
+	for _, tc := range cases {
+		client := &fakeCluster{object: object, manifestErr: tc.err}
+		result := mustObject(t, envelopeByID(t, runRequests(t, client, apply), "apply").Result)
+		items, ok := result["items"].([]any)
+		if !ok || len(items) != 1 {
+			t.Fatalf("%s: items = %#v", tc.name, result["items"])
+		}
+		if got := mustObject(t, items[0])["created"]; got != tc.want {
+			t.Errorf("%s: created = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

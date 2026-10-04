@@ -197,13 +197,35 @@ final class PodFileTransferController {
             defer { try? input.close() }
             while let bytes = try input.read(upToCount: Self.chunkSize), !bytes.isEmpty {
                 try Task.checkCancellation()
-                _ = try await client.request("exec.stdin", parameters: .object([
-                    "streamID": .string(try activeStreamID()), "dataBase64": .string(bytes.base64EncodedString())
-                ]))
+                try await sendStdin(bytes)
             }
             _ = try await client.request("exec.stdin.close", parameters: .object(["streamID": .string(try activeStreamID())]))
             try await waitForClose()
             message = "Uploaded \(localURL.lastPathComponent) to \(destination)."
+        }
+    }
+
+    /// The helper queues a bounded number of stdin chunks and answers
+    /// `input_backpressure` when the pod is not draining fast enough. That is a
+    /// signal to slow down, not a failure, so wait and resend the same chunk.
+    private func sendStdin(_ bytes: Data) async throws {
+        let encoded = bytes.base64EncodedString()
+        var delayMilliseconds: UInt64 = 20
+        let deadline = ContinuousClock.now + .seconds(120)
+        while true {
+            do {
+                _ = try await client.request("exec.stdin", parameters: .object([
+                    "streamID": .string(try activeStreamID()), "dataBase64": .string(encoded)
+                ]))
+                return
+            } catch let error as CoreError where error.code == "input_backpressure" {
+                guard ContinuousClock.now < deadline else {
+                    throw PodTransferError("The pod stopped accepting upload data. Try a smaller file.")
+                }
+                try Task.checkCancellation()
+                try await Task.sleep(for: .milliseconds(delayMilliseconds))
+                delayMilliseconds = min(delayMilliseconds * 2, 500)
+            }
         }
     }
 
