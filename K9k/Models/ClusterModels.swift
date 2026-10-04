@@ -544,6 +544,9 @@ struct ManifestIdentity: Codable, Hashable {
 struct ManifestDocument: Codable, Hashable {
     let identity: ManifestIdentity
     let yaml: String
+    /// Set only on batch-import results: true when the object did not exist
+    /// before the import and is therefore safe to offer for removal.
+    var created: Bool? = nil
 }
 
 struct ManifestApplyResult: Codable, Hashable {

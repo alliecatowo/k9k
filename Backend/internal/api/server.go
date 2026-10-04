@@ -2466,8 +2466,23 @@ func (s *Server) applyManifestBatch(ctx context.Context, items []manifestApplyPa
 	if !confirm {
 		return map[string]any{"validated": true, "applied": false, "items": previewDocuments}, nil
 	}
-	appliedDocuments := make([]ManifestDocument, 0, len(items))
-	for _, item := range items {
+	// Server-side apply creates or updates, so record which targets did not
+	// exist before the write. Only those may be offered for removal: deleting a
+	// pre-existing object that the import merely updated would destroy data the
+	// import never created.
+	created := make([]bool, len(items))
+	for index, item := range items {
+		_, manifestErr := s.cluster.Manifest(ctx, item.gvr(), item.Namespace, item.Name, item.isNamespaced())
+		switch {
+		case manifestErr == nil:
+		case apierrors.IsNotFound(manifestErr):
+			created[index] = true
+		default:
+			return nil, kubeError(manifestErr)
+		}
+	}
+	appliedDocuments := make([]ManifestImportItem, 0, len(items))
+	for index, item := range items {
 		applied, applyErr := s.cluster.ApplyManifest(ctx, item.request(false))
 		if applyErr != nil {
 			return nil, manifestOperationError(applyErr, "manifest batch apply failed")
@@ -2476,7 +2491,7 @@ func (s *Server) applyManifestBatch(ctx context.Context, items []manifestApplyPa
 		if documentErr != nil {
 			return nil, kubeError(documentErr)
 		}
-		appliedDocuments = append(appliedDocuments, document)
+		appliedDocuments = append(appliedDocuments, ManifestImportItem{ManifestDocument: document, Created: created[index]})
 	}
 	return map[string]any{"validated": true, "applied": true, "items": appliedDocuments}, nil
 }

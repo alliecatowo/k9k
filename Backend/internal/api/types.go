@@ -637,6 +637,14 @@ type ManifestDocument struct {
 	YAML     string           `json:"yaml"`
 }
 
+// ManifestImportItem is one applied document of a batch import. Created is true
+// only when the object did not exist before the import, which is the only case
+// where removing the batch may delete it.
+type ManifestImportItem struct {
+	ManifestDocument
+	Created bool `json:"created"`
+}
+
 // PodLogRequest is the bounded client-go log query used by the streaming
 // protocol. The API server validates every numeric limit before this reaches
 // a Kubernetes client.
