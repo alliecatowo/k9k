@@ -490,6 +490,9 @@ type NodeDrainRequest struct {
 	Node               string `json:"node"`
 	IgnoreDaemonSets   bool   `json:"ignoreDaemonSets"`
 	DeleteEmptyDirData bool   `json:"deleteEmptyDirData"`
+	// Force allows evicting Pods that have no controller owner. Nothing
+	// recreates such a Pod, so eviction deletes it permanently.
+	Force bool `json:"force"`
 }
 
 // NodeDrainResult retains every decision so the GUI can distinguish an

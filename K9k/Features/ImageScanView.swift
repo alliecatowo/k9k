@@ -198,7 +198,11 @@ struct ImageScanView: View {
                 for container in spec[field]?.arrayValue ?? [] {
                     guard let container = container.objectValue,
                           let image = container["image"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-                          !image.isEmpty else { continue }
+                          !image.isEmpty,
+                          // A reference beginning with "-" would be parsed as a scanner option, and
+                          // whitespace cannot appear in a valid reference.
+                          !image.hasPrefix("-"),
+                          !image.contains(where: \.isWhitespace) else { continue }
                     if locationsByImage[image] == nil { orderedImages.append(image) }
                     let name = container["name"]?.stringValue ?? "unnamed"
                     locationsByImage[image, default: []].append("\(source) · \(title): \(name)")

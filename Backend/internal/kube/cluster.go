@@ -997,6 +997,11 @@ func (c *Cluster) DrainNode(ctx context.Context, request api.NodeDrainRequest) (
 			}
 			continue
 		}
+		if !hasController(&pod) && !request.Force {
+			entry.Reason = "no controller will recreate this Pod; evicting it deletes it permanently (force required)"
+			result.Blocked = append(result.Blocked, entry)
+			continue
+		}
 		if podUsesEmptyDir(&pod) && !request.DeleteEmptyDirData {
 			entry.Reason = "uses emptyDir data; enable deletion explicitly to evict"
 			result.Blocked = append(result.Blocked, entry)
@@ -1216,6 +1221,15 @@ func cloneStringMap(values map[string]string) map[string]string {
 func isDaemonSetPod(pod *corev1.Pod) bool {
 	for _, owner := range pod.OwnerReferences {
 		if owner.Kind == "DaemonSet" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasController(pod *corev1.Pod) bool {
+	for _, owner := range pod.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller {
 			return true
 		}
 	}
