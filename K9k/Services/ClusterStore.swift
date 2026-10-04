@@ -1284,7 +1284,7 @@ final class ClusterStore {
         do {
             let review = try decode(
                 (try await client.request("rbac.check", parameters: .object([
-                    "verb": .string("patch"), "gvr": .string(source.deploymentType.gvr),
+                    "verb": .string("update"), "gvr": .string(source.deploymentType.gvr),
                     "namespace": .string(source.namespace), "name": .string(source.deployment),
                 ]))).result,
                 as: AccessReview.self

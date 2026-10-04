@@ -519,3 +519,29 @@ func mapsEqual(left, right map[string]string) bool {
 	}
 	return true
 }
+
+func TestDrainNodeBlocksUncontrolledPodsUnlessForced(t *testing.T) {
+	controller := true
+	pods := []runtime.Object{
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "worker"}, Spec: corev1.NodeSpec{Unschedulable: true}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "managed", Namespace: "demo", OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "rs", Controller: &controller}}}, Spec: corev1.PodSpec{NodeName: "worker"}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "bare", Namespace: "demo"}, Spec: corev1.PodSpec{NodeName: "worker"}},
+	}
+	for _, force := range []bool{false, true} {
+		cluster := &Cluster{typed: fake.NewSimpleClientset(pods...)}
+		result, err := cluster.DrainNode(context.Background(), api.NodeDrainRequest{Node: "worker", Force: force})
+		if err != nil {
+			t.Fatal(err)
+		}
+		evicted := map[string]bool{}
+		for _, pod := range result.Evicted {
+			evicted[pod.Name] = true
+		}
+		if !evicted["managed"] {
+			t.Errorf("force=%v: controller-owned Pod must be evicted: %#v", force, result)
+		}
+		if evicted["bare"] != force {
+			t.Errorf("force=%v: bare Pod evicted=%v, blocked=%#v", force, evicted["bare"], result.Blocked)
+		}
+	}
+}
