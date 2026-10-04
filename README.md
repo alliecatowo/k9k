@@ -84,6 +84,14 @@ The app never reads kubeconfig credentials into Swift. The helper owns Kubernete
 - Xcode 26+
 - [mise](https://mise.jdx.dev/)
 
+## Install
+
+```sh
+brew install --cask alliecatowo/tap/k9k
+```
+
+Releases are Apple Silicon builds, ad-hoc signed and not yet notarized. The cask clears the quarantine flag so Gatekeeper does not block first launch; downloading the zip from the [Releases](https://github.com/alliecatowo/k9k/releases) page instead means right-click, Open. `checksums.txt` is attached to every release. Release builds are produced by `.github/workflows/release.yml`; Developer ID signing and notarization turn on automatically once the Apple secrets described in `Scripts/notarize.sh` exist.
+
 ## Build and run
 
 ```sh

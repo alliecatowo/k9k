@@ -1,0 +1,45 @@
+# Homebrew Cask for K9k, a native macOS Kubernetes manager.
+# brew install --cask alliecatowo/tap/k9k
+#
+# Version and sha256 are rewritten on every release by the update-homebrew job in
+# alliecatowo/k9k, rendered from packaging/homebrew/k9k.rb.tmpl. Do not edit by hand.
+cask "k9k" do
+  version "@VERSION@"
+  sha256 "@SHA256@"
+
+  url "https://github.com/alliecatowo/k9k/releases/download/v#{version}/K9k-#{version}-macos-arm64.zip"
+  name "K9k"
+  desc "Native macOS Kubernetes manager"
+  homepage "https://github.com/alliecatowo/k9k"
+
+  depends_on arch: :arm64
+  depends_on macos: ">= :tahoe"
+
+  app "K9k.app"
+
+  # K9k is ad-hoc signed but not notarized (no paid Apple Developer Program
+  # account behind it yet). Casks quarantine installed apps, so Gatekeeper would
+  # block first launch. Clear the flag for K9k.app only.
+  # TODO(notarization): once releases are notarized and stapled, delete this
+  # postflight block and the caveat below.
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", "#{appdir}/K9k.app"]
+  end
+
+  zap trash: [
+    "~/Library/Application Support/K9k",
+    "~/Library/Caches/com.k9k.app",
+    "~/Library/Preferences/com.k9k.app.plist",
+    "~/Library/Saved Application State/com.k9k.app.savedState",
+  ]
+
+  caveats <<~EOS
+    K9k is ad-hoc signed but not notarized by Apple. This cask clears the
+    com.apple.quarantine flag on #{appdir}/K9k.app so Gatekeeper does not block
+    first launch with "Apple could not verify K9k is free of malware".
+    To see that warning and decide yourself, install from the zip on the
+    Releases page instead:
+      https://github.com/alliecatowo/k9k/releases
+  EOS
+end

@@ -1,0 +1,221 @@
+name: Release
+
+# Push a version tag (git tag v0.1.0 && git push origin v0.1.0) to cut a release.
+# Run by hand (Actions > Release > Run workflow) with `publish` off to dry-run
+# the builds; with `publish` on it creates the tag and release itself.
+#
+# Builds: the unsigned (ad-hoc signed) K9k.app as a zip on a macos runner, plus
+# standalone k9k-core Go server binaries. Publishes checksums.txt, then updates
+# the Homebrew cask in alliecatowo/homebrew-tap through a deploy key.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the leading v (for example 0.1.0)"
+        required: true
+        type: string
+      publish:
+        description: "Create the tag and GitHub Release and update the Homebrew cask. Leave off for a build-only test."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [ "$EVENT" = "push" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            publish=true
+          else
+            version="${INPUT_VERSION#v}"
+            publish="$INPUT_PUBLISH"
+          fi
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version '$version' is not X.Y.Z"; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Go tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: Backend/go.mod
+          cache-dependency-path: Backend/go.sum
+      - working-directory: Backend
+        run: go test ./...
+
+  server:
+    name: k9k-core (${{ matrix.goos }}-${{ matrix.goarch }})
+    needs: [version, test]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: Backend/go.mod
+          cache-dependency-path: Backend/go.sum
+      - name: Build and archive
+        working-directory: Backend
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          name="k9k-core-${VERSION}-${GOOS}-${GOARCH}"
+          mkdir -p "../dist/${name}"
+          go build -trimpath -ldflags "-s -w" -o "../dist/${name}/k9k-core" ./cmd/k9k-core
+          cp ../LICENSE "../dist/${name}/"
+          tar -C ../dist -czf "../dist/${name}.tar.gz" "${name}"
+          rm -rf "../dist/${name}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.tar.gz
+
+  macos-app:
+    name: macOS app (unsigned)
+    needs: [version, test]
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      # Notarization hook: set these repository secrets and the build signs
+      # with Developer ID and notarizes (see Scripts/notarize.sh). Until then
+      # the app is ad-hoc signed and the cask clears quarantine.
+      DEVELOPER_ID_CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+      DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+      DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: Backend/go.mod
+          cache-dependency-path: Backend/go.sum
+      - name: Import Developer ID certificate (when configured)
+        run: |
+          if [ -z "$DEVELOPER_ID_CERT_P12" ] || [ -z "$DEVELOPER_ID_APPLICATION" ] || [ -z "$APPLE_ID" ]; then
+            echo "No Developer ID secrets: building an unsigned (ad-hoc) release."
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          password="$(uuidgen)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "$DEVELOPER_ID_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$DEVELOPER_ID_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "NOTARIZE=true" >> "$GITHUB_ENV"
+      - name: Build, bundle and zip
+        run: Scripts/package-release.sh "${{ needs.version.outputs.version }}" dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-app
+          path: dist/*.zip
+
+  publish:
+    name: GitHub Release
+    needs: [version, server, macos-app]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          sha256sum *.zip *.tar.gz > checksums.txt
+          cat checksums.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          tag="v${VERSION}"
+          notes="Unsigned build: K9k.app is ad-hoc signed and not notarized. Install with \`brew install --cask alliecatowo/tap/k9k\` (clears quarantine) or download the zip and right-click Open. Verify downloads against checksums.txt."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/* --clobber
+          else
+            gh release create "$tag" artifacts/* --target "$GITHUB_SHA" --title "K9k ${VERSION}" --notes "$notes" --prerelease="$([ "${VERSION%%.*}" = 0 ] && echo true || echo false)"
+          fi
+
+  update-homebrew:
+    name: Update Homebrew cask
+    needs: [version, publish]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos-app
+          path: artifacts
+      - name: Render cask and push to the tap
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          sha="$(sha256sum "artifacts/K9k-${VERSION}-macos-arm64.zip" | cut -d' ' -f1)"
+          install -d -m 700 ~/.ssh
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s\n' "$HOMEBREW_TAP_DEPLOY_KEY" > "$keyfile"
+          chmod 600 "$keyfile"
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $keyfile -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          git clone --depth 1 git@github.com:alliecatowo/homebrew-tap.git tap
+          mkdir -p tap/Casks
+          # Render from the template every run so the next release still has tokens to replace.
+          sed -e "s|@VERSION@|${VERSION}|" -e "s|@SHA256@|${sha}|" packaging/homebrew/k9k.rb.tmpl > tap/Casks/k9k.rb
+          cd tap
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Tap already up to date."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/k9k.rb
+          git commit -m "k9k ${VERSION}"
+          git push origin HEAD:main
