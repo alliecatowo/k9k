@@ -9,11 +9,11 @@ cask "k9k" do
 
   url "https://github.com/alliecatowo/k9k/releases/download/v#{version}/K9k-#{version}-macos-arm64.zip"
   name "K9k"
-  desc "Native macOS Kubernetes manager"
+  desc "Native Kubernetes manager built with SwiftUI and Go"
   homepage "https://github.com/alliecatowo/k9k"
 
   depends_on arch: :arm64
-  depends_on macos: ">= :tahoe"
+  depends_on macos: :tahoe
 
   app "K9k.app"
 
@@ -22,9 +22,10 @@ cask "k9k" do
   # block first launch. Clear the flag for K9k.app only.
   # TODO(notarization): once releases are notarized and stapled, delete this
   # postflight block and the caveat below.
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/K9k.app"]
+  postflight_steps do
+    run "/usr/bin/xattr",
+        args:           ["-dr", "com.apple.quarantine", "{{appdir}}/K9k.app"],
+        writable_paths: ["{{appdir}}/K9k.app"]
   end
 
   zap trash: [
